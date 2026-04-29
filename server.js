@@ -12,6 +12,10 @@ import {
   e3dRequest,
   getAuthStatus
 } from "./e3dAuthClient.js";
+import { evaluateLiveCapabilityStatus } from "./scripts/custodyControls.js";
+import { generateOperationsMonitorReport } from "./scripts/operationsMonitor.js";
+import { resolveRiskPolicy } from "./scripts/riskEngine.js";
+import { buildOperatorPermissionPolicy, readOperatorActionRecords, recordOperatorAction } from "./scripts/auditTrail.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -40,9 +44,18 @@ const ROOT = __dirname;
 const DASHBOARD_DIR = path.join(ROOT, "dashboard");
 const LOG_DIR = path.join(ROOT, "logs");
 const REPORTS_DIR = path.join(ROOT, "reports");
+const BACKTEST_REPORTS_DIR = path.join(REPORTS_DIR, "backtests");
+const PROMOTION_REPORTS_DIR = path.join(REPORTS_DIR, "promotions");
+const ATTRIBUTION_REPORTS_DIR = path.join(REPORTS_DIR, "attribution");
+const OPERATIONS_REPORTS_DIR = path.join(REPORTS_DIR, "operations");
+const INCIDENTS_DIR = path.join(REPORTS_DIR, "incidents");
+const RECONCILIATION_REPORTS_DIR = path.join(REPORTS_DIR, "reconciliation");
 const PORTFOLIO_FILE = path.join(ROOT, "portfolio.json");
 const PIPELINE_LOG = path.join(LOG_DIR, "pipeline.jsonl");
 const TRAINING_EVENT_LOG = path.join(LOG_DIR, "training-events.jsonl");
+const TRADE_REVIEWS_LOG = path.join(LOG_DIR, "trade-reviews.jsonl");
+const DASHBOARD_HEARTBEAT_FILE = path.join(LOG_DIR, "dashboard-heartbeat.json");
+const RETRAINING_READINESS_FILE = path.join(REPORTS_DIR, "retraining-readiness.json");
 const MONGO_CONTAINER_NAME = process.env.E3D_MONGO_CONTAINER || "e3d-mongo";
 const MONGO_DATABASE_NAME = process.env.E3D_MONGO_DATABASE || "e3d";
 const CLICKHOUSE_HTTP_URL = process.env.E3D_CLICKHOUSE_HTTP_URL || "http://127.0.0.1:8123";
@@ -180,10 +193,706 @@ function listReportFiles() {
       .map((name) => path.join(REPORTS_DIR, name))
       .map((filePath) => ({ filePath, report: readReportFile(filePath) }))
       .filter(({ report }) => report && report.report_id)
+      .filter(({ report }) => report.report_type !== "daily_performance")
       .sort((a, b) => String(b.report.generated_at || "").localeCompare(String(a.report.generated_at || "")));
   } catch {
     return [];
   }
+}
+
+function listPerformanceReportFiles() {
+  try {
+    if (!fs.existsSync(REPORTS_DIR)) return [];
+    return fs.readdirSync(REPORTS_DIR)
+      .filter((name) => /^performance-daily-\d{8}\.json$/.test(name))
+      .map((name) => path.join(REPORTS_DIR, name))
+      .map((filePath) => ({ filePath, report: readReportFile(filePath) }))
+      .filter(({ report }) => report?.report_type === "daily_performance")
+      .sort((a, b) => String(b.report.generated_at || "").localeCompare(String(a.report.generated_at || "")));
+  } catch {
+    return [];
+  }
+}
+
+function listBacktestReportFiles() {
+  try {
+    if (!fs.existsSync(BACKTEST_REPORTS_DIR)) return [];
+    return fs.readdirSync(BACKTEST_REPORTS_DIR)
+      .filter((name) => /^backtest-\d{8}-\d{6}\.json$/.test(name))
+      .map((name) => path.join(BACKTEST_REPORTS_DIR, name))
+      .map((filePath) => ({ filePath, report: readReportFile(filePath) }))
+      .filter(({ report }) => report?.report_type === "backtest_replay")
+      .sort((a, b) => String(b.report.generated_at || "").localeCompare(String(a.report.generated_at || "")));
+  } catch {
+    return [];
+  }
+}
+
+function listPromotionReportFiles() {
+  try {
+    if (!fs.existsSync(PROMOTION_REPORTS_DIR)) return [];
+    return fs.readdirSync(PROMOTION_REPORTS_DIR)
+      .filter((name) => /^promotion-\d{8}-\d{6}\.json$/.test(name))
+      .map((name) => path.join(PROMOTION_REPORTS_DIR, name))
+      .map((filePath) => ({ filePath, report: readReportFile(filePath) }))
+      .filter(({ report }) => report?.report_type === "strategy_promotion_gate")
+      .sort((a, b) => String(b.report.generated_at || "").localeCompare(String(a.report.generated_at || "")));
+  } catch {
+    return [];
+  }
+}
+
+function listAttributionReportFiles() {
+  try {
+    if (!fs.existsSync(ATTRIBUTION_REPORTS_DIR)) return [];
+    return fs.readdirSync(ATTRIBUTION_REPORTS_DIR)
+      .filter((name) => /^signal-attribution-\d{8}-\d{6}\.json$/.test(name))
+      .map((name) => path.join(ATTRIBUTION_REPORTS_DIR, name))
+      .map((filePath) => ({ filePath, report: readReportFile(filePath) }))
+      .filter(({ report }) => report?.report_type === "signal_attribution_expectancy")
+      .sort((a, b) => String(b.report.generated_at || "").localeCompare(String(a.report.generated_at || "")));
+  } catch {
+    return [];
+  }
+}
+
+function listOperationsReportFiles() {
+  try {
+    if (!fs.existsSync(OPERATIONS_REPORTS_DIR)) return [];
+    return fs.readdirSync(OPERATIONS_REPORTS_DIR)
+      .filter((name) => /^operations-\d{8}-\d{6}\.json$/.test(name))
+      .map((name) => path.join(OPERATIONS_REPORTS_DIR, name))
+      .map((filePath) => ({ filePath, report: readReportFile(filePath) }))
+      .filter(({ report }) => report?.report_type === "operations_monitor")
+      .sort((a, b) => String(b.report.generated_at || "").localeCompare(String(a.report.generated_at || "")));
+  } catch {
+    return [];
+  }
+}
+
+function listReconciliationReportFiles() {
+  try {
+    if (!fs.existsSync(RECONCILIATION_REPORTS_DIR)) return [];
+    return fs.readdirSync(RECONCILIATION_REPORTS_DIR)
+      .filter((name) => /^reconciliation-\d{8}-\d{6}\.json$/.test(name))
+      .map((name) => path.join(RECONCILIATION_REPORTS_DIR, name))
+      .map((filePath) => ({ filePath, report: readReportFile(filePath) }))
+      .filter(({ report }) => report?.report_type === "reconciliation_accounting")
+      .sort((a, b) => String(b.report.generated_at || "").localeCompare(String(a.report.generated_at || "")));
+  } catch {
+    return [];
+  }
+}
+
+function listIncidentFiles() {
+  try {
+    if (!fs.existsSync(INCIDENTS_DIR)) return [];
+    return fs.readdirSync(INCIDENTS_DIR)
+      .filter((name) => /^incident-[a-f0-9]{16}\.json$/.test(name))
+      .map((name) => path.join(INCIDENTS_DIR, name))
+      .map((filePath) => ({ filePath, report: readReportFile(filePath) }))
+      .filter(({ report }) => report?.incident_id)
+      .sort((a, b) => String(b.report.latest_observed_at || b.report.start_time || "").localeCompare(String(a.report.latest_observed_at || a.report.start_time || "")));
+  } catch {
+    return [];
+  }
+}
+
+function summarizePerformanceReport(report) {
+  const window24h = report?.windows?.["24h"] || {};
+  const metrics = window24h.metrics || {};
+  return {
+    report_id: report?.report_id || null,
+    report_date: report?.report_date || null,
+    generated_at: report?.generated_at || null,
+    report_file: report?.report_file || null,
+    markdown_file: report?.markdown_file || null,
+    window_hours: 24,
+    trade_count: metrics.closed_trade_count || 0,
+    win_rate: metrics.win_rate || 0,
+    realized_pnl_usd: metrics.realized_pnl_usd || 0,
+    profit_factor: metrics.profit_factor ?? null,
+    market_data_quality: report?.market_data_quality || null,
+    top_loss_reasons: Array.isArray(window24h.top_loss_reasons) ? window24h.top_loss_reasons.slice(0, 5) : [],
+    retraining_recommendation: report?.retraining?.recommendation || "hold"
+  };
+}
+
+function summarizePromotionReport(report) {
+  return {
+    report_id: report?.report_id || null,
+    generated_at: report?.generated_at || null,
+    strategy_version: report?.strategy_version || null,
+    target_state: report?.target_state || null,
+    promotion_decision: report?.promotion_decision || "blocked",
+    promotion_allowed: Boolean(report?.promotion_allowed),
+    blocker_count: Array.isArray(report?.blockers) ? report.blockers.length : 0,
+    warning_count: Array.isArray(report?.warnings) ? report.warnings.length : 0,
+    closed_trade_count: report?.evidence?.sample_size?.closed_trade_count ?? null,
+    profit_factor: report?.evidence?.performance?.profit_factor ?? null,
+    expectancy_usd: report?.evidence?.performance?.expectancy_usd ?? null,
+    max_drawdown_pct: report?.evidence?.performance?.max_drawdown_pct ?? null,
+    signed: Boolean(report?.signed),
+    signature: report?.signature || null,
+    live_capability: report?.live_capability ? {
+      capability_status: report.live_capability.capability_status,
+      live_submission_enabled: Boolean(report.live_capability.live_submission_enabled),
+      blocker_count: Array.isArray(report.live_capability.blockers) ? report.live_capability.blockers.length : 0,
+      blockers: Array.isArray(report.live_capability.blockers) ? report.live_capability.blockers.slice(0, 8) : []
+    } : null,
+    report_file: report?.report_file || null,
+    markdown_file: report?.markdown_file || null
+  };
+}
+
+function summarizeBacktestReport(report) {
+  const metrics = report?.metrics || {};
+  const performance = report?.performance || {};
+  const executionQuality = report?.execution_quality || {};
+  const executionControls = report?.execution_controls || {};
+  const marketDataQuality = report?.market_data_quality || {};
+  return {
+    report_id: report?.report_id || null,
+    generated_at: report?.generated_at || null,
+    strategy_version: report?.strategy_version || null,
+    seed: report?.seed || null,
+    report_file: report?.report_file || null,
+    markdown_file: report?.markdown_file || null,
+    window: report?.window || null,
+    order_count: report?.replay?.order_count ?? (Array.isArray(report?.replay?.orders) ? report.replay.orders.length : null),
+    total_return_pct: metrics.total_return_pct ?? null,
+    realized_pnl_usd: metrics.realized_pnl_usd ?? null,
+    unrealized_pnl_usd: metrics.unrealized_pnl_usd ?? null,
+    profit_factor: metrics.profit_factor ?? null,
+    max_drawdown_pct: metrics.max_drawdown_pct ?? null,
+    win_rate_pct: metrics.win_rate_pct ?? null,
+    turnover_usd: metrics.turnover_usd ?? null,
+    fee_slippage_drag_usd: metrics.fee_slippage_drag_usd ?? null,
+    before_execution_costs: performance.before_execution_costs || null,
+    after_execution_costs: performance.after_execution_costs || null,
+    execution_cost_impact: performance.cost_impact || null,
+    execution_quality: {
+      model_version: executionQuality.model_version || report?.execution_model_version || null,
+      fill_ratio: executionQuality.fill_ratio ?? null,
+      rejection_ratio: executionQuality.rejection_ratio ?? null,
+      partial_fill_count: executionQuality.partial_fill_count ?? null,
+      average_slippage_bps: executionQuality.average_slippage_bps ?? null,
+      average_fee_bps: executionQuality.average_fee_bps ?? null,
+      average_time_to_fill_ms: executionQuality.average_time_to_fill_ms ?? null
+    },
+    execution_controls: {
+      model_version: executionControls.model_version || null,
+      control_count: executionControls.control_count ?? null,
+      quote_count: executionControls.quote_count ?? null,
+      by_route_feasibility: executionControls.by_route_feasibility || null,
+      by_quote_quality: executionControls.by_quote_quality || null,
+      by_liquidity_depth_bucket: executionControls.by_liquidity_depth_bucket || null,
+      average_gas_bps: executionControls.average_gas_bps ?? null,
+      average_mev_risk_bps: executionControls.average_mev_risk_bps ?? null,
+      top_warnings: Array.isArray(executionControls.top_warnings) ? executionControls.top_warnings.slice(0, 5) : []
+    },
+    market_data_quality: {
+      snapshot_count: marketDataQuality.snapshot_count ?? null,
+      degraded_count: marketDataQuality.degraded_count ?? null,
+      stale_count: marketDataQuality.stale_count ?? null,
+      blocker_count: marketDataQuality.blocker_count ?? null,
+      warning_count: marketDataQuality.warning_count ?? null,
+      average_confidence: marketDataQuality.average_confidence ?? null,
+      top_warnings: Array.isArray(marketDataQuality.top_warnings) ? marketDataQuality.top_warnings.slice(0, 5) : [],
+      top_blockers: Array.isArray(marketDataQuality.top_blockers) ? marketDataQuality.top_blockers.slice(0, 5) : []
+    },
+    baselines: report?.baselines || null,
+    portfolio_json_mutated: Boolean(report?.safety?.portfolio_json_mutated)
+  };
+}
+
+function summarizeAttributionReport(report) {
+  const summary = report?.summary || {};
+  const decisionSummary = report?.decision_summary || {};
+  return {
+    report_id: report?.report_id || null,
+    generated_at: report?.generated_at || null,
+    report_file: report?.report_file || null,
+    markdown_file: report?.markdown_file || null,
+    realized_trade_count: summary.realized_trade_count ?? null,
+    reviewed_trade_count: summary.reviewed_trade_count ?? null,
+    win_rate_pct: summary.win_rate_pct ?? null,
+    expectancy_usd: summary.expectancy_usd ?? null,
+    realized_pnl_usd: summary.realized_pnl_usd ?? null,
+    fee_slippage_drag_usd: summary.fee_slippage_drag_usd ?? null,
+    no_trade_decision_count: summary.no_trade_decision_count ?? null,
+    missed_opportunity_count: summary.missed_opportunity_count ?? null,
+    negative_expectancy_group_count: summary.negative_expectancy_group_count ?? null,
+    top_positive_setups: Array.isArray(summary.top_positive_setups) ? summary.top_positive_setups.slice(0, 5) : [],
+    top_negative_setups: Array.isArray(summary.top_negative_setups) ? summary.top_negative_setups.slice(0, 5) : [],
+    candidate_count: decisionSummary.candidate_count ?? null
+  };
+}
+
+function summarizeOperationsReport(report) {
+  return {
+    report_id: report?.report_id || null,
+    generated_at: report?.generated_at || null,
+    overall_status: report?.overall_status || "unknown",
+    active_alert_count: report?.alerts?.active_count ?? 0,
+    active_incident_count: report?.incidents?.active_count ?? 0,
+    pipeline_status: report?.health?.pipeline?.status || "unknown",
+    dashboard_status: report?.health?.dashboard?.status || "unknown",
+    order_queue_status: report?.health?.order_queue?.status || "unknown",
+    report_file: report?.report_file || null,
+    markdown_file: report?.markdown_file || null
+  };
+}
+
+function summarizeReconciliationReport(report) {
+  return {
+    report_id: report?.report_id || null,
+    generated_at: report?.generated_at || null,
+    status: report?.status || "unknown",
+    live_trading_blocked: Boolean(report?.live_trading_blocked),
+    issue_count: Array.isArray(report?.issues) ? report.issues.length : 0,
+    critical_issue_count: Array.isArray(report?.issues) ? report.issues.filter((issue) => issue.severity === "critical").length : 0,
+    paper_status: report?.reconciliation?.paper?.status || null,
+    replay_status: report?.reconciliation?.replay?.status || null,
+    paper_cash_delta_usd: report?.reconciliation?.paper?.cash?.delta_usd ?? null,
+    replay_cash_delta_usd: report?.reconciliation?.replay?.cash?.delta_usd ?? null,
+    tax_lot_export: report?.tax_lot_export || null,
+    report_file: report?.report_file || null,
+    markdown_file: report?.markdown_file || null
+  };
+}
+
+function listTradeReviews() {
+  return readJsonLines(TRADE_REVIEWS_LOG, 5000)
+    .sort((a, b) => String(b.reviewed_at || "").localeCompare(String(a.reviewed_at || "")));
+}
+
+function indexTradeReviews() {
+  const map = new Map();
+  for (const review of listTradeReviews()) {
+    if (review?.trade_id && !map.has(review.trade_id)) map.set(review.trade_id, review);
+  }
+  return map;
+}
+
+function latestTrainingEvent(eventType) {
+  const events = readJsonLines(TRAINING_EVENT_LOG, 2000);
+  return [...events].reverse().find((event) => event.event_type === eventType) || null;
+}
+
+function summarizeOperationsLatest() {
+  const regime = latestTrainingEvent("regime_policy");
+  const sizing = latestTrainingEvent("position_sizing_decision");
+  const signal = latestTrainingEvent("signal_snapshot");
+  const arbitrage = latestTrainingEvent("arbitrage_signal");
+  return {
+    regime_policy: regime?.payload?.policy || regime?.payload || null,
+    latest_sizing_decision: sizing?.payload?.decision || null,
+    latest_signal_snapshot: signal?.payload || null,
+    latest_arbitrage_signal: arbitrage?.payload || null,
+    generated_at: regime?.ts || sizing?.ts || signal?.ts || arbitrage?.ts || null
+  };
+}
+
+function latestPerformanceReport() {
+  return listPerformanceReportFiles()[0]?.report || null;
+}
+
+function latestBacktestReport() {
+  return listBacktestReportFiles()[0]?.report || null;
+}
+
+function latestPromotionReport() {
+  return listPromotionReportFiles()[0]?.report || null;
+}
+
+function latestAttributionReport() {
+  return listAttributionReportFiles()[0]?.report || null;
+}
+
+function latestOperationsReport() {
+  return listOperationsReportFiles()[0]?.report || null;
+}
+
+function latestReconciliationReport() {
+  return listReconciliationReportFiles()[0]?.report || null;
+}
+
+function toFiniteNumber(value, fallback = 0) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : fallback;
+}
+
+function roundTo(value, digits = 2) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return 0;
+  const factor = 10 ** digits;
+  return Math.round(num * factor) / factor;
+}
+
+function averageFinite(values, digits = 2) {
+  const nums = (Array.isArray(values) ? values : []).map((value) => Number(value)).filter((value) => Number.isFinite(value));
+  if (!nums.length) return null;
+  return roundTo(nums.reduce((sum, value) => sum + value, 0) / nums.length, digits);
+}
+
+function positionValueUsd(position = {}) {
+  return roundTo(toFiniteNumber(
+    position?.market_value_usd,
+    toFiniteNumber(position?.current_value_usd, toFiniteNumber(position?.cost_basis_usd, 0))
+  ), 2);
+}
+
+function computePortfolioEquityUsd(portfolio = {}) {
+  const positions = Object.values(portfolio?.positions || {});
+  const marketValueUsd = positions.reduce((sum, position) => sum + positionValueUsd(position), 0);
+  return roundTo(toFiniteNumber(portfolio?.cash_usd, 0) + marketValueUsd, 2);
+}
+
+function readTrainingEvents(limit = 1000) {
+  return readJsonLines(TRAINING_EVENT_LOG, limit);
+}
+
+function collectTradeRecords(portfolio = {}) {
+  const actions = Array.isArray(portfolio?.action_history) ? portfolio.action_history : [];
+  const closed = Array.isArray(portfolio?.closed_trades) ? portfolio.closed_trades : [];
+  const seen = new Set();
+  return [...actions, ...closed]
+    .filter((trade) => trade && typeof trade === "object")
+    .filter((trade) => {
+      const key = trade.trade_id || `${trade.ts || ""}:${trade.side || ""}:${trade.symbol || ""}:${trade.contract_address || ""}:${trade.quantity || ""}:${trade.price || ""}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((a, b) => String(b.ts || "").localeCompare(String(a.ts || "")));
+}
+
+function summarizeKillSwitches(portfolio = {}) {
+  const settings = portfolio?.settings && typeof portfolio.settings === "object" ? portfolio.settings : {};
+  const candidates = [
+    ["disable_new_buys", settings.disable_new_buys],
+    ["disable_rotations", settings.disable_rotations],
+    ["exit_only", settings.exit_only],
+    ["cancel_open_orders", settings.cancel_open_orders],
+    ["pause_all_trading", settings.pause_all_trading],
+    ["force_shadow_mode", settings.force_shadow_mode]
+  ];
+  return candidates.filter(([, enabled]) => enabled === true).map(([key]) => key);
+}
+
+function topExposureRows(portfolio = {}, keyFn, limit = 5) {
+  const map = new Map();
+  for (const position of Object.values(portfolio?.positions || {})) {
+    const key = keyFn(position);
+    if (!key) continue;
+    map.set(key, roundTo((map.get(key) || 0) + positionValueUsd(position), 2));
+  }
+  return [...map.entries()]
+    .map(([key, value_usd]) => ({ key, value_usd }))
+    .sort((a, b) => b.value_usd - a.value_usd || String(a.key).localeCompare(String(b.key)))
+    .slice(0, limit);
+}
+
+function summarizeRiskSnapshot(portfolio = {}, trainingEvents = []) {
+  const decisions = trainingEvents
+    .filter((event) => event?.event_type === "risk_decision")
+    .map((event) => {
+      const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+      const decision = payload.risk_decision && typeof payload.risk_decision === "object"
+        ? payload.risk_decision
+        : payload;
+      const verdict = String(decision?.decision || payload?.decision || "").toLowerCase();
+      return {
+        ts: event.ts,
+        decision: verdict === "allow" ? "allow" : verdict === "block" ? "block" : "unknown",
+        blockers: Array.isArray(decision?.blockers) ? decision.blockers : [],
+        warnings: Array.isArray(decision?.warnings) ? decision.warnings : [],
+        checked_limits: Array.isArray(decision?.checked_limits) ? decision.checked_limits : [],
+        symbol: decision?.symbol || payload?.proposal?.token?.symbol || payload?.symbol || null
+      };
+    })
+    .sort((a, b) => String(b.ts || "").localeCompare(String(a.ts || "")));
+
+  const latest = decisions[0] || null;
+  const blockedReasons = new Map();
+  for (const decision of decisions.slice(0, 50)) {
+    for (const reason of decision.blockers || []) {
+      blockedReasons.set(reason, (blockedReasons.get(reason) || 0) + 1);
+    }
+  }
+
+  const equityUsd = computePortfolioEquityUsd(portfolio);
+  const policy = resolveRiskPolicy(portfolio);
+  const openPositions = Object.keys(portfolio?.positions || {}).length;
+  const tokenExposure = topExposureRows(portfolio, (position) => String(position?.symbol || position?.contract_address || "").trim().toUpperCase(), 5);
+  const categoryExposure = topExposureRows(portfolio, (position) => String(position?.category || "unknown").trim().toLowerCase(), 5);
+  const strategyExposure = topExposureRows(portfolio, (position) => String(position?.strategy_version || "unknown").trim(), 5);
+  const marketRegime = portfolio?.stats?.market_regime || latest?.checked_limits?.find((item) => item?.key === "market_wide_risk_off_block")?.actual?.market_regime || "unknown";
+  const killSwitches = summarizeKillSwitches(portfolio);
+
+  return {
+    market_regime: marketRegime,
+    active_kill_switches: killSwitches,
+    new_buys_allowed: !killSwitches.includes("disable_new_buys") && !killSwitches.includes("exit_only") && !killSwitches.includes("pause_all_trading"),
+    recent_decision_counts: {
+      allow: decisions.filter((decision) => decision.decision === "allow").length,
+      block: decisions.filter((decision) => decision.decision === "block").length
+    },
+    latest_decision: latest ? {
+      ts: latest.ts,
+      decision: latest.decision,
+      symbol: latest.symbol,
+      blockers: latest.blockers.slice(0, 8),
+      warnings: latest.warnings.slice(0, 8)
+    } : null,
+    top_blocked_reasons: [...blockedReasons.entries()]
+      .map(([reason, count]) => ({ reason, count }))
+      .sort((a, b) => b.count - a.count || String(a.reason).localeCompare(String(b.reason)))
+      .slice(0, 8),
+    utilization: [
+      {
+        key: "open_positions",
+        label: "Open positions",
+        actual: openPositions,
+        limit: policy.max_open_positions,
+        utilization_pct: policy.max_open_positions > 0 ? roundTo(openPositions / policy.max_open_positions * 100, 2) : null
+      },
+      {
+        key: "largest_token_exposure",
+        label: "Largest token exposure",
+        actual: tokenExposure[0]?.value_usd || 0,
+        limit: equityUsd > 0 ? roundTo(equityUsd * toFiniteNumber(policy.max_token_exposure_pct, 0), 2) : null,
+        utilization_pct: equityUsd > 0 ? roundTo((tokenExposure[0]?.value_usd || 0) / Math.max(equityUsd * toFiniteNumber(policy.max_token_exposure_pct, 0), 1) * 100, 2) : null
+      },
+      {
+        key: "largest_category_exposure",
+        label: "Largest category exposure",
+        actual: categoryExposure[0]?.value_usd || 0,
+        limit: equityUsd > 0 ? roundTo(equityUsd * toFiniteNumber(policy.max_category_exposure_pct, 0), 2) : null,
+        utilization_pct: equityUsd > 0 ? roundTo((categoryExposure[0]?.value_usd || 0) / Math.max(equityUsd * toFiniteNumber(policy.max_category_exposure_pct, 0), 1) * 100, 2) : null
+      },
+      {
+        key: "largest_strategy_exposure",
+        label: "Largest strategy exposure",
+        actual: strategyExposure[0]?.value_usd || 0,
+        limit: equityUsd > 0 ? roundTo(equityUsd * toFiniteNumber(policy.max_strategy_exposure_pct, 0), 2) : null,
+        utilization_pct: equityUsd > 0 ? roundTo((strategyExposure[0]?.value_usd || 0) / Math.max(equityUsd * toFiniteNumber(policy.max_strategy_exposure_pct, 0), 1) * 100, 2) : null
+      }
+    ],
+    exposure: {
+      by_token: tokenExposure,
+      by_category: categoryExposure,
+      by_strategy: strategyExposure
+    }
+  };
+}
+
+function summarizeExecutionSnapshot(tradeRecords = [], backtest = null) {
+  const orders = tradeRecords
+    .filter((trade) => trade?.order_lifecycle || trade?.simulated_execution)
+    .map((trade) => {
+      const lifecycle = trade.order_lifecycle || {};
+      const execution = trade.simulated_execution || lifecycle.simulated_execution || {};
+      const control = execution?.liquidity_execution_control || {};
+      const lastState = Array.isArray(lifecycle?.state_history) ? lifecycle.state_history[lifecycle.state_history.length - 1] : null;
+      return {
+        ts: trade.ts || null,
+        order_id: lifecycle.order_id || trade.order_id || null,
+        symbol: trade.symbol || lifecycle.symbol || null,
+        side: trade.side || lifecycle.side || null,
+        state: lifecycle.current_state || execution.decision || "unknown",
+        fill_ratio: Number(execution?.fill_ratio),
+        slippage_bps: Number(execution?.slippage_bps),
+        fee_bps: Number(execution?.fee_bps),
+        fee_usd: toFiniteNumber(execution?.fee_usd, 0),
+        slippage_usd: toFiniteNumber(execution?.slippage_usd, 0),
+        warnings: Array.isArray(control?.warnings) ? control.warnings : [],
+        reason: lastState?.reason || execution?.rejection_reason || null
+      };
+    });
+
+  const lifecycleCounts = {};
+  for (const order of orders) {
+    lifecycleCounts[order.state] = (lifecycleCounts[order.state] || 0) + 1;
+  }
+
+  const rejectedCount = orders.filter((order) => ["rejected", "failed", "expired", "risk_rejected"].includes(order.state)).length;
+  const partialFillCount = orders.filter((order) => order.state === "partially_filled").length;
+  const warningCounts = new Map();
+  for (const order of orders) {
+    for (const warning of order.warnings) {
+      warningCounts.set(warning, (warningCounts.get(warning) || 0) + 1);
+    }
+  }
+
+  const backtestSummary = backtest ? summarizeBacktestReport(backtest) : null;
+  return {
+    recent_order_count: orders.length,
+    lifecycle_counts: lifecycleCounts,
+    rejected_count: rejectedCount,
+    partial_fill_count: partialFillCount,
+    average_fill_ratio: averageFinite(orders.map((order) => order.fill_ratio), 4),
+    average_slippage_bps: averageFinite(orders.map((order) => order.slippage_bps), 4),
+    average_fee_bps: averageFinite(orders.map((order) => order.fee_bps), 4),
+    fee_slippage_drag_usd: roundTo(orders.reduce((sum, order) => sum + order.fee_usd + order.slippage_usd, 0), 2),
+    top_warnings: [...warningCounts.entries()]
+      .map(([warning, count]) => ({ warning, count }))
+      .sort((a, b) => b.count - a.count || String(a.warning).localeCompare(String(b.warning)))
+      .slice(0, 6),
+    recent_orders: orders.slice(0, 8),
+    backtest_execution_quality: backtestSummary ? {
+      fill_ratio: backtestSummary.execution_quality.fill_ratio,
+      rejection_ratio: backtestSummary.execution_quality.rejection_ratio,
+      partial_fill_count: backtestSummary.execution_quality.partial_fill_count,
+      average_slippage_bps: backtestSummary.execution_quality.average_slippage_bps,
+      average_fee_bps: backtestSummary.execution_quality.average_fee_bps,
+      fee_slippage_drag_usd: backtestSummary.fee_slippage_drag_usd
+    } : null
+  };
+}
+
+function summarizeIncidentSnapshot() {
+  const incidents = listIncidentFiles().map(({ report }) => report).filter(Boolean);
+  const simplify = (incident) => ({
+    incident_id: incident.incident_id || null,
+    severity: incident.severity || "unknown",
+    status: incident.status || (incident.end_time ? "resolved" : "active"),
+    summary: incident.summary || incident.title || incident.name || incident.code || "incident",
+    root_cause: incident.root_cause || incident.root_cause_summary || null,
+    remediation: incident.remediation || incident.remediation_summary || null,
+    start_time: incident.start_time || null,
+    end_time: incident.end_time || null,
+    latest_observed_at: incident.latest_observed_at || null
+  });
+  const active = incidents.filter((incident) => !incident?.end_time).map(simplify).slice(0, 5);
+  const resolved = incidents.filter((incident) => incident?.end_time).map(simplify).slice(0, 5);
+  return {
+    active_count: active.length,
+    resolved_count: resolved.length,
+    active,
+    resolved
+  };
+}
+
+async function buildProfessionalDashboardSummary() {
+  const portfolio = await loadPortfolioState();
+  const trainingEvents = readTrainingEvents(1500);
+  const performanceReport = latestPerformanceReport();
+  const backtestReport = latestBacktestReport();
+  const promotionReport = latestPromotionReport();
+  const attributionReport = latestAttributionReport();
+  const operationsReport = latestOperationsReport() || generateOperationsMonitorReport({ writeReport: false, writeEvents: false });
+  const reconciliationReport = latestReconciliationReport();
+  const tradeRecords = collectTradeRecords(portfolio);
+  const custody = evaluateLiveCapabilityStatus({ mode: "paper", portfolio });
+  const auditPolicy = buildOperatorPermissionPolicy({
+    action_type: "mode_change_request",
+    mode: "paper",
+    actor: "dashboard_local",
+    role: "viewer",
+    reason: "professional dashboard status view",
+    portfolio
+  });
+  const risk = summarizeRiskSnapshot(portfolio, trainingEvents);
+  const execution = summarizeExecutionSnapshot(tradeRecords, backtestReport);
+  const incidents = summarizeIncidentSnapshot();
+  const performance = performanceReport ? summarizePerformanceReport(performanceReport) : null;
+  const backtest = backtestReport ? summarizeBacktestReport(backtestReport) : null;
+  const promotion = promotionReport ? summarizePromotionReport(promotionReport) : null;
+  const attribution = attributionReport ? summarizeAttributionReport(attributionReport) : null;
+  const operations = operationsReport ? summarizeOperationsReport(operationsReport) : null;
+  const reconciliation = reconciliationReport ? summarizeReconciliationReport(reconciliationReport) : null;
+
+  const overallBlockers = [];
+  const overallWarnings = [];
+  const killSwitches = risk.active_kill_switches || [];
+
+  if (killSwitches.includes("pause_all_trading")) overallBlockers.push("pause_all_trading");
+  if (killSwitches.includes("exit_only")) overallWarnings.push("exit_only");
+  if (killSwitches.includes("disable_new_buys")) overallWarnings.push("disable_new_buys");
+  if (!getPipelineStatus().running) overallWarnings.push("pipeline_not_running");
+  if ((operations?.overall_status || "").toLowerCase() === "failed") overallBlockers.push("operations_failed");
+  else if ((operations?.overall_status || "").toLowerCase() === "degraded") overallWarnings.push("operations_degraded");
+  if ((reconciliation?.status || "").toLowerCase() === "mismatch") overallWarnings.push("reconciliation_mismatch");
+  if (promotion && !promotion.promotion_allowed) overallWarnings.push("promotion_blocked");
+  if (backtest?.portfolio_json_mutated) overallBlockers.push("backtest_mutated_portfolio_json");
+
+  const canPaperTradeNow = overallBlockers.length === 0;
+  const newBuysAllowed = canPaperTradeNow && risk.new_buys_allowed;
+  const overallStatus = overallBlockers.length
+    ? "blocked"
+    : overallWarnings.length
+      ? "degraded"
+      : "paper_ready";
+
+  return {
+    generated_at: new Date().toISOString(),
+    trading_mode: "paper",
+    live_submission_enabled: false,
+    live_submission_attempted: false,
+    overall: {
+      status: overallStatus,
+      can_trade_now: canPaperTradeNow,
+      can_paper_trade_now: canPaperTradeNow,
+      new_buys_allowed: newBuysAllowed,
+      live_trading_enabled: false,
+      summary: canPaperTradeNow
+        ? (newBuysAllowed ? "Paper trading is available. Live submission remains disabled." : "Paper trading is available in reduced mode. Live submission remains disabled.")
+        : "Trading is blocked by dashboard-visible controls. Live submission remains disabled.",
+      blockers: [...new Set(overallBlockers)],
+      warnings: [...new Set(overallWarnings)]
+    },
+    performance: {
+      daily: performance,
+      backtest: backtest ? {
+        total_return_pct: backtest.total_return_pct,
+        profit_factor: backtest.profit_factor,
+        max_drawdown_pct: backtest.max_drawdown_pct,
+        fee_slippage_drag_usd: backtest.fee_slippage_drag_usd,
+        before_execution_costs: backtest.before_execution_costs,
+        after_execution_costs: backtest.after_execution_costs,
+        execution_cost_impact: backtest.execution_cost_impact,
+        baselines: backtest.baselines,
+        portfolio_json_mutated: backtest.portfolio_json_mutated
+      } : null,
+      attribution: attribution ? {
+        expectancy_usd: attribution.expectancy_usd,
+        realized_pnl_usd: attribution.realized_pnl_usd,
+        negative_expectancy_group_count: attribution.negative_expectancy_group_count,
+        top_positive_setups: attribution.top_positive_setups,
+        top_negative_setups: attribution.top_negative_setups
+      } : null
+    },
+    strategy: {
+      backtest,
+      promotion,
+      attribution
+    },
+    execution,
+    risk,
+    data_quality: backtest?.market_data_quality || performance?.market_data_quality || null,
+    crypto_ops: {
+      operations,
+      reconciliation,
+      custody: {
+        capability_status: custody.capability_status,
+        blocker_count: Array.isArray(custody.blockers) ? custody.blockers.length : 0,
+        blockers: Array.isArray(custody.blockers) ? custody.blockers.slice(0, 8) : [],
+        enabled_venue_count: Array.isArray(custody.controls?.venues) ? custody.controls.venues.filter((venue) => venue.enabled).length : 0,
+        enabled_wallet_count: Array.isArray(custody.controls?.wallets) ? custody.controls.wallets.filter((wallet) => wallet.enabled).length : 0,
+        enabled_signer_count: Array.isArray(custody.controls?.signers) ? custody.controls.signers.filter((signer) => signer.enabled).length : 0
+      }
+    },
+    audit: {
+      current_mode: getPipelineStatus().mode,
+      permission_decision: auditPolicy.decision,
+      blockers: auditPolicy.blockers,
+      live_submission_enabled: false,
+      recent_operator_actions: readOperatorActionRecords({ maxRecords: 8 })
+    },
+    incidents
+  };
 }
 
 function summarizeReport(report, filePath) {
@@ -237,6 +946,19 @@ function ensureDir(filePath) {
   fs.mkdirSync(LOG_DIR, { recursive: true });
   fs.mkdirSync(REPORTS_DIR, { recursive: true });
   fs.mkdirSync(DASHBOARD_DIR, { recursive: true });
+}
+
+function writeDashboardHeartbeat() {
+  try {
+    ensureDir(DASHBOARD_HEARTBEAT_FILE);
+    fs.writeFileSync(DASHBOARD_HEARTBEAT_FILE, `${JSON.stringify({
+      updated_at: nowLocalIso(),
+      pid: process.pid,
+      host: HOST,
+      port: PORT
+    }, null, 2)}\n`, "utf8");
+  } catch {
+  }
 }
 
 function readJsonLines(filePath, limit = 250) {
@@ -355,6 +1077,14 @@ function getPipelineStatus() {
 
 function setPipelineState(nextState) {
   pipelineState = { ...pipelineState, ...nextState };
+}
+
+function operatorContextFromBody(body = {}, fallbackReason = null) {
+  return {
+    actor: body.actor || body.operator || "dashboard_local",
+    role: body.role || body.operator_role || "operator",
+    reason: body.reason || fallbackReason
+  };
 }
 
 function stopPipelineProcess(signal = "SIGTERM") {
@@ -595,7 +1325,7 @@ async function enrichPortfolioPosition(pos) {
   };
 }
 
-async function enrichSoldTrade(trade) {
+async function enrichSoldTrade(trade, review = null) {
   const quantity = asNumber(trade.quantity, 0);
   const salePrice = asNumber(trade.price, 0);
   const proceedsUsd = asNumber(trade.proceeds_usd, salePrice * quantity);
@@ -605,6 +1335,12 @@ async function enrichSoldTrade(trade) {
 
   return {
     contract_address: trade.contract_address,
+    trade_id: trade.trade_id || null,
+    order_id: trade.order_id || trade.order_lifecycle?.order_id || null,
+    order_ids: Array.isArray(trade.order_ids) ? trade.order_ids : (trade.order_id ? [trade.order_id] : []),
+    risk_decision_id: trade.risk_decision_id || trade.order_lifecycle?.risk_decision_id || trade.paper_trade_ticket?.risk_decision_id || null,
+    risk_decision_ref: trade.risk_decision_ref || trade.paper_trade_ticket?.risk_decision_ref || null,
+    position_id: trade.position_id || null,
     symbol: tokenMeta?.symbol || trade.symbol || null,
     name: tokenMeta?.name || trade.name || trade.symbol || null,
     category: trade.category || "unknown",
@@ -620,7 +1356,8 @@ async function enrichSoldTrade(trade) {
     score: trade.score,
     quantity,
     avg_entry_price: avgEntryPrice,
-    current_price: salePrice
+    current_price: salePrice,
+    review
   };
 }
 
@@ -728,11 +1465,12 @@ function safeSummary(payload) {
     const parsed = typeof payload === "string" ? JSON.parse(payload) : payload;
     return {
       decision: parsed.executor_decision || parsed.decision || parsed.outcome_label || null,
+      risk_decision_id: parsed.risk_decision_id || parsed.risk_decision?.risk_decision_id || null,
       symbol: parsed?.token?.symbol || parsed?.symbol || null,
       side: parsed.side || null,
       trade_lifecycle: parsed.trade_lifecycle || null,
       pnl_usd: parsed.pnl_usd ?? null,
-      reason_summary: parsed.reason_summary || parsed.short_summary || null
+      reason_summary: parsed.reason_summary || parsed.short_summary || parsed.summary || null
     };
   } catch {
     return null;
@@ -967,13 +1705,37 @@ async function handleRequest(req, res) {
   if (url.pathname === "/api/pipeline/start" && req.method === "POST") {
     const body = await readRequestJson();
     const intervalSeconds = body.interval_seconds ?? body.intervalSeconds ?? 300;
+    const operator = operatorContextFromBody(body, "dashboard pipeline start request");
+    recordOperatorAction({
+      action_type: "pipeline_start",
+      actor: operator.actor,
+      role: operator.role,
+      reason: operator.reason,
+      resource: "pipeline",
+      previous_state: getPipelineStatus(),
+      new_state: { requested_mode: "loop", interval_seconds: intervalSeconds },
+      metadata: { source: "dashboard_api" }
+    });
     const status = startPipelineProcess(intervalSeconds);
     sendJson(res, 200, status);
     return;
   }
 
   if (url.pathname === "/api/pipeline/stop" && req.method === "POST") {
+    const body = await readRequestJson();
+    const operator = operatorContextFromBody(body, "dashboard pipeline stop request");
+    const previous = getPipelineStatus();
     const stopped = stopPipelineProcess();
+    recordOperatorAction({
+      action_type: "pipeline_stop",
+      actor: operator.actor,
+      role: operator.role,
+      reason: operator.reason,
+      resource: "pipeline",
+      previous_state: previous,
+      new_state: getPipelineStatus(),
+      metadata: { source: "dashboard_api", stopped }
+    });
     sendJson(res, 200, {
       ok: stopped,
       pipeline: getPipelineStatus()
@@ -982,7 +1744,20 @@ async function handleRequest(req, res) {
   }
 
   if (url.pathname === "/api/reset-all" && req.method === "POST") {
+    const body = await readRequestJson();
+    const operator = operatorContextFromBody(body, "dashboard reset request");
+    const previous = getPipelineStatus();
     const result = clearSystemState();
+    recordOperatorAction({
+      action_type: "reset_request",
+      actor: operator.actor,
+      role: operator.role,
+      reason: operator.reason,
+      resource: "system_state",
+      previous_state: previous,
+      new_state: { reset_at: nowLocalIso(), pipeline: getPipelineStatus() },
+      metadata: { source: "dashboard_api", ...result }
+    });
     sendJson(res, 200, {
       ok: true,
       reset_at: nowLocalIso(),
@@ -1010,9 +1785,155 @@ async function handleRequest(req, res) {
     return;
   }
 
+  if (url.pathname === "/api/performance/latest" && req.method === "GET") {
+    const latest = listPerformanceReportFiles()[0]?.report || null;
+    sendJson(res, 200, latest ? summarizePerformanceReport(latest) : null);
+    return;
+  }
+
+  if (url.pathname === "/api/performance/reports" && req.method === "GET") {
+    const reports = listPerformanceReportFiles().slice(0, 30).map(({ report }) => summarizePerformanceReport(report));
+    sendJson(res, 200, reports);
+    return;
+  }
+
+  if (url.pathname === "/api/backtests/latest" && req.method === "GET") {
+    const latest = listBacktestReportFiles()[0]?.report || null;
+    sendJson(res, 200, latest ? summarizeBacktestReport(latest) : null);
+    return;
+  }
+
+  if (url.pathname === "/api/backtests/reports" && req.method === "GET") {
+    const reports = listBacktestReportFiles().slice(0, 30).map(({ report }) => summarizeBacktestReport(report));
+    sendJson(res, 200, reports);
+    return;
+  }
+
+  if (url.pathname === "/api/promotions/latest" && req.method === "GET") {
+    const latest = listPromotionReportFiles()[0]?.report || null;
+    sendJson(res, 200, latest ? summarizePromotionReport(latest) : null);
+    return;
+  }
+
+  if (url.pathname === "/api/promotions/reports" && req.method === "GET") {
+    const reports = listPromotionReportFiles().slice(0, 30).map(({ report }) => summarizePromotionReport(report));
+    sendJson(res, 200, reports);
+    return;
+  }
+
+  if (url.pathname === "/api/attribution/latest" && req.method === "GET") {
+    const latest = listAttributionReportFiles()[0]?.report || null;
+    sendJson(res, 200, latest ? summarizeAttributionReport(latest) : null);
+    return;
+  }
+
+  if (url.pathname === "/api/attribution/reports" && req.method === "GET") {
+    const reports = listAttributionReportFiles().slice(0, 30).map(({ report }) => summarizeAttributionReport(report));
+    sendJson(res, 200, reports);
+    return;
+  }
+
+  if (url.pathname === "/api/operations/latest" && req.method === "GET") {
+    const latest = listOperationsReportFiles()[0]?.report || null;
+    if (latest) {
+      sendJson(res, 200, latest);
+      return;
+    }
+    const report = generateOperationsMonitorReport({ writeReport: false, writeEvents: false });
+    recordOperatorAction({
+      action_type: "report_generation",
+      actor: "dashboard_local",
+      role: "viewer",
+      reason: "generated in-memory operations monitor report for dashboard request",
+      resource: "operations_report",
+      new_state: { report_id: report.report_id, report_file: null },
+      report_id: report.report_id,
+      metadata: { source: "dashboard_api", write_performed: false }
+    });
+    sendJson(res, 200, report);
+    return;
+  }
+
+  if (url.pathname === "/api/operations/reports" && req.method === "GET") {
+    const reports = listOperationsReportFiles().slice(0, 30).map(({ report }) => summarizeOperationsReport(report));
+    sendJson(res, 200, reports);
+    return;
+  }
+
+  if (url.pathname === "/api/reconciliation/latest" && req.method === "GET") {
+    const latest = listReconciliationReportFiles()[0]?.report || null;
+    sendJson(res, 200, latest ? summarizeReconciliationReport(latest) : null);
+    return;
+  }
+
+  if (url.pathname === "/api/reconciliation/reports" && req.method === "GET") {
+    const reports = listReconciliationReportFiles().slice(0, 30).map(({ report }) => summarizeReconciliationReport(report));
+    sendJson(res, 200, reports);
+    return;
+  }
+
+  if (url.pathname === "/api/incidents" && req.method === "GET") {
+    const incidents = listIncidentFiles().slice(0, 100).map(({ report }) => report);
+    sendJson(res, 200, incidents);
+    return;
+  }
+
+  if (url.pathname === "/api/trade-reviews" && req.method === "GET") {
+    sendJson(res, 200, listTradeReviews().slice(0, 200));
+    return;
+  }
+
+  if (url.pathname === "/api/retraining/readiness" && req.method === "GET") {
+    sendJson(res, 200, readJsonFile(RETRAINING_READINESS_FILE, null));
+    return;
+  }
+
+  if (url.pathname === "/api/operations/state" && req.method === "GET") {
+    sendJson(res, 200, summarizeOperationsLatest());
+    return;
+  }
+
+  if (url.pathname === "/api/custody/status" && req.method === "GET") {
+    const portfolio = await loadPortfolioState();
+    sendJson(res, 200, evaluateLiveCapabilityStatus({ mode: url.searchParams.get("mode") || "paper", portfolio }));
+    return;
+  }
+
+  if (url.pathname === "/api/audit/status" && req.method === "GET") {
+    const portfolio = await loadPortfolioState();
+    const mode = url.searchParams.get("mode") || "paper";
+    sendJson(res, 200, {
+      permission_policy: buildOperatorPermissionPolicy({
+        action_type: url.searchParams.get("action_type") || "mode_change_request",
+        mode,
+        actor: url.searchParams.get("actor") || "dashboard_local",
+        role: url.searchParams.get("role") || "viewer",
+        reason: url.searchParams.get("reason") || null,
+        portfolio
+      }),
+      current_mode: getPipelineStatus().mode,
+      pipeline: getPipelineStatus(),
+      recent_operator_actions: readOperatorActionRecords({ maxRecords: 50 })
+    });
+    return;
+  }
+
+  if (url.pathname === "/api/professional/summary" && req.method === "GET") {
+    sendJson(res, 200, await buildProfessionalDashboardSummary());
+    return;
+  }
+
   if (url.pathname.startsWith("/api/reports/") && req.method === "GET") {
     const reportId = decodeURIComponent(url.pathname.slice("/api/reports/".length)).trim();
-    const match = listReportFiles().find(({ report }) => report?.report_id === reportId);
+    const match = [
+      ...listReportFiles(),
+      ...listPerformanceReportFiles(),
+      ...listBacktestReportFiles(),
+      ...listPromotionReportFiles(),
+      ...listAttributionReportFiles(),
+      ...listOperationsReportFiles(),
+      ...listReconciliationReportFiles()
+    ].find(({ report }) => report?.report_id === reportId);
     if (!match) {
       sendJson(res, 404, { ok: false, error: "REPORT_NOT_FOUND" });
       return;
@@ -1050,12 +1971,13 @@ async function handleRequest(req, res) {
     const [portfolio, activity] = await Promise.all([loadPortfolioState(), loadActivity()]);
     const positions = Object.values(portfolio.positions || {});
     const historyTrades = Array.isArray(portfolio.closed_trades) ? [...portfolio.closed_trades].reverse() : [];
+    const reviewIndex = indexTradeReviews();
     // Sequential enrichment — concurrent Promise.all causes a request burst that
     // exhausts the API rate limit and causes 429s in the pipeline stories call.
     const enrichedPositions = [];
     for (const pos of positions) enrichedPositions.push(await enrichPortfolioPosition(pos));
     const enrichedHistory = [];
-    for (const trade of historyTrades.slice(0, 20)) enrichedHistory.push(await enrichSoldTrade(trade));
+    for (const trade of historyTrades.slice(0, 20)) enrichedHistory.push(await enrichSoldTrade(trade, reviewIndex.get(trade.trade_id) || null));
     const unrealizedPnlUsd = enrichedPositions.reduce((sum, pos) => {
       const currentValueUsd = asNumber(pos?.current_value_usd, asNumber(pos?.market_value_usd, 0));
       const costUsd = asNumber(pos?.cost_usd, 0);
@@ -1179,7 +2101,11 @@ server.on("upgrade", wsHandleUpgrade);
 
 // Reattach to any pipeline that survived a previous server restart
 recoverPipelineIfRunning();
+writeDashboardHeartbeat();
+const dashboardHeartbeatTimer = setInterval(writeDashboardHeartbeat, 30000);
+dashboardHeartbeatTimer.unref?.();
 
 server.listen(PORT, HOST, () => {
+  writeDashboardHeartbeat();
   console.log(`Dashboard server running at http://${HOST}:${PORT}`);
 });

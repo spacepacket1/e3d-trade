@@ -5,6 +5,12 @@ import { execFileSync } from "child_process";
 import { fileURLToPath } from "url";
 import { buildCurlAuthArgs } from "./e3dAuthClient.js";
 import { buildCycleQuantContext, enrichCandidateQuant, batchEnrichTokenFlow } from "./marketData.js";
+import { createOrderLifecycleRecord } from "./scripts/orderLifecycle.js";
+import { evaluateRiskDecision, buildRiskDecisionRef } from "./scripts/riskEngine.js";
+import { buildTokenRiskScan, buildTokenRiskScanRef } from "./scripts/tokenRiskScanner.js";
+import { buildLiquidityExecutionControls } from "./scripts/liquidityExecutionControls.js";
+import { buildMarketDataQuality, buildMarketDataQualityRef } from "./scripts/marketDataQuality.js";
+import { recordOperatorAction } from "./scripts/auditTrail.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -15,6 +21,8 @@ const PORTFOLIO_FILE = path.join(__dirname, "portfolio.json");
 const PIPELINE_LOG = path.join(LOG_DIR, "pipeline.jsonl");
 const AGENT_RAW_LOG = path.join(LOG_DIR, "agent-raw.jsonl");
 const TRAINING_EVENT_LOG = path.join(LOG_DIR, "training-events.jsonl");
+const TRADE_REVIEWS_LOG = path.join(LOG_DIR, "trade-reviews.jsonl");
+const RETRAINING_READINESS_FILE = path.join(REPORTS_DIR, "retraining-readiness.json");
 const TRAINING_EVENT_SCHEMA_VERSION = "1.0";
 const MONGO_CONTAINER_NAME = process.env.E3D_MONGO_CONTAINER || "e3d-mongo";
 const MONGO_DATABASE_NAME = process.env.E3D_MONGO_DATABASE || "e3d";
@@ -29,6 +37,8 @@ const E3D_DOSSIER_CACHE_TTL_MS = 10 * 60 * 1000;
 const E3D_DOSSIER_MAX_POSITIONS = 5;
 const E3D_DOSSIER_MAX_STORIES = 4;
 const E3D_DOSSIER_MAX_COUNTERPARTIES = 5;
+const PAPER_ORDER_STRATEGY_VERSION = process.env.E3D_STRATEGY_VERSION || "paper-pipeline-v1";
+const PAPER_FILL_MODEL_VERSION = "paper-portfolio-fill-v1";
 
 // Rate-limit budget management.
 // Tiers: free=100/day @5000ms, premium=1000/day @1000ms, enterprise=100000/day @10ms
@@ -577,6 +587,14 @@ function readJsonLines(filePath, maxLines = 1000) {
   }
 }
 
+function readJsonFileSafe(filePath, fallback = null) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    return fallback;
+  }
+}
+
 function buildTrainingEventRecord(eventType, actor, portfolio, context = {}, details = {}) {
   const mergedContext = { ...(getTrainingContext() || {}), ...(context || {}) };
   const record = {
@@ -659,6 +677,21 @@ function recordRiskDecisionEvent(proposal, risk, portfolio, context = {}, handof
   return record;
 }
 
+function recordRiskEngineDecisionEvent(decision, portfolio, context = {}, details = {}) {
+  const record = buildTrainingEventRecord("risk_engine_decision", "risk_engine", portfolio, context, {
+    decision: decision?.decision || null,
+    risk_decision_id: decision?.risk_decision_id || null,
+    trade_id: decision?.trade_id || details.trade_id || null,
+    candidate_id: details.candidate_id || null,
+    position_id: details.position_id || null,
+    source_trade_id: decision?.source_trade_id || null,
+    risk_decision: decision || null,
+    ...details
+  });
+  appendTrainingEvent(record);
+  return record;
+}
+
 function recordExecutorDecisionEvent(bundle, portfolio, context = {}, tradeKind = "buy") {
   const action = bundle?.action || {};
   const proposal = bundle?.proposal || {};
@@ -702,6 +735,12 @@ function recordOutcomeEvent(trade, positionBefore, portfolio, context = {}) {
     position_before: positionBefore || null,
     trade: trade || null
   });
+  appendTrainingEvent(record);
+  return record;
+}
+
+function recordAuxiliaryEvent(eventType, actor, portfolio, details = {}) {
+  const record = buildTrainingEventRecord(eventType, actor, portfolio, getTrainingContext(), details);
   appendTrainingEvent(record);
   return record;
 }
@@ -911,6 +950,390 @@ function regimePolicy(regime, settings = SETTINGS_DEFAULTS) {
   };
 }
 
+function readLatestJsonReport(prefix) {
+  try {
+    return fs.readdirSync(REPORTS_DIR)
+      .filter((name) => name.startsWith(prefix) && name.endsWith(".json"))
+      .map((name) => readJsonFileSafe(path.join(REPORTS_DIR, name), null))
+      .filter(Boolean)
+      .sort((a, b) => String(b.generated_at || "").localeCompare(String(a.generated_at || "")))[0] || null;
+  } catch {
+    return null;
+  }
+}
+
+function buildRecentReviewStats(limit = 200) {
+  const reviews = readJsonLines(TRADE_REVIEWS_LOG, limit);
+  const negative = reviews.filter((review) => review.training_label === "negative");
+  const avoidableLosses = reviews.filter((review) => review.avoidable_loss);
+  const bySetup = new Map();
+  for (const review of reviews) {
+    const key = String(review.setup_label || "unknown");
+    const stats = bySetup.get(key) || { setup_label: key, reviewed: 0, positive: 0, negative: 0, neutral: 0 };
+    stats.reviewed += 1;
+    stats[review.training_label] = (stats[review.training_label] || 0) + 1;
+    bySetup.set(key, stats);
+  }
+  return {
+    review_count: reviews.length,
+    negative_count: negative.length,
+    avoidable_loss_count: avoidableLosses.length,
+    setup_expectancy: [...bySetup.values()].map((stats) => ({
+      ...stats,
+      negative_rate: stats.reviewed ? stats.negative / stats.reviewed : 0
+    }))
+  };
+}
+
+function computeDailyEquityBaseline(portfolio, referenceTs = nowIso()) {
+  const targetDay = new Intl.DateTimeFormat("en-CA", {
+    timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(new Date(referenceTs));
+  const events = readJsonLines(TRAINING_EVENT_LOG, 2000)
+    .filter((record) => record?.event_type === "cycle_start" || record?.event_type === "cycle_end")
+    .map((record) => ({
+      record,
+      tsMs: optionalMs(record?.ts),
+      day: record?.ts ? new Intl.DateTimeFormat("en-CA", {
+        timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit"
+      }).format(new Date(record.ts)) : null
+    }))
+    .filter((entry) => entry.tsMs != null && entry.day === targetDay)
+    .sort((a, b) => a.tsMs - b.tsMs);
+
+  const first = events[0]?.record?.payload?.portfolio_snapshot?.equity_usd;
+  return toNum(first, equityUsd(portfolio));
+}
+
+function buildPortfolioRiskAnalytics(portfolio, evaluationTs = nowIso()) {
+  return {
+    evaluated_at: evaluationTs,
+    market_regime: portfolio?.stats?.market_regime || "unknown",
+    recent_performance: computeRecentClosedTradeMetrics(portfolio),
+    review_stats: buildRecentReviewStats(200),
+    day_start_equity_usd: computeDailyEquityBaseline(portfolio, evaluationTs)
+  };
+}
+
+function buildBuyRiskIntent(candidate, allocationUsd, tradeKind = "buy") {
+  const token = candidate?.token || {};
+  const marketDataQuality = candidate?.market_data_quality || buildMarketDataQuality(candidate, {
+    evaluated_at: candidate?.created_at || nowIso()
+  });
+  return {
+    side: "buy",
+    symbol: token.symbol || null,
+    contract_address: token.contract_address || null,
+    category: token.category || "unknown",
+    strategy_version: candidate?.strategy_version || PAPER_ORDER_STRATEGY_VERSION,
+    setup_type: candidate?.setup_type || null,
+    requested_notional_usd: allocationUsd,
+    requested_quantity: toNum(marketDataQuality.normalized?.price_usd, 0) > 0 ? allocationUsd / toNum(marketDataQuality.normalized.price_usd, 0) : 0,
+    liquidity_usd: toNum(marketDataQuality.normalized?.liquidity_usd, 0),
+    spread_bps: toNum(marketDataQuality.normalized?.spread_bps, 0),
+    slippage_bps: toNum(marketDataQuality.normalized?.slippage_bps, 0),
+    market_regime: _cycleRegimePolicy?.regime || null,
+    reason: tradeKind,
+    market_data_quality_id: marketDataQuality.data_quality_id,
+    market_data_quality_warnings: marketDataQuality.warnings || [],
+    market_data_quality_blockers: marketDataQuality.blockers || []
+  };
+}
+
+function attachTokenRiskScanMetadata(target, scan, context = {}) {
+  if (!target || !scan?.token_risk_scan_id) return null;
+  const ref = buildTokenRiskScanRef(scan, context);
+  target.token_risk_scan_id = scan.token_risk_scan_id;
+  target.token_risk_scan_ref = ref;
+  target.token_risk_scan = deepClone(scan);
+  if (target.paper_trade_ticket && typeof target.paper_trade_ticket === "object") {
+    target.paper_trade_ticket.token_risk_scan_id = scan.token_risk_scan_id;
+    target.paper_trade_ticket.token_risk_scan_ref = ref;
+    target.paper_trade_ticket.token_risk_scan = deepClone(scan);
+  }
+  return ref;
+}
+
+function recordTokenRiskScanEvent(scan, portfolio, context = {}, details = {}) {
+  if (!scan?.token_risk_scan_id) return null;
+  return recordAuxiliaryEvent("token_risk_scan", "token_risk_scanner", portfolio, {
+    token_risk_scan_id: scan.token_risk_scan_id,
+    token_risk_scan: scan,
+    ...details
+  });
+}
+
+function buildCandidateTokenRiskScan(candidate, portfolio, details = {}) {
+  const token = candidate?.token || {};
+  return buildTokenRiskScan({
+    evaluated_at: details.evaluated_at || nowIso(),
+    mode: details.mode || "paper",
+    side: details.side || "buy",
+    candidate_id: candidate?.training_candidate_id || candidate?.candidate_id || token?.contract_address || token?.symbol || null,
+    position_id: candidate?.training_position_id || candidate?.position_id || null,
+    signal_snapshot_ref: details.signal_snapshot_ref || null,
+    risk_decision_id: details.risk_decision_id || null,
+    risk_decision_ref: details.risk_decision_ref || null,
+    token: {
+      ...deepClone(token),
+      liquidity_usd: toNum(candidate?.liquidity_data?.liquidity_usd, toNum(token?.liquidity_usd, 0)),
+      liquidity_quality: candidate?.liquidity_quality ?? token?.liquidity_quality ?? null,
+      fraud_risk: candidate?.fraud_risk ?? token?.fraud_risk ?? null,
+      current_price: toNum(candidate?.market_data?.current_price, toNum(token?.current_price, 0)),
+      spread_bps: toNum(candidate?.execution_data?.spread_bps, toNum(token?.spread_bps, 0)),
+      slippage_bps: toNum(candidate?.execution_data?.estimated_slippage_bps, toNum(token?.slippage_bps, 0))
+    },
+    market_data: candidate?.market_data || null,
+    liquidity_data: candidate?.liquidity_data || null,
+    execution_data: candidate?.execution_data || null,
+    category: token?.category || candidate?.category || null
+  });
+}
+
+function buildPositionTokenRiskScan(position, portfolio, details = {}) {
+  if (!position || typeof position !== "object") return null;
+  return buildTokenRiskScan({
+    evaluated_at: details.evaluated_at || nowIso(),
+    mode: details.mode || "paper",
+    side: details.side || "sell",
+    candidate_id: position.training_candidate_id || null,
+    position_id: position.training_position_id || null,
+    trade_id: details.trade_id || null,
+    source_trade_id: details.source_trade_id || null,
+    signal_snapshot_ref: details.signal_snapshot_ref || null,
+    risk_decision_id: details.risk_decision_id || null,
+    risk_decision_ref: details.risk_decision_ref || null,
+    token: {
+      symbol: position.symbol,
+      contract_address: position.contract_address,
+      category: position.category,
+      liquidity_usd: toNum(position.liquidity_usd, 0),
+      liquidity_quality: position.liquidity_quality ?? null,
+      fraud_risk: position.fraud_risk ?? null,
+      current_price: toNum(position.current_price, 0),
+      ...(position.last_market_snapshot || {})
+    },
+    market_data: position.last_market_snapshot?.market_data || null,
+    liquidity_data: position.last_market_snapshot?.liquidity_data || null,
+    execution_data: position.last_market_snapshot?.execution_data || null
+  });
+}
+
+function attachRiskDecisionMetadata(target, decision, context = {}) {
+  if (!target || !decision?.risk_decision_id) return null;
+  const ref = buildRiskDecisionRef(decision, context);
+  target.risk_decision_id = decision.risk_decision_id;
+  target.risk_decision_ref = ref;
+  if (target.paper_trade_ticket && typeof target.paper_trade_ticket === "object") {
+    target.paper_trade_ticket.risk_decision_id = decision.risk_decision_id;
+    target.paper_trade_ticket.risk_decision_ref = ref;
+    target.paper_trade_ticket.risk_engine = {
+      decision: decision.decision,
+      policy_version: decision.policy_version,
+      input_snapshot_hash: decision.input_snapshot_hash,
+      blockers: decision.blockers,
+      warnings: decision.warnings,
+      checked_limits: decision.checked_limits
+    };
+  }
+  return ref;
+}
+
+function classifyExitReasonForPolicy(reason) {
+  const text = String(reason || "").toLowerCase();
+  const root = text.split(":")[0];
+  if (root.includes("stop")) return "stop_loss";
+  if (root.includes("target")) return "target";
+  if (root.includes("rotation_out")) return "rotation_out";
+  if (root.includes("non_tradeable")) return "non_tradeable_force_exit";
+  if (root.includes("harvest")) return "harvest_exit";
+  return root || "unknown";
+}
+
+function computeRecentClosedTradeMetrics(portfolio, windowMs = 24 * 60 * 60 * 1000) {
+  const cutoff = Date.now() - windowMs;
+  const closed = (Array.isArray(portfolio?.closed_trades) ? portfolio.closed_trades : [])
+    .filter((trade) => trade?.side === "sell")
+    .filter((trade) => Number.isFinite(toNum(trade?.pnl_usd, NaN)))
+    .filter((trade) => {
+      const ts = Date.parse(trade?.ts || "");
+      return Number.isFinite(ts) && ts >= cutoff;
+    });
+  const wins = closed.filter((trade) => toNum(trade.pnl_usd, 0) > 0);
+  const losses = closed.filter((trade) => toNum(trade.pnl_usd, 0) < 0);
+  const grossProfit = wins.reduce((sum, trade) => sum + toNum(trade.pnl_usd, 0), 0);
+  const grossLoss = losses.reduce((sum, trade) => sum + toNum(trade.pnl_usd, 0), 0);
+  const realizedPnl = grossProfit + grossLoss;
+
+  return {
+    source: "portfolio_rolling_24h",
+    closed_trade_count: closed.length,
+    win_rate: closed.length ? (wins.length / closed.length) * 100 : 0,
+    realized_pnl_usd: realizedPnl,
+    gross_profit_usd: grossProfit,
+    gross_loss_usd: grossLoss,
+    profit_factor: grossLoss < 0 ? grossProfit / Math.abs(grossLoss) : (grossProfit > 0 ? null : 0),
+    stop_loss_count: closed.filter((trade) => classifyExitReasonForPolicy(trade.reason) === "stop_loss").length
+  };
+}
+
+function buildRegimeSentinelPolicy(portfolio, quantContext) {
+  const perf = readLatestJsonReport("performance-daily-");
+  const reportPerf24 = perf?.windows?.["24h"]?.metrics || {};
+  const rollingPerf24 = computeRecentClosedTradeMetrics(portfolio);
+  const perf24 = rollingPerf24.closed_trade_count > 0 ? rollingPerf24 : { ...reportPerf24, source: "performance_daily_report" };
+  const reviewStats = buildRecentReviewStats(200);
+  const macro = quantContext?.macro || {};
+  const settings = portfolio?.settings || SETTINGS_DEFAULTS;
+  const base = regimePolicy(macro.regime || portfolio?.stats?.market_regime || "neutral", settings);
+  const reasonCodes = [];
+  let allocationMultiplier = toNum(base.allocation_multiplier, 1);
+  let allowBuys = Boolean(base.allow_buys);
+  let allowRotations = Boolean(base.allow_rotations);
+  let maxBuys = toNum(base.max_buys_per_cycle, settings.max_buys_per_cycle);
+  let maxRotations = toNum(base.max_rotations_per_cycle, settings.max_rotations_per_cycle);
+
+  if (toNum(perf24.profit_factor, 1) < 0.7 && toNum(perf24.realized_pnl_usd, 0) < 0) {
+    allowBuys = false;
+    maxBuys = 0;
+    allocationMultiplier = 0;
+    reasonCodes.push("negative_recent_profit_factor");
+    reasonCodes.push("new_buys_blocked_by_recent_losses");
+  }
+  if (toNum(perf24.stop_loss_count, 0) >= 2) {
+    allowBuys = false;
+    maxBuys = 0;
+    reasonCodes.push("stop_loss_cluster");
+  }
+  if (toNum(perf24.win_rate, 0) >= 60 && toNum(perf24.realized_pnl_usd, 0) < 0) {
+    allocationMultiplier = Math.min(allocationMultiplier, 0.6);
+    reasonCodes.push("high_win_rate_negative_expectancy");
+  }
+  if (String(base.regime) === "risk_off") {
+    allowBuys = false;
+    allowRotations = false;
+    maxBuys = 0;
+    maxRotations = 0;
+    reasonCodes.push("risk_off_blocks_speculative_buys");
+  }
+  if (macro?.btc && toNum(macro.btc.change_24h_pct, 0) < -3) reasonCodes.push("btc_downtrend");
+  if (!reasonCodes.length) reasonCodes.push("baseline_regime_policy");
+
+  return {
+    regime: base.regime || "neutral",
+    confidence: Math.min(0.95, 0.55 + reasonCodes.length * 0.08),
+    allow_new_buys: allowBuys,
+    allow_buys: allowBuys,
+    allow_rotations: allowRotations,
+    allow_harvest_exits: true,
+    max_buys_per_cycle: maxBuys,
+    max_rotations_per_cycle: maxRotations,
+    allocation_multiplier: allocationMultiplier,
+    tighten_stops: Boolean(macro.tighten_stops || reasonCodes.includes("negative_recent_profit_factor")),
+    reason_codes: reasonCodes,
+    recent_performance: {
+      win_rate: perf24.win_rate ?? null,
+      realized_pnl_usd: perf24.realized_pnl_usd ?? null,
+      profit_factor: perf24.profit_factor ?? null,
+      stop_loss_count: perf24.stop_loss_count ?? null,
+      closed_trade_count: perf24.closed_trade_count ?? null,
+      source: perf24.source || "unknown"
+    },
+    review_stats: {
+      review_count: reviewStats.review_count,
+      negative_count: reviewStats.negative_count,
+      avoidable_loss_count: reviewStats.avoidable_loss_count
+    }
+  };
+}
+
+function buildSignalSnapshotForToken(token, portfolio) {
+  const addr = cleanAddress(token?.contract_address || "");
+  const sym = String(token?.symbol || "").toUpperCase();
+  const flow = addr ? _cycleQuantContext?.token_flow?.[addr] : null;
+  const funding = sym ? _cycleQuantContext?.funding_rates?.[sym] : null;
+  const liquidity = toNum(token?.liquidity_usd ?? token?.liquidity_data?.liquidity_usd, 0);
+  const change24 = toNum(token?.change_24h_pct ?? token?.market_data?.change_24h_pct, 0);
+  const positiveReasons = [];
+  const negativeReasons = [];
+  const missingSources = [];
+  if (change24 > 5) positiveReasons.push("positive_24h_momentum");
+  if (change24 < -5) negativeReasons.push("negative_24h_momentum");
+  if (liquidity >= 250000) positiveReasons.push("liquidity_sufficient");
+  if (liquidity > 0 && liquidity < 100000) negativeReasons.push("liquidity_thin");
+  if (!liquidity) missingSources.push("liquidity");
+  if (flow?.flow_direction === "accumulation") positiveReasons.push("smart_wallet_accumulation");
+  if (flow?.flow_direction === "distribution") negativeReasons.push("smart_wallet_distribution");
+  if (!flow) missingSources.push("token_flow");
+  if (funding?.signal === "overcrowded_long") negativeReasons.push("overcrowded_long_funding");
+  if (!funding) missingSources.push("funding");
+
+  return {
+    symbol: token?.symbol || "unknown",
+    contract_address: token?.contract_address || null,
+    generated_at: nowIso(),
+    signals: {
+      story_momentum: Math.max(0, Math.min(1, (change24 + 20) / 40)),
+      smart_wallet_accumulation: flow?.flow_direction === "accumulation" ? 0.7 : 0.35,
+      liquidity_trend: liquidity >= 250000 ? 0.8 : liquidity >= 100000 ? 0.55 : 0.2,
+      holder_concentration_risk: 0.5,
+      social_velocity: 0,
+      contract_risk: toNum(token?.fraud_risk, 0) / 100,
+      quote_depth_quality: liquidity >= 250000 ? 0.8 : liquidity >= 100000 ? 0.5 : 0.2
+    },
+    positive_reasons: positiveReasons,
+    negative_reasons: negativeReasons,
+    missing_sources: missingSources,
+    source_metadata: {
+      generated_from: ["e3d", "quant_context", "portfolio"],
+      market_regime: portfolio?.stats?.market_regime || "unknown"
+    }
+  };
+}
+
+function buildCycleSignalSnapshot(portfolio) {
+  const tokens = Object.values(portfolio?.positions || {}).map((pos) => ({
+    symbol: pos.symbol,
+    contract_address: pos.contract_address,
+    liquidity_usd: pos.liquidity_usd,
+    change_24h_pct: pos.last_market_snapshot?.market_data?.change_24h_pct,
+    fraud_risk: pos.fraud_risk
+  }));
+  return {
+    generated_at: nowIso(),
+    signals: tokens.map((token) => buildSignalSnapshotForToken(token, portfolio))
+  };
+}
+
+function buildArbitrageSignals(portfolio) {
+  return Object.values(portfolio?.positions || {}).slice(0, 8).map((pos) => {
+    const price = toNum(pos.current_price, 0);
+    const snapshotPrice = toNum(pos.last_market_snapshot?.market_data?.current_price, price);
+    const grossSpreadPct = price > 0 && snapshotPrice > 0 ? Math.abs(price - snapshotPrice) / price * 100 : 0;
+    const estimatedCostPct = 0.9;
+    const netEdgePct = grossSpreadPct - estimatedCostPct;
+    return {
+      symbol: pos.symbol,
+      contract_address: pos.contract_address,
+      observed_at: nowIso(),
+      venue_a: "e3d_portfolio_mark",
+      venue_b: "latest_market_snapshot",
+      gross_spread_pct: Number(grossSpreadPct.toFixed(4)),
+      estimated_cost_pct: estimatedCostPct,
+      net_edge_pct: Number(netEdgePct.toFixed(4)),
+      feasibility: netEdgePct > 0 ? "watch_only" : "not_viable",
+      reason_codes: netEdgePct > 0 ? ["spread_positive_after_costs"] : ["spread_below_estimated_costs"],
+      execution_allowed: false
+    };
+  });
+}
+
 function isInCooldown(portfolio, symbol) {
   if (!portfolio || !symbol) return false;
   const until = portfolio.cooldowns?.[symbol];
@@ -1005,7 +1428,15 @@ function buildExecutorProposal(action, portfolio, tradeKind) {
       open_positions: Object.keys(portfolio?.positions || {}).length
     },
     proposed_allocation_usd: toNum(action?.allocation_usd, 0),
-    proposed_exit_fraction: toNum(action?.sell_fraction, 0),
+    proposed_exit_fraction: toNum(action?.suggested_exit_fraction ?? action?.sell_fraction, 0),
+    position_sizing: action?.position_sizing || null,
+    regime_policy: _cycleRegimePolicy || null,
+    signal_snapshot: token?.contract_address && _cycleSignalSnapshot?.signals
+      ? _cycleSignalSnapshot.signals.find((item) => cleanAddress(item.contract_address) === cleanAddress(token.contract_address)) || null
+      : null,
+    arbitrage_signal: token?.contract_address && Array.isArray(_cycleArbitrageSignals)
+      ? _cycleArbitrageSignals.find((item) => cleanAddress(item.contract_address) === cleanAddress(token.contract_address)) || null
+      : null,
     reason: action?.reason || null,
     from_symbol: action?.from_symbol || null
   };
@@ -1650,6 +2081,9 @@ function setCachedDossier(cacheKey, value) {
 let _cycleMarketContext = null;
 // Quant context: DexScreener order flow, macro regime, Binance funding rates — reset each cycle.
 let _cycleQuantContext = null;
+let _cycleRegimePolicy = null;
+let _cycleSignalSnapshot = null;
+let _cycleArbitrageSignals = [];
 // Story types actually returned by the E3D API this cycle — used to make coverage scoring fair.
 // Coverage only grades against types that were present in the data, not the full expected list.
 let _cycleAvailableStoryTypes = null;
@@ -2792,6 +3226,12 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
     !quantMacro.new_positions_ok ? "⚠ MACRO GATE: new_positions_ok=false — only propose TIER 1 setups with conviction >= 0.75" : "",
     quantMacro.tighten_stops ? "⚠ TIGHTEN STOPS: high greed or BTC pullback — size down, tighten invalidation levels" : "",
   ].filter(Boolean) : [];
+  const policyLines = _cycleRegimePolicy ? [
+    `\n--- REGIME SENTINEL POLICY ---`,
+    `regime=${_cycleRegimePolicy.regime} allow_new_buys=${_cycleRegimePolicy.allow_new_buys} allow_rotations=${_cycleRegimePolicy.allow_rotations} allocation_multiplier=${_cycleRegimePolicy.allocation_multiplier}`,
+    `reason_codes=${(_cycleRegimePolicy.reason_codes || []).join(", ")}`,
+    !_cycleRegimePolicy.allow_new_buys ? "Policy blocks speculative new buys unless a deterministic later gate explicitly allows them." : ""
+  ].filter(Boolean) : [];
 
   // Build funding rate warning for Scout (overcrowded longs to avoid)
   const overcrowdedSymbols = Object.entries(_cycleQuantContext?.funding_rates || {})
@@ -2801,6 +3241,21 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
     `\n--- FUNDING RATE WARNINGS ---`,
     `Overcrowded longs (avoid new entries): ${overcrowdedSymbols.join(", ")}`,
   ] : [];
+  const signalLines = _cycleSignalSnapshot?.signals?.length ? [
+    `\n--- SIGNAL CURATOR SNAPSHOT ---`,
+    JSON.stringify(_cycleSignalSnapshot.signals.slice(0, 8).map((item) => ({
+      symbol: item.symbol,
+      contract_address: item.contract_address,
+      signals: item.signals,
+      positive_reasons: item.positive_reasons,
+      negative_reasons: item.negative_reasons,
+      missing_sources: item.missing_sources
+    })))
+  ] : [];
+  const arbitrageLines = _cycleArbitrageSignals?.length ? [
+    `\n--- ARBITRAGE WATCHER (watch-only, never execute directly) ---`,
+    JSON.stringify(_cycleArbitrageSignals.slice(0, 8))
+  ] : [];
 
   // Split user message into fixed before/after the candidates section so we can
   // batch candidates across multiple LLM calls without OOMing the GPU.
@@ -2808,7 +3263,10 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
     `Scout task — ${createdAt} [token universe sorted by: ${data.sortLabel}]`,
     `Portfolio: cash=$${portfolio?.cash_usd ?? 100000} positions=${Object.keys(portfolio?.positions || {}).length}`,
     ...macroLines,
+    ...policyLines,
     ...fundingLines,
+    ...signalLines,
+    ...arbitrageLines,
     `Token universe: ${data.tokenUniverse.length} tradeable tokens (stablecoins/wrapped assets excluded), ${data.tokenUniverse.filter(t => (t.liquidity_usd||0) > 100000).length} with liq>$100k, ${data.tokenUniverse.filter(t => (t.market_cap_usd||0) > 2000000).length} with mcap>$2M`,
     `Story types in data (you must report all of these in stories_checked): ${allStoryTypes.join(", ")}`,
     `\n--- E3D AGENT CANDIDATES (primary signal — multi-story convergence, use these first) ---`,
@@ -3270,12 +3728,18 @@ function runHarvestDirect(portfolio, portfolioIntelligence = null) {
     harvestMacro.fear_greed ? `Fear&Greed: ${harvestMacro.fear_greed.value}/100 — ${harvestMacro.fear_greed.label}` : "",
     harvestMacro.tighten_stops ? "⚠ TIGHTEN STOPS: take partial profits on positions > 15% gain; tighten all stops" : "Stops: normal — no macro-driven tightening required",
   ].filter(Boolean) : [];
+  const harvestPolicyLines = _cycleRegimePolicy ? [
+    `\n--- REGIME SENTINEL POLICY ---`,
+    `regime=${_cycleRegimePolicy.regime} allow_harvest_exits=${_cycleRegimePolicy.allow_harvest_exits} tighten_stops=${_cycleRegimePolicy.tighten_stops}`,
+    `reason_codes=${(_cycleRegimePolicy.reason_codes || []).join(", ")}`
+  ] : [];
 
   const userMessage = [
     `Harvest task — ${createdAt}`,
     `Held positions (${positionData.length}) — prices are live (refreshed this cycle), pnl_pct is real:`,
     JSON.stringify(positionData),
     ...harvestMacroLines,
+    ...harvestPolicyLines,
     `\n--- EXIT RISK STORIES (matched to held addresses) ---`,
     ...exitRiskTypes.map((type) => {
       const matches = storyMatches[type] || [];
@@ -3359,7 +3823,10 @@ function buildScoutPrompt(portfolio, portfolioIntelligence = null) {
     market_regime: dossier.market_regime,
     portfolio: dossier.prompt_snapshot.portfolio,
     thesis_snapshot: dossier.prompt_snapshot.thesis_snapshot,
-    holdings: holdings
+    holdings: holdings,
+    regime_policy: _cycleRegimePolicy || null,
+    signal_snapshot: _cycleSignalSnapshot || null,
+    arbitrage_watch_only: _cycleArbitrageSignals || []
   };
   const compactPortfolioBaseline = JSON.stringify(portfolioBaseline);
 
@@ -3636,17 +4103,21 @@ function runRiskDirect(proposal, paperMode = false) {
 
 function deterministicBuyGate(proposal, portfolio) {
   const blockers = [];
+  const dataQuality = proposal?.market_data_quality || buildMarketDataQuality(proposal, {
+    evaluated_at: proposal?.created_at || proposal?.signal_snapshot?.generated_at || nowIso()
+  });
   const addr = cleanAddress(proposal?.token?.contract_address || "");
-  const price = optionalNum(proposal?.market_data?.current_price);
-  const liquidity = optionalNum(proposal?.liquidity_data?.liquidity_usd);
+  const price = optionalNum(dataQuality?.normalized?.price_usd ?? proposal?.market_data?.current_price);
+  const liquidity = optionalNum(dataQuality?.normalized?.liquidity_usd ?? proposal?.liquidity_data?.liquidity_usd);
   const marketCap = optionalNum(proposal?.market_data?.market_cap_usd);
   const volume24h = optionalNum(proposal?.market_data?.volume_24h_usd);
-  const slippageBps = optionalNum(proposal?.execution_data?.estimated_slippage_bps);
+  const slippageBps = optionalNum(dataQuality?.normalized?.slippage_bps ?? proposal?.execution_data?.estimated_slippage_bps);
   const fragilityScore = optionalNum(proposal?._fragility_score);
   const fraudRisk = optionalNum(proposal?.fraud_risk);
   const confidence = normalizeScore(proposal?.confidence);
   const flowSignal = String(proposal?._dex_flow?.flow_signal || "").toLowerCase();
   const fundingAvoid = proposal?._funding_rate?.avoid_new_longs === true;
+  const curatedNegativeReasons = Array.isArray(proposal?.signal_snapshot?.negative_reasons) ? proposal.signal_snapshot.negative_reasons : [];
   const evidenceCount = Array.isArray(proposal?.evidence) ? proposal.evidence.length : 0;
   const category = proposal?.token?.category || "unknown";
   const categoryPct = categoryExposurePct(portfolio, category);
@@ -3662,12 +4133,15 @@ function deterministicBuyGate(proposal, portfolio) {
   if (confidence != null && confidence <= 55) blockers.push("confidence_too_low");
   if (flowSignal === "distribution" || flowSignal === "strong_distribution") blockers.push("bearish_order_flow");
   if (fundingAvoid) blockers.push("overcrowded_long_funding");
+  if (curatedNegativeReasons.includes("smart_wallet_distribution")) blockers.push("curated_signal_distribution");
+  if (curatedNegativeReasons.includes("overcrowded_long_funding")) blockers.push("curated_signal_overcrowded_long");
   if (evidenceCount < 2) blockers.push("insufficient_signal_evidence");
   if (categoryPct >= toNum(portfolio?.settings?.category_cap_pct, SETTINGS_DEFAULTS.category_cap_pct)) blockers.push("category_exposure_cap_reached");
+  for (const blocker of dataQuality.blockers || []) blockers.push(`market_data_${blocker}`);
 
   return {
     ok: blockers.length === 0,
-    blockers,
+    blockers: [...new Set(blockers)],
     metrics: {
       price,
       liquidity_usd: liquidity,
@@ -3679,8 +4153,12 @@ function deterministicBuyGate(proposal, portfolio) {
       confidence,
       flow_signal: flowSignal || null,
       funding_avoid_new_longs: fundingAvoid,
+      curated_negative_reasons: curatedNegativeReasons,
       evidence_count: evidenceCount,
-      category_exposure_pct: categoryPct
+      category_exposure_pct: categoryPct,
+      data_quality_id: dataQuality.data_quality_id,
+      data_quality_confidence: dataQuality.normalized?.confidence ?? null,
+      data_quality_warnings: dataQuality.warnings || []
     }
   };
 }
@@ -3706,6 +4184,19 @@ function runRiskForCandidates(candidates, portfolio) {
 
   const paperMode = Boolean(portfolio?.settings?.paper_mode);
   for (const proposal of candidates) {
+    const marketDataQuality = buildMarketDataQuality(proposal, {
+      evaluated_at: proposal?.created_at || proposal?.signal_snapshot?.generated_at || nowIso()
+    });
+    proposal.market_data_quality = marketDataQuality;
+    proposal.market_data_quality_id = marketDataQuality.data_quality_id;
+    proposal.market_data_quality_ref = buildMarketDataQualityRef(marketDataQuality, { context: "candidate_risk_review" });
+    proposal.signal_snapshot = buildSignalSnapshotForToken({
+      symbol: proposal?.token?.symbol,
+      contract_address: proposal?.token?.contract_address,
+      liquidity_data: proposal?.liquidity_data,
+      market_data: proposal?.market_data,
+      fraud_risk: proposal?.fraud_risk
+    }, portfolio);
     const gate = deterministicBuyGate(proposal, portfolio);
     const risk = gate.ok
       ? runRiskDirect(proposal, paperMode)
@@ -3867,8 +4358,94 @@ function resolveExecutorAllocation(action, review, portfolio) {
   return allocationUsd;
 }
 
+function buildPositionSizingDecision(action, portfolio, tradeKind = "buy") {
+  const settings = portfolio?.settings || SETTINGS_DEFAULTS;
+  const policy = _cycleRegimePolicy || regimePolicy(portfolio?.stats?.market_regime || "neutral", settings);
+  const equity = equityUsd(portfolio);
+  const candidate = action?.candidate || action?.to_candidate || action || {};
+  const token = candidate?.token || action?.token || {};
+  const symbol = token.symbol || action?.symbol || action?.from_symbol || "unknown";
+  const liquidity = toNum(candidate?.liquidity_data?.liquidity_usd ?? action?.liquidity_data?.liquidity_usd, 0);
+  const fraudRisk = toNum(candidate?.fraud_risk, 0);
+  const slippageBps = toNum(candidate?.execution_data?.estimated_slippage_bps, 0);
+  const drawdown = toNum(portfolio?.stats?.max_drawdown_pct, 0);
+  const reasonCodes = [];
+  const blockers = [];
+
+  const regimeMultiplier = policy.regime === "risk_on" ? 1.05 : policy.regime === "risk_off" ? 0.4 : 0.85;
+  const liquidityMultiplier = liquidity <= 0 ? 0.75 : liquidity < 100000 ? 0.65 : 1;
+  const performanceMultiplier = policy.reason_codes?.includes("high_win_rate_negative_expectancy") || policy.reason_codes?.includes("negative_recent_profit_factor") ? 0.65 : 1;
+  const drawdownMultiplier = drawdown > 0.05 ? 0.7 : drawdown > 0.03 ? 0.85 : 1;
+  const totalMultiplier = Math.min(1, regimeMultiplier * liquidityMultiplier * performanceMultiplier * drawdownMultiplier);
+
+  if (policy.regime === "risk_off") reasonCodes.push("risk_off_size_reduction");
+  else reasonCodes.push(`${policy.regime || "neutral"}_regime`);
+  if (liquidity <= 0) reasonCodes.push("missing_liquidity");
+  else if (liquidity < 100000) reasonCodes.push("liquidity_thin");
+  else reasonCodes.push("liquidity_sufficient");
+  if (performanceMultiplier < 1) reasonCodes.push("negative_setup_expectancy_warning");
+  if (drawdownMultiplier < 1) reasonCodes.push("drawdown_size_reduction");
+  if (fraudRisk >= settings.reject_fraud_risk_gte) blockers.push("fraud_risk_blocker");
+  if (slippageBps > 150) reasonCodes.push("slippage_size_reduction");
+  if (tradeKind === "buy" && !policy.allow_buys) blockers.push("policy_blocks_new_buys");
+
+  const approvedPct = toNum(candidate?._risk?.approved_size_pct, 0) / 100;
+  const basePct = approvedPct > 0 ? approvedPct : settings.risk_per_trade_pct;
+  const recommendedPct = Math.min(basePct * totalMultiplier, settings.max_position_pct);
+  let maxAllocationUsd = Math.min(toNum(action?.allocation_usd, equity * recommendedPct), equity * recommendedPct, portfolio.cash_usd);
+
+  if (tradeKind === "buy") {
+    const categoryPct = categoryExposurePct(portfolio, token.category || "unknown");
+    const categoryHeadroom = Math.max(0, settings.category_cap_pct - categoryPct);
+    maxAllocationUsd = Math.min(maxAllocationUsd, equity * categoryHeadroom);
+    if (maxAllocationUsd < settings.min_trade_usd) blockers.push("below_min_trade_usd");
+  }
+
+  const rawExitFraction = toNum(action?.suggested_exit_fraction ?? action?.fraction, toNum(action?._risk?.approved_exit_fraction, 0.5));
+  const recommendedExitFraction = Math.max(0.1, Math.min(1, rawExitFraction * (policy.tighten_stops ? 1.1 : 1)));
+  const decision = {
+    symbol,
+    contract_address: token.contract_address || action?.contract_address || null,
+    action: tradeKind === "exit" ? "trim" : tradeKind,
+    recommended_size_pct: Number((recommendedPct * 100).toFixed(4)),
+    recommended_exit_fraction: Number(recommendedExitFraction.toFixed(4)),
+    max_allocation_usd: Number(Math.max(0, maxAllocationUsd).toFixed(2)),
+    sizing_reason_codes: reasonCodes,
+    risk_adjustments: {
+      regime_multiplier: regimeMultiplier,
+      liquidity_multiplier: liquidityMultiplier,
+      performance_multiplier: performanceMultiplier,
+      drawdown_multiplier: drawdownMultiplier
+    },
+    blocker_list: blockers
+  };
+  recordAuxiliaryEvent("position_sizing_decision", "position_sizer", portfolio, { decision, action });
+  return decision;
+}
+
+function applySizingToBuyAction(action, sizing) {
+  if (sizing.blocker_list?.length) return null;
+  return {
+    ...action,
+    allocation_usd: Math.min(toNum(action.allocation_usd, 0), toNum(sizing.max_allocation_usd, 0)),
+    position_sizing: sizing
+  };
+}
+
+function applySizingToExitAction(action, sizing) {
+  if (sizing.blocker_list?.includes("fraud_risk_blocker")) return null;
+  return {
+    ...action,
+    suggested_exit_fraction: toNum(sizing.recommended_exit_fraction, action.suggested_exit_fraction),
+    position_sizing: sizing
+  };
+}
+
 function buildPaperTradeTicket(candidate, allocationUsd, review, reason) {
-  const assumedEntry = toNum(candidate?.market_data?.current_price, 0);
+  const marketDataQuality = candidate?.market_data_quality || buildMarketDataQuality(candidate, {
+    evaluated_at: candidate?.created_at || nowIso()
+  });
+  const assumedEntry = toNum(marketDataQuality.normalized?.price_usd, toNum(candidate?.market_data?.current_price, 0));
   return {
     created_at: nowIso(),
     assumed_entry: assumedEntry,
@@ -3876,13 +4453,107 @@ function buildPaperTradeTicket(candidate, allocationUsd, review, reason) {
     targets: deepClone(sanitizeTargets(candidate?.targets, assumedEntry)),
     thesis_summary: candidate?.summary ?? candidate?.thesis_summary ?? null,
     edge_source: candidate?.edge_source ?? null,
+    setup_type: candidate?.setup_type ?? null,
+    liquidity_usd: toNum(marketDataQuality.normalized?.liquidity_usd, 0),
+    spread_bps: toNum(marketDataQuality.normalized?.spread_bps, 0),
     reason,
     allocation_usd: allocationUsd,
     executor_decision: executorDecision(review),
     approved_size_pct: toNum(review?.approved_size_pct, 0),
+    position_sizing: candidate?.position_sizing || null,
     max_slippage_bps: toNum(review?.max_slippage_bps, 0),
-    follow_up_action: review?.follow_up_action ?? null
+    follow_up_action: review?.follow_up_action ?? null,
+    data_quality_id: marketDataQuality.data_quality_id,
+    market_data_quality_ref: candidate?.market_data_quality_ref || buildMarketDataQualityRef(marketDataQuality, { context: "paper_trade_ticket" }),
+    market_data_quality: deepClone(marketDataQuality),
+    token_risk_scan_id: candidate?.token_risk_scan_id || null,
+    token_risk_scan_ref: candidate?.token_risk_scan_ref || null,
+    token_risk_scan: candidate?.token_risk_scan ? deepClone(candidate.token_risk_scan) : null
   };
+}
+
+function buildPaperFillExecution(trade) {
+  const side = String(trade?.side || "").toLowerCase() === "sell" ? "sell" : "buy";
+  const price = toNum(trade?.price, 0);
+  const requestedNotional = side === "sell"
+    ? toNum(trade?.proceeds_usd, toNum(trade?.quantity, 0) * price)
+    : toNum(trade?.cost_usd, toNum(trade?.paper_trade_ticket?.allocation_usd, toNum(trade?.quantity, 0) * price));
+  const quantity = toNum(trade?.quantity, price > 0 ? requestedNotional / price : 0);
+
+  const execution = {
+    model_version: PAPER_FILL_MODEL_VERSION,
+    decision: "filled",
+    rejection_reason: null,
+    side,
+    arrival_price: price,
+    decision_price: price,
+    quote_price: price,
+    simulated_fill_price: price,
+    fill_price: price,
+    requested_notional_usd: requestedNotional,
+    requested_quantity: quantity,
+    filled_notional_usd: requestedNotional,
+    quantity,
+    fill_ratio: 1,
+    rejection_ratio: 0,
+    fee_bps: 0,
+    slippage_bps: 0,
+    fee_usd: 0,
+    slippage_usd: 0,
+    time_to_fill_ms: 0
+  };
+  const executionControl = buildLiquidityExecutionControls(trade, execution, {
+    modelVersion: "paper-liquidity-execution-controls-v1"
+  });
+  return {
+    ...execution,
+    execution_control_id: executionControl.control_id,
+    quote_id: executionControl.quote_id,
+    liquidity_execution_control: executionControl
+  };
+}
+
+function attachPaperOrderLifecycle(trade, options = {}) {
+  if (!trade) return null;
+  const context = getTrainingContext() || {};
+  trade.strategy_version = trade.strategy_version || PAPER_ORDER_STRATEGY_VERSION;
+  const execution = options.execution || trade.simulated_execution || buildPaperFillExecution(trade);
+  const order = createOrderLifecycleRecord({
+    mode: "paper",
+    strategyVersion: trade.strategy_version,
+    trade,
+    execution,
+    planned_at: trade.ts,
+    signal_snapshot_ref: options.signal_snapshot_ref || (_cycleSignalSnapshot ? {
+      event_type: "signal_snapshot",
+      cycle_id: context.cycle_id || null,
+      pipeline_run_id: context.pipeline_run_id || null
+    } : null),
+    risk_decision_ref: options.risk_decision_ref || trade.risk_decision_ref || trade.paper_trade_ticket?.risk_decision_ref || (trade.candidate_id ? {
+      event_type: "risk_decision",
+      candidate_id: trade.candidate_id,
+      cycle_id: context.cycle_id || null
+    } : null),
+    sizing_decision_ref: options.sizing_decision_ref || trade.paper_trade_ticket?.position_sizing || null,
+    portfolio_mutation_ref: {
+      type: "portfolio_json",
+      collection: trade.side === "sell" ? "closed_trades/action_history" : "action_history",
+      trade_id: trade.trade_id || null,
+      position_id: trade.position_id || null,
+      mutation_applied: true
+    },
+    context: {
+      pipeline_run_id: context.pipeline_run_id || null,
+      cycle_id: context.cycle_id || null,
+      cycle_index: context.cycle_index ?? null,
+      token_risk_scan_id: trade.token_risk_scan_id || trade.paper_trade_ticket?.token_risk_scan_id || null
+    }
+  });
+  trade.order_id = order.order_id;
+  trade.order_ids = [order.order_id];
+  trade.order_lifecycle = order;
+  trade.simulated_execution = execution;
+  return order;
 }
 
 // Update held position prices using the token universe fetched this cycle.
@@ -4062,6 +4733,22 @@ function executeSell(portfolio, action) {
   };
 
   trade.trade_id = buildTradeId(trade, getTrainingContext());
+  const sellTokenRiskScan = buildPositionTokenRiskScan(pos, portfolio, {
+    evaluated_at: trade.ts,
+    side: "sell",
+    trade_id: trade.trade_id,
+    source_trade_id: trade.trade_id
+  });
+  if (sellTokenRiskScan) {
+    attachTokenRiskScanMetadata(trade, sellTokenRiskScan, getTrainingContext());
+    recordTokenRiskScanEvent(sellTokenRiskScan, portfolio, getTrainingContext(), {
+      trade_id: trade.trade_id,
+      position_id: trade.position_id,
+      candidate_id: trade.candidate_id,
+      trade_kind: "sell"
+    });
+  }
+  attachPaperOrderLifecycle(trade);
 
   portfolio.closed_trades.push(trade);
   portfolio.action_history.push(trade);
@@ -4149,6 +4836,9 @@ function executeRotation(portfolio, action, review = null) {
     equity * allocPct,
     sellTrade.proceeds_usd
   );
+  if (action.position_sizing?.max_allocation_usd != null) {
+    allocationUsd = Math.min(allocationUsd, toNum(action.position_sizing.max_allocation_usd, allocationUsd));
+  }
 
   const categoryPct = categoryExposurePct(portfolio, candidate.token.category || "unknown");
   const remainingCategoryHeadroom =
@@ -4165,28 +4855,68 @@ function executeRotation(portfolio, action, review = null) {
     return { sellTrade, buyTrade: null };
   }
 
-  const buyTrade = openPosition(portfolio, candidate, allocationUsd, `rotation_in:${action.reason}`);
+  const evaluationTs = nowIso();
+  const rotationRiskDecision = evaluateRiskDecision({
+    mode: "paper",
+    enforcement_mode: "enforced",
+    evaluated_at: evaluationTs,
+    portfolio,
+    intent: buildBuyRiskIntent(candidate, allocationUsd, "rotation"),
+    analytics: buildPortfolioRiskAnalytics(portfolio, evaluationTs)
+  });
+  recordRiskEngineDecisionEvent(rotationRiskDecision, portfolio, getTrainingContext(), {
+    candidate_id: candidate?.training_candidate_id || candidate?.token?.contract_address || candidate?.token?.symbol || null,
+    proposed_allocation_usd: allocationUsd,
+    trade_kind: "rotation"
+  });
+  if (rotationRiskDecision.decision === "block") return { sellTrade, buyTrade: null };
+
+  const rotationTokenRiskScan = buildCandidateTokenRiskScan(candidate, portfolio, {
+    evaluated_at: evaluationTs,
+    mode: "paper",
+    side: "buy",
+    risk_decision_id: rotationRiskDecision.risk_decision_id,
+    risk_decision_ref: buildRiskDecisionRef(rotationRiskDecision, getTrainingContext()),
+    signal_snapshot_ref: candidate?.signal_snapshot || null
+  });
+  attachTokenRiskScanMetadata(candidate, rotationTokenRiskScan, getTrainingContext());
+  recordTokenRiskScanEvent(rotationTokenRiskScan, portfolio, getTrainingContext(), {
+    candidate_id: candidate?.training_candidate_id || candidate?.token?.contract_address || candidate?.token?.symbol || null,
+    position_id: candidate?.training_position_id || null,
+    trade_kind: "rotation"
+  });
+
+  const rotationTicket = buildPaperTradeTicket(
+    { ...candidate, position_sizing: action.position_sizing || null },
+    allocationUsd,
+    review,
+    `rotation_in:${action.reason}`
+  );
+  rotationTicket.rotation_from_symbol = action.from_symbol;
+  rotationTicket.rotation_score_delta = toNum(action.score_delta, 0);
+
+  const buyTrade = openPosition(portfolio, candidate, allocationUsd, `rotation_in:${action.reason}`, {
+    strategyVersion: PAPER_ORDER_STRATEGY_VERSION,
+    paperTradeTicket: rotationTicket,
+    riskDecision: rotationRiskDecision,
+    tokenRiskScan: rotationTokenRiskScan
+  });
   if (buyTrade) {
-    buyTrade.paper_trade_ticket = buildPaperTradeTicket(
-      candidate,
-      allocationUsd,
-      review,
-      `rotation_in:${action.reason}`
-    );
-    buyTrade.paper_trade_ticket.rotation_from_symbol = action.from_symbol;
-    buyTrade.paper_trade_ticket.rotation_score_delta = toNum(action.score_delta, 0);
+    attachRiskDecisionMetadata(buyTrade, rotationRiskDecision, getTrainingContext());
+    attachPaperOrderLifecycle(buyTrade, { risk_decision_ref: buyTrade.risk_decision_ref });
   }
 
   return { sellTrade, buyTrade };
 }
 
-function openPosition(portfolio, candidate, allocationUsd, reason = "buy") {
+function openPosition(portfolio, candidate, allocationUsd, reason = "buy", options = {}) {
   const price = toNum(candidate?.market_data?.current_price, 0);
   if (!(price > 0)) return null;
   if (allocationUsd < portfolio.settings.min_trade_usd) return null;
   if (portfolio.cash_usd < allocationUsd) return null;
 
   const symbol = candidate.token.symbol;
+  const strategyVersion = options.strategyVersion || candidate?.strategy_version || PAPER_ORDER_STRATEGY_VERSION;
   const stopPrice = saneStopPrice(candidate.invalidation_price, price);
   const targets = sanitizeTargets(candidate.targets, price);
 
@@ -4197,6 +4927,7 @@ function openPosition(portfolio, candidate, allocationUsd, reason = "buy") {
   const quantity = allocationUsd / price;
   const context = getTrainingContext();
   const training = ensureCandidateTrainingMetadata(candidate, context);
+  const tokenRiskScan = options.tokenRiskScan || options.paperTradeTicket?.token_risk_scan || candidate?.token_risk_scan || null;
 
   portfolio.cash_usd -= allocationUsd;
 
@@ -4214,9 +4945,15 @@ function openPosition(portfolio, candidate, allocationUsd, reason = "buy") {
     existing.targets = targets;
     existing.score = candidate._score ?? computePositionScoreLike(candidate);
     existing.category = candidate.token.category || existing.category || "unknown";
+    existing.strategy_version = strategyVersion;
     existing.last_updated_at = nowIso();
     existing.training_candidate_id = existing.training_candidate_id || training.candidate_id;
     existing.training_position_id = existing.training_position_id || training.position_id;
+    if (tokenRiskScan?.token_risk_scan_id) {
+      existing.token_risk_scan_id = tokenRiskScan.token_risk_scan_id;
+      existing.token_risk_scan_ref = buildTokenRiskScanRef(tokenRiskScan, context);
+      existing.token_risk_scan = deepClone(tokenRiskScan);
+    }
   } else {
     portfolio.positions[symbol] = {
       symbol,
@@ -4238,10 +4975,14 @@ function openPosition(portfolio, candidate, allocationUsd, reason = "buy") {
       fraud_risk: toNum(candidate.fraud_risk, 0),
       liquidity_usd: toNum(candidate?.liquidity_data?.liquidity_usd, 0),
       liquidity_quality: toNum(candidate.liquidity_quality, 0),
+      strategy_version: strategyVersion,
       opened_at: nowIso(),
       last_updated_at: nowIso(),
       training_candidate_id: training.candidate_id,
       training_position_id: training.position_id,
+      token_risk_scan_id: tokenRiskScan?.token_risk_scan_id || null,
+      token_risk_scan_ref: tokenRiskScan?.token_risk_scan_id ? buildTokenRiskScanRef(tokenRiskScan, context) : null,
+      token_risk_scan: tokenRiskScan ? deepClone(tokenRiskScan) : null,
       last_market_snapshot: {
         market_data: deepClone(candidate.market_data || {}),
         liquidity_data: deepClone(candidate.liquidity_data || {}),
@@ -4261,12 +5002,23 @@ function openPosition(portfolio, candidate, allocationUsd, reason = "buy") {
     cost_usd: allocationUsd,
     score: candidate._score ?? computePositionScoreLike(candidate),
     trade_lifecycle: "open",
+    strategy_version: strategyVersion,
     candidate_id: training.candidate_id,
     position_id: training.position_id,
     trade_id: null
   };
 
   trade.trade_id = buildTradeId(trade, context);
+  if (options.paperTradeTicket) {
+    trade.paper_trade_ticket = deepClone(options.paperTradeTicket);
+  }
+  if (tokenRiskScan) {
+    attachTokenRiskScanMetadata(trade, tokenRiskScan, context);
+  }
+  if (options.riskDecision) {
+    attachRiskDecisionMetadata(trade, options.riskDecision, context);
+  }
+  attachPaperOrderLifecycle(trade);
 
   portfolio.action_history.push(trade);
   recordTradeEvent(trade, portfolio, context, {
@@ -4437,6 +5189,7 @@ function buildManagerReport(cycleState, portfolio) {
   const harvestMeta = cycleState.harvest_llm_meta || getLastLLMMeta("harvest") || {};
   const riskDecisions = Array.isArray(cycleState.risk_decisions) ? cycleState.risk_decisions : [];
   const executorDecisions = Array.isArray(cycleState.executor_decisions) ? cycleState.executor_decisions : [];
+  const sizingDecisions = cycleTrainingEvents.filter((record) => record.event_type === "position_sizing_decision");
   const buys = Array.isArray(cycleState.cycle_actions?.buys) ? cycleState.cycle_actions.buys : [];
   const sells = Array.isArray(cycleState.cycle_actions?.sells) ? cycleState.cycle_actions.sells : [];
   const rotations = Array.isArray(cycleState.cycle_actions?.rotations) ? cycleState.cycle_actions.rotations : [];
@@ -4618,6 +5371,15 @@ function buildManagerReport(cycleState, portfolio) {
     pushManagerFlag(executorFlags, "critical", "executor", "EXECUTOR_LIVE_TRADE_IN_PAPER", "Executor allowed live execution while paper mode is enabled.");
   }
 
+  const sizerFlags = [];
+  const sizerBlocked = sizingDecisions.filter((record) => (record?.payload?.decision?.blocker_list || []).length > 0);
+  if (sizingDecisions.some((record) => toNum(record?.payload?.decision?.recommended_size_pct, 0) > toNum(portfolio?.settings?.max_position_pct, SETTINGS_DEFAULTS.max_position_pct) * 100)) {
+    pushManagerFlag(sizerFlags, "critical", "sizer", "SIZER_MAX_POSITION_BREACH", "Sizer recommended a size above max_position_pct.");
+  }
+  if (sizingDecisions.some((record) => (record?.payload?.decision?.sizing_reason_codes || []).includes("missing_liquidity") && toNum(record?.payload?.decision?.risk_adjustments?.liquidity_multiplier, 1) >= 1)) {
+    pushManagerFlag(sizerFlags, "warning", "sizer", "SIZER_MISSING_LIQUIDITY_NOT_REDUCED", "Sizer did not reduce size for missing liquidity.");
+  }
+
   const pipelineFlags = [];
   const currentEquity = toNum(portfolioSnapshot.equity_usd, toNum(cycleState.stats?.equity_usd, 0));
   const previousCycleEnd = [...cycleTrainingEvents].reverse().find((record) => record.event_type === "cycle_end" && record.cycle_id !== cycleState.cycle_id);
@@ -4654,12 +5416,14 @@ function buildManagerReport(cycleState, portfolio) {
   const harvestScore = scoreFromFlags(harvestFlags);
   const riskScore = scoreFromFlags(riskFlags);
   const executorScore = scoreFromFlags(executorFlags);
+  const sizerScore = scoreFromFlags(sizerFlags);
   const pipelineScore = scoreFromFlags(pipelineFlags);
   const overallScore = Math.round(
     (scoutScore * 0.25)
     + (harvestScore * 0.25)
     + (riskScore * 0.25)
-    + (executorScore * 0.15)
+    + (executorScore * 0.12)
+    + (sizerScore * 0.03)
     + (pipelineScore * 0.10)
   );
 
@@ -4675,7 +5439,7 @@ function buildManagerReport(cycleState, portfolio) {
     overall_grade: gradeFromScore(overallScore),
     overall_score: overallScore,
     summary: "",
-    flags: [...scoutFlags, ...harvestFlags, ...riskFlags, ...executorFlags, ...pipelineFlags],
+    flags: [...scoutFlags, ...harvestFlags, ...riskFlags, ...executorFlags, ...sizerFlags, ...pipelineFlags],
     agents: {
       scout: {
         grade: gradeFromScore(scoutScore),
@@ -4719,6 +5483,13 @@ function buildManagerReport(cycleState, portfolio) {
         paper_trades_recorded: buys.length + sells.length + rotations.length,
         live_execution_allowed: false,
         flags: executorFlags
+      },
+      sizer: {
+        grade: gradeFromScore(sizerScore),
+        score: sizerScore,
+        decisions_made: sizingDecisions.length,
+        blocked_by_guardrails: sizerBlocked.length,
+        flags: sizerFlags
       },
       pipeline: {
         grade: gradeFromScore(pipelineScore),
@@ -4820,10 +5591,38 @@ async function runCycle(runContext = {}) {
   // Reset per-cycle state
   _cycleMarketContext = null;
   _cycleQuantContext = null;
+  _cycleRegimePolicy = null;
+  _cycleSignalSnapshot = null;
+  _cycleArbitrageSignals = [];
   _cycleAvailableStoryTypes = null;
 
   const portfolio = loadPortfolio();
   pruneCooldowns(portfolio);
+  const trainingContext = {
+    pipeline_run_id: runContext.pipeline_run_id || crypto.randomUUID(),
+    cycle_id: runContext.cycle_id || crypto.randomUUID(),
+    cycle_index: runContext.cycle_index ?? null,
+    market_regime: portfolio.stats.market_regime || "unknown"
+  };
+  recordOperatorAction({
+    action_type: "pipeline_cycle_start",
+    actor: runContext.actor || "pipeline",
+    role: "operator",
+    reason: runContext.reason || "paper pipeline cycle started",
+    resource: "pipeline",
+    new_state: {
+      mode: "paper",
+      pipeline_run_id: trainingContext.pipeline_run_id,
+      cycle_id: trainingContext.cycle_id,
+      cycle_index: trainingContext.cycle_index
+    },
+    correlation_id: trainingContext.cycle_id,
+    metadata: {
+      debug_mode: Boolean(runContext.debugMode),
+      live_submission_enabled: false
+    }
+  });
+  setTrainingContext(trainingContext);
   // Build quant context: DexScreener flow for held positions, macro regime, Binance funding rates.
   // Four external API calls total — all synchronous curl, completing in ~3s.
   _cycleQuantContext = buildCycleQuantContext(portfolio);
@@ -4836,6 +5635,20 @@ async function runCycle(runContext = {}) {
     token_flow_count: Object.keys(_cycleQuantContext.token_flow || {}).length,
     funding_rates_count: Object.keys(_cycleQuantContext.funding_rates || {}).length,
   });
+  _cycleRegimePolicy = buildRegimeSentinelPolicy(portfolio, _cycleQuantContext);
+  portfolio.stats.market_regime = _cycleRegimePolicy.regime;
+  trainingContext.market_regime = _cycleRegimePolicy.regime;
+  setTrainingContext(trainingContext);
+  log("regime_sentinel", _cycleRegimePolicy);
+  recordAuxiliaryEvent("regime_policy", "regime_sentinel", portfolio, { policy: _cycleRegimePolicy });
+  _cycleSignalSnapshot = buildCycleSignalSnapshot(portfolio);
+  log("signal_curator", _cycleSignalSnapshot);
+  recordAuxiliaryEvent("signal_snapshot", "signal_curator", portfolio, _cycleSignalSnapshot);
+  _cycleArbitrageSignals = buildArbitrageSignals(portfolio);
+  log("arbitrage_watcher", _cycleArbitrageSignals);
+  for (const signal of _cycleArbitrageSignals) {
+    recordAuxiliaryEvent("arbitrage_signal", "arbitrage_watcher", portfolio, signal);
+  }
   const portfolioIntelligence = buildPortfolioIntelligenceDossier(portfolio);
   if (runContext.debugMode) {
     const debugSnapshot = buildDebugHandoffSnapshot(portfolio, portfolioIntelligence, runContext);
@@ -4850,16 +5663,10 @@ async function runCycle(runContext = {}) {
       scout_candidate_count: debugSnapshot.scout.candidate_debug.candidate_count,
       scout_reviewed_tokens: debugSnapshot.scout.candidate_debug.total_tokens_reviewed
     });
+    setTrainingContext(null);
     return debugSnapshot;
   }
 
-  const trainingContext = {
-    pipeline_run_id: runContext.pipeline_run_id || crypto.randomUUID(),
-    cycle_id: runContext.cycle_id || crypto.randomUUID(),
-    cycle_index: runContext.cycle_index ?? null,
-    market_regime: portfolio.stats.market_regime || "unknown"
-  };
-  setTrainingContext(trainingContext);
   recordCycleEvent("cycle_start", trainingContext, portfolio, {
     settings: deepClone(portfolio.settings),
     portfolio_intelligence: portfolioIntelligence.prompt_snapshot
@@ -4910,7 +5717,10 @@ async function runCycle(runContext = {}) {
     }
     if (harvestRejected.length) log("harvest_rejected", harvestRejected);
 
-    const harvestReviews = runExecutorForActions(harvestApproved, portfolio, "exit");
+    const sizedHarvestApproved = harvestApproved
+      .map((action) => applySizingToExitAction(action, buildPositionSizingDecision(action, portfolio, "exit")))
+      .filter(Boolean);
+    const harvestReviews = runExecutorForActions(sizedHarvestApproved, portfolio, "exit");
     if (harvestReviews.length) {
       log("executor_exit", harvestReviews.map((item) => ({
         symbol: item.action.token?.symbol || item.action.symbol,
@@ -4941,6 +5751,7 @@ async function runCycle(runContext = {}) {
           approved_exit_fraction: toNum(item.review?.approved_exit_fraction, 0) || fraction,
           follow_up_action: item.review?.follow_up_action ?? null
         };
+        attachPaperOrderLifecycle(trade);
         harvestTrades.push(trade);
       }
     }
@@ -4957,9 +5768,13 @@ async function runCycle(runContext = {}) {
     log("risk_rejected", rejected);
 
     const marketRegime = computeMarketRegime(scoutPayload, approved, portfolio);
-    const policy = regimePolicy(marketRegime.regime, portfolio.settings);
-    portfolio.stats.market_regime = marketRegime.regime;
-    trainingContext.market_regime = marketRegime.regime;
+    if (marketRegime.regime === "risk_off" && _cycleRegimePolicy?.regime !== "risk_off") {
+      _cycleRegimePolicy = buildRegimeSentinelPolicy({ ...portfolio, stats: { ...portfolio.stats, market_regime: "risk_off" } }, _cycleQuantContext);
+      _cycleRegimePolicy.reason_codes = [...new Set([...( _cycleRegimePolicy.reason_codes || []), "post_risk_regime_downgrade"])];
+    }
+    const policy = _cycleRegimePolicy || regimePolicy(marketRegime.regime, portfolio.settings);
+    portfolio.stats.market_regime = policy.regime;
+    trainingContext.market_regime = policy.regime;
     setTrainingContext(trainingContext);
     log("market_regime", { ...marketRegime, policy });
 
@@ -4972,8 +5787,10 @@ async function runCycle(runContext = {}) {
     const rotationActions = policy.allow_rotations
       ? evaluateRotationActions(portfolio, approved).slice(0, policy.max_rotations_per_cycle)
       : [];
+    const sizedRotationActions = rotationActions
+      .map((action) => ({ ...action, position_sizing: buildPositionSizingDecision(action, portfolio, "rotation") }));
     const rotationReviews = policy.allow_rotations
-      ? runExecutorForActions(rotationActions, portfolio, "rotation")
+      ? runExecutorForActions(sizedRotationActions, portfolio, "rotation")
       : [];
     if (rotationReviews.length) {
       log("executor_rotation", rotationReviews.map((item) => ({
@@ -5004,7 +5821,7 @@ async function runCycle(runContext = {}) {
     }
 
     // 8. NORMAL BUY ENGINE
-    const buyActions = policy.allow_buys
+    const rawBuyActions = policy.allow_buys
       ? evaluateBuyActions(portfolio, approved)
           .slice(0, policy.max_buys_per_cycle)
           .map((action) => ({
@@ -5013,6 +5830,9 @@ async function runCycle(runContext = {}) {
           }))
           .filter((action) => action.allocation_usd >= portfolio.settings.min_trade_usd)
       : [];
+    const buyActions = rawBuyActions
+      .map((action) => applySizingToBuyAction(action, buildPositionSizingDecision(action, portfolio, "buy")))
+      .filter((action) => action && action.allocation_usd >= portfolio.settings.min_trade_usd);
     const buyReviews = policy.allow_buys
       ? runExecutorForActions(buyActions, portfolio, "buy")
       : [];
@@ -5031,19 +5851,59 @@ async function runCycle(runContext = {}) {
       const allocationUsd = resolveExecutorAllocation(item.action, item.review, portfolio);
       if (allocationUsd < portfolio.settings.min_trade_usd) continue;
 
+      const evaluationTs = nowIso();
+      const riskDecision = evaluateRiskDecision({
+        mode: "paper",
+        enforcement_mode: "enforced",
+        evaluated_at: evaluationTs,
+        portfolio,
+        intent: buildBuyRiskIntent(item.action.candidate, allocationUsd, "buy"),
+        analytics: buildPortfolioRiskAnalytics(portfolio, evaluationTs)
+      });
+      recordRiskEngineDecisionEvent(riskDecision, portfolio, getTrainingContext(), {
+        candidate_id: item.action.candidate?.training_candidate_id || item.action.candidate?.token?.contract_address || item.action.candidate?.token?.symbol || null,
+        proposed_allocation_usd: allocationUsd,
+        trade_kind: "buy"
+      });
+      if (riskDecision.decision === "block") continue;
+
+      const tokenRiskScan = buildCandidateTokenRiskScan(item.action.candidate, portfolio, {
+        evaluated_at: evaluationTs,
+        mode: "paper",
+        side: "buy",
+        risk_decision_id: riskDecision.risk_decision_id,
+        risk_decision_ref: buildRiskDecisionRef(riskDecision, getTrainingContext()),
+        signal_snapshot_ref: item.action.proposal?.signal_snapshot || item.action.candidate?.signal_snapshot || null
+      });
+      attachTokenRiskScanMetadata(item.action.candidate, tokenRiskScan, getTrainingContext());
+      recordTokenRiskScanEvent(tokenRiskScan, portfolio, getTrainingContext(), {
+        candidate_id: item.action.candidate?.training_candidate_id || item.action.candidate?.token?.contract_address || item.action.candidate?.token?.symbol || null,
+        position_id: item.action.candidate?.training_position_id || null,
+        trade_kind: "buy"
+      });
+
+      const paperTradeTicket = buildPaperTradeTicket(
+        { ...item.action.candidate, position_sizing: item.action.position_sizing || null },
+        allocationUsd,
+        item.review,
+        item.action.reason
+      );
+
       const trade = openPosition(
         portfolio,
         item.action.candidate,
         allocationUsd,
-        `${item.action.reason}:${executorDecision(item.review) || "paper_trade"}`
+        `${item.action.reason}:${executorDecision(item.review) || "paper_trade"}`,
+        {
+          strategyVersion: PAPER_ORDER_STRATEGY_VERSION,
+          paperTradeTicket,
+          riskDecision,
+          tokenRiskScan
+        }
       );
       if (trade) {
-        trade.paper_trade_ticket = buildPaperTradeTicket(
-          item.action.candidate,
-          allocationUsd,
-          item.review,
-          item.action.reason
-        );
+        attachRiskDecisionMetadata(trade, riskDecision, getTrainingContext());
+        attachPaperOrderLifecycle(trade, { risk_decision_ref: trade.risk_decision_ref });
         buyTrades.push(trade);
       }
     }
@@ -5134,6 +5994,26 @@ async function runCycle(runContext = {}) {
     });
   } finally {
     setTrainingContext(null);
+    recordOperatorAction({
+      action_type: "pipeline_cycle_stop",
+      actor: runContext.actor || "pipeline",
+      role: "operator",
+      reason: "paper pipeline cycle ended",
+      resource: "pipeline",
+      previous_state: {
+        mode: "paper",
+        pipeline_run_id: trainingContext.pipeline_run_id,
+        cycle_id: trainingContext.cycle_id,
+        cycle_index: trainingContext.cycle_index
+      },
+      new_state: {
+        mode: "cycle_complete",
+        pipeline_run_id: trainingContext.pipeline_run_id,
+        cycle_id: trainingContext.cycle_id,
+        cycle_index: trainingContext.cycle_index
+      },
+      correlation_id: trainingContext.cycle_id
+    });
   }
 }
 
@@ -5141,15 +6021,50 @@ async function main() {
   const cli = parseCliArgs(process.argv.slice(2));
   const pipelineRunId = crypto.randomUUID();
   const debugMode = Boolean(cli.debug);
+  recordOperatorAction({
+    action_type: "pipeline_start",
+    actor: "pipeline_cli",
+    role: "operator",
+    reason: cli.loop ? "pipeline loop process started" : "single paper pipeline run started",
+    resource: "pipeline",
+    new_state: {
+      mode: cli.loop ? "loop" : "once",
+      pipeline_run_id: pipelineRunId,
+      interval_ms: cli.intervalMs,
+      max_iterations: Number.isFinite(cli.maxIterations) ? cli.maxIterations : null,
+      debug_mode: debugMode
+    },
+    correlation_id: pipelineRunId
+  });
 
   if (!cli.loop) {
     await runCycle({ pipeline_run_id: pipelineRunId, cycle_id: crypto.randomUUID(), cycle_index: 1, debugMode });
+    recordOperatorAction({
+      action_type: "pipeline_stop",
+      actor: "pipeline_cli",
+      role: "operator",
+      reason: "single paper pipeline run completed",
+      resource: "pipeline",
+      previous_state: { mode: "once", pipeline_run_id: pipelineRunId },
+      new_state: { mode: "stopped", pipeline_run_id: pipelineRunId },
+      correlation_id: pipelineRunId
+    });
     return;
   }
 
   let stopRequested = false;
   process.on("SIGINT", () => {
     stopRequested = true;
+    recordOperatorAction({
+      action_type: "pipeline_stop",
+      actor: "pipeline_cli",
+      role: "operator",
+      reason: "stop signal received; finishing current cycle before exit",
+      resource: "pipeline",
+      previous_state: { mode: "loop", pipeline_run_id: pipelineRunId },
+      new_state: { mode: "stopping", pipeline_run_id: pipelineRunId },
+      correlation_id: pipelineRunId
+    });
     console.log("\n🛑 Stop requested; finishing current cycle before exit...\n");
   });
 
@@ -5170,6 +6085,17 @@ async function main() {
     console.log(`\n⏳ Sleeping ${Math.round(cli.intervalMs / 1000)}s before the next cycle...\n`);
     await sleep(cli.intervalMs);
   }
+
+  recordOperatorAction({
+    action_type: "pipeline_stop",
+    actor: "pipeline_cli",
+    role: "operator",
+    reason: stopRequested ? "pipeline loop stopped by request" : "pipeline loop completed max iterations",
+    resource: "pipeline",
+    previous_state: { mode: "loop", pipeline_run_id: pipelineRunId },
+    new_state: { mode: "stopped", pipeline_run_id: pipelineRunId, iterations: iteration },
+    correlation_id: pipelineRunId
+  });
 }
 
 main().catch((err) => {

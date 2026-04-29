@@ -69,6 +69,14 @@ function badgeForGrade(grade) {
   return "badge";
 }
 
+function badgeForOperationalStatus(status) {
+  const value = String(status || "").toLowerCase();
+  if (["paper_ready", "healthy", "running", "allow", "reconciled", "approved_for_paper", "approved_for_shadow"].includes(value)) return "badge badge-green";
+  if (["degraded", "warning", "limited"].includes(value)) return "badge badge-amber";
+  if (["blocked", "failed", "mismatch", "blocked_live_only"].includes(value) || value.startsWith("approved_for_tiny_live") || value.startsWith("approved_for_scaled_live")) return "badge badge-red";
+  return "badge";
+}
+
 function formatPipelineStatus(status) {
   if (!status) return "Unknown";
   if (status.running) {
@@ -113,6 +121,11 @@ function prettyAgo(value) {
   if (mins < 60) return `${mins}m ago`;
   const hrs = Math.round(mins / 60);
   return `${hrs}h ago`;
+}
+
+function formatPct(value, digits = 2) {
+  const num = Number(value);
+  return Number.isFinite(num) ? `${num.toFixed(digits)}%` : "—";
 }
 
 function normalizeDecision(value) {
@@ -254,6 +267,221 @@ function MetricCard({ label, value, sublabel, tone = "" }) {
     React.createElement("div", { className: "metric-label" }, label),
     React.createElement("div", { className: "metric-value" }, value),
     sublabel ? React.createElement("div", { className: "metric-sublabel" }, sublabel) : null
+  );
+}
+
+function ProfessionalDashboardPanel({ professional, error }) {
+  const overall = professional?.overall || {};
+  const performance = professional?.performance || {};
+  const strategy = professional?.strategy || {};
+  const execution = professional?.execution || {};
+  const risk = professional?.risk || {};
+  const cryptoOps = professional?.crypto_ops || {};
+  const audit = professional?.audit || {};
+  const incidents = professional?.incidents || {};
+  const daily = performance.daily || null;
+  const backtest = strategy.backtest || performance.backtest || null;
+  const promotion = strategy.promotion || null;
+  const attribution = strategy.attribution || performance.attribution || null;
+  const operations = cryptoOps.operations || null;
+  const reconciliation = cryptoOps.reconciliation || null;
+  const custody = cryptoOps.custody || null;
+  const blockedReasons = Array.isArray(risk.top_blocked_reasons) ? risk.top_blocked_reasons : [];
+  const utilRows = Array.isArray(risk.utilization) ? risk.utilization : [];
+  const recentOrders = Array.isArray(execution.recent_orders) ? execution.recent_orders : [];
+  const recentActions = Array.isArray(audit.recent_operator_actions) ? audit.recent_operator_actions : [];
+  const positiveSetups = Array.isArray(attribution?.top_positive_setups) ? attribution.top_positive_setups : [];
+  const negativeSetups = Array.isArray(attribution?.top_negative_setups) ? attribution.top_negative_setups : [];
+  const activeIncidents = Array.isArray(incidents.active) ? incidents.active : [];
+  const resolvedIncidents = Array.isArray(incidents.resolved) ? incidents.resolved : [];
+
+  return React.createElement(
+    "section",
+    { className: "card panel professional-panel" },
+    React.createElement(
+      "div",
+      { className: "panel-head" },
+      React.createElement("h2", null, "Professional Dashboard"),
+      React.createElement("span", { className: "panel-note" }, professional?.generated_at ? `Updated ${prettyAgo(professional.generated_at)}` : "Read-only status view")
+    ),
+    error ? React.createElement("div", { className: "card error" }, error) : null,
+    React.createElement(
+      "div",
+      { className: "professional-status-strip" },
+      React.createElement(
+        "div",
+        { className: "professional-status-main" },
+        React.createElement(
+          "div",
+          { className: "professional-status-head" },
+          React.createElement("span", { className: badgeForOperationalStatus(overall.status) }, String(overall.status || "unknown").replace(/_/g, " ")),
+          React.createElement("span", { className: "badge badge-blue" }, professional?.trading_mode || "paper"),
+          React.createElement("span", { className: "badge badge-red" }, professional?.live_submission_enabled ? "live enabled" : "live disabled")
+        ),
+        React.createElement("div", { className: "professional-status-copy" }, overall.summary || "No professional summary yet.")
+      ),
+      React.createElement(
+        "div",
+        { className: "professional-status-metrics" },
+        React.createElement("div", { className: "professional-mini-stat" }, React.createElement("span", null, "Trade now"), React.createElement("strong", null, overall.can_trade_now ? "yes" : "no")),
+        React.createElement("div", { className: "professional-mini-stat" }, React.createElement("span", null, "New buys"), React.createElement("strong", null, overall.new_buys_allowed ? "allowed" : "blocked")),
+        React.createElement("div", { className: "professional-mini-stat" }, React.createElement("span", null, "Ops"), React.createElement("strong", null, operations?.overall_status || "unknown")),
+        React.createElement("div", { className: "professional-mini-stat" }, React.createElement("span", null, "Reconciliation"), React.createElement("strong", null, reconciliation?.status || "missing"))
+      )
+    ),
+    React.createElement(
+      "div",
+      { className: "professional-grid professional-grid-top" },
+      React.createElement("div", { className: "professional-box" },
+        React.createElement("span", null, "24h realized PnL"),
+        React.createElement("strong", null, daily ? fmtUsd.format(Number(daily.realized_pnl_usd || 0)) : "—"),
+        React.createElement("small", null, daily ? `${formatPct(daily.win_rate || 0)} win rate · PF ${daily.profit_factor == null ? "n/a" : fmtNum.format(Number(daily.profit_factor || 0))}` : "No daily scorecard")
+      ),
+      React.createElement("div", { className: "professional-box" },
+        React.createElement("span", null, "Backtest edge"),
+        React.createElement("strong", null, backtest ? formatPct(backtest.total_return_pct || 0) : "—"),
+        React.createElement("small", null, backtest ? `PF ${backtest.profit_factor == null ? "n/a" : fmtNum.format(Number(backtest.profit_factor || 0))} · MDD ${formatPct(backtest.max_drawdown_pct || 0)}` : "No replay report")
+      ),
+      React.createElement("div", { className: "professional-box" },
+        React.createElement("span", null, "Promotion"),
+        React.createElement("strong", null, promotion?.promotion_decision || "missing"),
+        React.createElement("small", null, promotion ? `${promotion.blocker_count || 0} blockers · target ${promotion.target_state || "unknown"}` : "No promotion report")
+      ),
+      React.createElement("div", { className: "professional-box" },
+        React.createElement("span", null, "Execution drag"),
+        React.createElement("strong", null, execution?.backtest_execution_quality?.fee_slippage_drag_usd != null ? fmtUsd.format(Number(execution.backtest_execution_quality.fee_slippage_drag_usd || 0)) : backtest?.fee_slippage_drag_usd != null ? fmtUsd.format(Number(backtest.fee_slippage_drag_usd || 0)) : "—"),
+        React.createElement("small", null, execution?.backtest_execution_quality ? `Fill ${formatPct((execution.backtest_execution_quality.fill_ratio || 0) * 100, 1)} · Slip ${execution.backtest_execution_quality.average_slippage_bps ?? "—"} bps` : "No execution summary")
+      )
+    ),
+    React.createElement(
+      "div",
+      { className: "professional-grid professional-grid-main" },
+      React.createElement(
+        "div",
+        { className: "professional-section" },
+        React.createElement("div", { className: "professional-section-title" }, "Risk"),
+        React.createElement("div", { className: "professional-kv-list" },
+          React.createElement("div", { className: "professional-kv-row" }, React.createElement("span", null, "Kill switches"), React.createElement("strong", null, (risk.active_kill_switches || []).length ? risk.active_kill_switches.join(", ") : "none")),
+          React.createElement("div", { className: "professional-kv-row" }, React.createElement("span", null, "Latest decision"), React.createElement("strong", null, risk.latest_decision ? `${risk.latest_decision.decision} ${risk.latest_decision.symbol ? `· ${risk.latest_decision.symbol}` : ""}` : "none")),
+          React.createElement("div", { className: "professional-kv-row" }, React.createElement("span", null, "Market regime"), React.createElement("strong", null, String(risk.market_regime || "unknown").replace(/_/g, " "))),
+          React.createElement("div", { className: "professional-kv-row" }, React.createElement("span", null, "Blocked reasons"), React.createElement("strong", null, blockedReasons.length ? blockedReasons.slice(0, 3).map((item) => `${item.reason} ×${item.count}`).join(", ") : "none"))
+        ),
+        React.createElement(
+          "div",
+          { className: "professional-chip-list" },
+          utilRows.slice(0, 4).map((item) => React.createElement(
+            "div",
+            { className: "professional-chip", key: item.key },
+            React.createElement("span", null, item.label),
+            React.createElement("strong", null, item.utilization_pct == null ? "—" : formatPct(item.utilization_pct))
+          ))
+        ),
+        React.createElement(
+          "div",
+          { className: "professional-subsection" },
+          React.createElement("div", { className: "professional-subtitle" }, "Top exposure"),
+          React.createElement("div", { className: "professional-list" },
+            (risk.exposure?.by_token || []).slice(0, 4).map((item) => React.createElement("div", { className: "professional-list-row", key: item.key }, React.createElement("span", null, item.key), React.createElement("strong", null, fmtUsd.format(Number(item.value_usd || 0)))))
+          )
+        )
+      ),
+      React.createElement(
+        "div",
+        { className: "professional-section" },
+        React.createElement("div", { className: "professional-section-title" }, "Strategy + Performance"),
+        React.createElement("div", { className: "professional-kv-list" },
+          React.createElement("div", { className: "professional-kv-row" }, React.createElement("span", null, "Strategy version"), React.createElement("strong", null, strategy.backtest?.strategy_version || strategy.promotion?.strategy_version || "unknown")),
+          React.createElement("div", { className: "professional-kv-row" }, React.createElement("span", null, "Expectancy"), React.createElement("strong", null, attribution?.expectancy_usd == null ? "—" : fmtUsd.format(Number(attribution.expectancy_usd || 0)))),
+          React.createElement("div", { className: "professional-kv-row" }, React.createElement("span", null, "Neg. expectancy groups"), React.createElement("strong", null, attribution?.negative_expectancy_group_count == null ? "—" : String(attribution.negative_expectancy_group_count))),
+          React.createElement("div", { className: "professional-kv-row" }, React.createElement("span", null, "Benchmark drag"), React.createElement("strong", null, backtest?.execution_cost_impact?.total_return_pct_points == null ? "—" : `${fmtNum.format(Number(backtest.execution_cost_impact.total_return_pct_points || 0))} pts`))
+        ),
+        React.createElement(
+          "div",
+          { className: "professional-subsection" },
+          React.createElement("div", { className: "professional-subtitle" }, "Best setups"),
+          React.createElement("div", { className: "professional-list" },
+            positiveSetups.slice(0, 3).map((item, index) => React.createElement("div", { className: "professional-list-row", key: `${item.setup_label || item.key || index}-pos` }, React.createElement("span", null, item.setup_label || item.key || "setup"), React.createElement("strong", null, item.expectancy_usd == null ? "—" : fmtUsd.format(Number(item.expectancy_usd || 0)))))
+          )
+        ),
+        React.createElement(
+          "div",
+          { className: "professional-subsection" },
+          React.createElement("div", { className: "professional-subtitle" }, "Worst setups"),
+          React.createElement("div", { className: "professional-list" },
+            negativeSetups.slice(0, 3).map((item, index) => React.createElement("div", { className: "professional-list-row", key: `${item.setup_label || item.key || index}-neg` }, React.createElement("span", null, item.setup_label || item.key || "setup"), React.createElement("strong", null, item.expectancy_usd == null ? "—" : fmtUsd.format(Number(item.expectancy_usd || 0)))))
+          )
+        )
+      ),
+      React.createElement(
+        "div",
+        { className: "professional-section" },
+        React.createElement("div", { className: "professional-section-title" }, "Execution + Order Lifecycle"),
+        React.createElement("div", { className: "professional-kv-list" },
+          React.createElement("div", { className: "professional-kv-row" }, React.createElement("span", null, "Recent orders"), React.createElement("strong", null, String(execution.recent_order_count || 0))),
+          React.createElement("div", { className: "professional-kv-row" }, React.createElement("span", null, "Rejected / failed"), React.createElement("strong", null, String(execution.rejected_count || 0))),
+          React.createElement("div", { className: "professional-kv-row" }, React.createElement("span", null, "Avg slippage"), React.createElement("strong", null, execution.average_slippage_bps == null ? "—" : `${fmtNum.format(Number(execution.average_slippage_bps || 0))} bps`)),
+          React.createElement("div", { className: "professional-kv-row" }, React.createElement("span", null, "Avg fee"), React.createElement("strong", null, execution.average_fee_bps == null ? "—" : `${fmtNum.format(Number(execution.average_fee_bps || 0))} bps`))
+        ),
+        React.createElement(
+          "div",
+          { className: "professional-chip-list" },
+          Object.entries(execution.lifecycle_counts || {}).slice(0, 6).map(([state, count]) => React.createElement(
+            "div",
+            { className: "professional-chip", key: state },
+            React.createElement("span", null, state.replace(/_/g, " ")),
+            React.createElement("strong", null, String(count))
+          ))
+        ),
+        React.createElement(
+          "div",
+          { className: "professional-subsection" },
+          React.createElement("div", { className: "professional-subtitle" }, "Latest orders"),
+          React.createElement("div", { className: "professional-list" },
+            recentOrders.length
+              ? recentOrders.map((item, index) => React.createElement(
+                  "div",
+                  { className: "professional-list-row", key: item.order_id || `${item.symbol || "order"}-${index}` },
+                  React.createElement("span", null, `${item.symbol || "?"} ${item.side || ""} · ${String(item.state || "unknown").replace(/_/g, " ")}`),
+                  React.createElement("strong", null, item.reason || "ok")
+                ))
+              : React.createElement("div", { className: "empty-state" }, "No lifecycle records yet.")
+          )
+        )
+      ),
+      React.createElement(
+        "div",
+        { className: "professional-section" },
+        React.createElement("div", { className: "professional-section-title" }, "Ops + Audit"),
+        React.createElement("div", { className: "professional-kv-list" },
+          React.createElement("div", { className: "professional-kv-row" }, React.createElement("span", null, "Operations"), React.createElement("strong", null, operations?.overall_status || "unknown")),
+          React.createElement("div", { className: "professional-kv-row" }, React.createElement("span", null, "Custody policy"), React.createElement("strong", null, custody?.capability_status || "unknown")),
+          React.createElement("div", { className: "professional-kv-row" }, React.createElement("span", null, "Audit policy"), React.createElement("strong", null, audit.permission_decision || "unknown")),
+          React.createElement("div", { className: "professional-kv-row" }, React.createElement("span", null, "Data quality"), React.createElement("strong", null, professional?.data_quality?.average_confidence == null ? "—" : fmtNum.format(Number(professional.data_quality.average_confidence || 0))))
+        ),
+        React.createElement(
+          "div",
+          { className: "professional-subsection" },
+          React.createElement("div", { className: "professional-subtitle" }, "Recent operator actions"),
+          React.createElement("div", { className: "professional-list" },
+            recentActions.length
+              ? recentActions.slice(0, 4).map((item) => React.createElement("div", { className: "professional-list-row", key: item.audit_event_id || `${item.ts}-${item.action_type}` }, React.createElement("span", null, `${item.action_type} · ${item.role}`), React.createElement("strong", null, prettyAgo(item.ts))))
+              : React.createElement("div", { className: "empty-state" }, "No recent operator actions.")
+          )
+        ),
+        React.createElement(
+          "div",
+          { className: "professional-subsection" },
+          React.createElement("div", { className: "professional-subtitle" }, "Incidents"),
+          React.createElement("div", { className: "professional-list" },
+            activeIncidents.length
+              ? activeIncidents.map((item) => React.createElement("div", { className: "professional-list-row", key: item.incident_id || item.summary }, React.createElement("span", null, `${item.severity} · ${item.summary}`), React.createElement("strong", null, item.root_cause || "active")))
+              : resolvedIncidents.length
+                ? resolvedIncidents.slice(0, 3).map((item) => React.createElement("div", { className: "professional-list-row", key: item.incident_id || item.summary }, React.createElement("span", null, `resolved · ${item.summary}`), React.createElement("strong", null, item.root_cause || "closed")))
+                : React.createElement("div", { className: "empty-state" }, "No incidents recorded.")
+          )
+        )
+      )
+    )
   );
 }
 
@@ -1140,6 +1368,7 @@ function PortfolioRow({ position }) {
   const timestampText = soldAt !== "—"
     ? `Purchased ${purchasedAt} · Sold ${soldAt}`
     : `Purchased ${purchasedAt}`;
+  const review = position?.review || null;
 
   return React.createElement(
     "div",
@@ -1204,7 +1433,17 @@ function PortfolioRow({ position }) {
         React.createElement("strong", null, `${deltaUsd >= 0 ? "+" : ""}${fmtUsd.format(deltaUsd)}`),
         React.createElement("span", { className: "portfolio-stat-sub" }, `${deltaPct >= 0 ? "+" : ""}${fmtNum.format(deltaPct)}%`)
       )
-    )
+    ),
+    review ? React.createElement(
+      "div",
+      { className: "trade-review-strip" },
+      React.createElement("div", { className: "trade-review-pill" }, `Label ${review.training_label || "neutral"}`),
+      React.createElement("div", { className: "trade-review-pill" }, `Entry ${review.entry_quality || "unknown"}`),
+      React.createElement("div", { className: "trade-review-pill" }, `Exit ${review.exit_quality || "unknown"}`),
+      React.createElement("div", { className: "trade-review-pill" }, `Agent ${review.primary_error_agent && review.primary_error_agent !== "none" ? review.primary_error_agent : review.primary_success_agent || "none"}`),
+      review.avoidable_loss ? React.createElement("div", { className: "trade-review-pill is-negative" }, "Avoidable loss") : null,
+      Array.isArray(review.lessons) && review.lessons[0] ? React.createElement("div", { className: "trade-review-lesson" }, review.lessons[0]) : null
+    ) : null
   );
 }
 
@@ -1561,6 +1800,16 @@ function App() {
   const [reportDetails, setReportDetails] = useState({});
   const [reportDetailLoading, setReportDetailLoading] = useState(null);
   const [reportDetailError, setReportDetailError] = useState(null);
+  const [performance, setPerformance] = useState(null);
+  const [performanceError, setPerformanceError] = useState(null);
+  const [readiness, setReadiness] = useState(null);
+  const [readinessError, setReadinessError] = useState(null);
+  const [operations, setOperations] = useState(null);
+  const [operationsError, setOperationsError] = useState(null);
+  const [professional, setProfessional] = useState(null);
+  const [professionalError, setProfessionalError] = useState(null);
+  const [auditStatus, setAuditStatus] = useState(null);
+  const [auditError, setAuditError] = useState(null);
 
   async function loadAuthStatus() {
     try {
@@ -1659,6 +1908,66 @@ function App() {
     }
   }
 
+  async function loadPerformance() {
+    try {
+      setPerformanceError(null);
+      const res = await fetch("/api/performance/latest");
+      const data = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(data?.error || data?.message || `HTTP ${res.status}`);
+      setPerformance(data);
+    } catch (err) {
+      setPerformanceError(err.message);
+    }
+  }
+
+  async function loadReadiness() {
+    try {
+      setReadinessError(null);
+      const res = await fetch("/api/retraining/readiness");
+      const data = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(data?.error || data?.message || `HTTP ${res.status}`);
+      setReadiness(data);
+    } catch (err) {
+      setReadinessError(err.message);
+    }
+  }
+
+  async function loadOperations() {
+    try {
+      setOperationsError(null);
+      const res = await fetch("/api/operations/latest");
+      const data = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(data?.error || data?.message || `HTTP ${res.status}`);
+      setOperations(data);
+    } catch (err) {
+      setOperationsError(err.message);
+    }
+  }
+
+  async function loadProfessional() {
+    try {
+      setProfessionalError(null);
+      const res = await fetch("/api/professional/summary");
+      const data = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(data?.error || data?.message || `HTTP ${res.status}`);
+      setProfessional(data);
+    } catch (err) {
+      setProfessionalError(err.message);
+    }
+  }
+
+  async function loadAuditStatus() {
+    try {
+      setAuditError(null);
+      const res = await fetch("/api/audit/status?action_type=mode_change_request&mode=paper&role=viewer");
+      const data = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(data?.error || data?.message || `HTTP ${res.status}`);
+      setAuditStatus(data);
+    } catch (err) {
+      setAuditError(err.message);
+    }
+  }
+
   async function load() {
     try {
       setError(null);
@@ -1693,7 +2002,11 @@ function App() {
       setPipelineError(null);
       setPipelineMessage(null);
       setError(null);
-      const res = await fetch("/api/reset-all", { method: "POST" });
+      const res = await fetch("/api/reset-all", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: "dashboard reset all request" })
+      });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
       setPipelineStatus(data.pipeline || null);
@@ -1711,7 +2024,7 @@ function App() {
       const res = await fetch("/api/pipeline/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ interval_seconds: Number(intervalSeconds) || 300 })
+        body: JSON.stringify({ interval_seconds: Number(intervalSeconds) || 300, reason: "dashboard start agents request" })
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
@@ -1727,7 +2040,11 @@ function App() {
     try {
       setPipelineError(null);
       setPipelineMessage(null);
-      const res = await fetch("/api/pipeline/stop", { method: "POST" });
+      const res = await fetch("/api/pipeline/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: "dashboard stop agents request" })
+      });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       setPipelineStatus(data.pipeline || null);
@@ -1740,6 +2057,22 @@ function App() {
   useEffect(() => {
     load();
     const id = setInterval(load, 10000);
+    return () => clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    loadPerformance();
+    loadReadiness();
+    loadOperations();
+    loadProfessional();
+    loadAuditStatus();
+    const id = setInterval(() => {
+      loadPerformance();
+      loadReadiness();
+      loadOperations();
+      loadProfessional();
+      loadAuditStatus();
+    }, 30000);
     return () => clearInterval(id);
   }, []);
 
@@ -1785,6 +2118,7 @@ function App() {
     (floorState.meters || []).some((meter) => Number(meter.value || 0) > 0)
   );
   const pipelineRunning = Boolean(pipelineStatus?.running);
+  const auditPolicy = auditStatus?.permission_policy || null;
   const orbitNodes = [
     { lane: lanes[0], className: "orbit-node orbit-scout", title: "Scout" },
     { lane: lanes[2], className: "orbit-node orbit-risk", title: "Risk" },
@@ -1820,6 +2154,130 @@ function App() {
             )
           )
         )
+  );
+
+  const performancePanel = React.createElement(
+    "div",
+    { className: "card panel performance-panel" },
+    React.createElement(
+      "div",
+      { className: "panel-head" },
+      React.createElement("h2", null, "Daily Performance"),
+      React.createElement("span", { className: "panel-note" }, performance?.generated_at ? `Updated ${prettyAgo(performance.generated_at)}` : "Run npm run performance:daily")
+    ),
+    performanceError ? React.createElement("div", { className: "card error" }, performanceError) : null,
+    performance ? React.createElement(
+      React.Fragment,
+      null,
+      React.createElement(
+        "div",
+        { className: "performance-grid" },
+        React.createElement("div", { className: "performance-stat" },
+          React.createElement("span", null, "Win rate"),
+          React.createElement("strong", null, `${fmtNum.format(Number(performance.win_rate || 0))}%`),
+          React.createElement("small", null, `${performance.trade_count || 0} closed trades`)
+        ),
+        React.createElement("div", { className: cls("performance-stat", Number(performance.realized_pnl_usd || 0) >= 0 ? "is-positive" : "is-negative") },
+          React.createElement("span", null, "Realized PnL"),
+          React.createElement("strong", null, fmtUsd.format(Number(performance.realized_pnl_usd || 0))),
+          React.createElement("small", null, "24h window")
+        ),
+        React.createElement("div", { className: "performance-stat" },
+          React.createElement("span", null, "Profit factor"),
+          React.createElement("strong", null, performance.profit_factor == null ? "n/a" : fmtNum.format(Number(performance.profit_factor || 0))),
+          React.createElement("small", null, `Retraining ${performance.retraining_recommendation || "hold"}`)
+        )
+      ),
+      React.createElement(
+        "div",
+        { className: "performance-losses" },
+        React.createElement("div", { className: "performance-losses-title" }, "Top loss reasons"),
+        performance.top_loss_reasons?.length
+          ? performance.top_loss_reasons.map((item) => React.createElement(
+              "div",
+              { className: "performance-loss-row", key: item.key },
+              React.createElement("span", null, String(item.key || "unknown").replace(/_/g, " ")),
+              React.createElement("strong", null, fmtUsd.format(Number(item.realized_pnl_usd || 0)))
+            ))
+          : React.createElement("div", { className: "empty-state" }, "No 24h loss reasons in the latest scorecard.")
+      )
+    ) : React.createElement("div", { className: "empty-state" }, "No daily performance scorecard has been generated yet.")
+  );
+
+  const readinessPanel = React.createElement(
+    "div",
+    { className: "card panel readiness-panel" },
+    React.createElement(
+      "div",
+      { className: "panel-head" },
+      React.createElement("h2", null, "Retraining Readiness"),
+      React.createElement("span", { className: "panel-note" }, readiness?.generated_at ? `Updated ${prettyAgo(readiness.generated_at)}` : "Run npm run retraining:readiness")
+    ),
+    readinessError ? React.createElement("div", { className: "card error" }, readinessError) : null,
+    readiness ? React.createElement(
+      React.Fragment,
+      null,
+      React.createElement(
+        "div",
+        { className: "readiness-grid" },
+        React.createElement("div", { className: cls("readiness-status", readiness.eligible ? "is-positive" : "is-hold") },
+          React.createElement("span", null, "Status"),
+          React.createElement("strong", null, readiness.eligible ? "Eligible" : "Hold"),
+          React.createElement("small", null, readiness.recommendation || "hold")
+        ),
+        React.createElement("div", { className: "readiness-status" },
+          React.createElement("span", null, "Reviews"),
+          React.createElement("strong", null, String(readiness.new_review_count || 0)),
+          React.createElement("small", null, `${readiness.positive_examples || 0} positive / ${readiness.negative_examples || 0} negative`)
+        ),
+        React.createElement("div", { className: "readiness-status" },
+          React.createElement("span", null, "Reason"),
+          React.createElement("strong", null, String(readiness.reason || "unknown").replace(/_/g, " ")),
+          React.createElement("small", null, `${readiness.neutral_examples || 0} neutral`)
+        )
+      ),
+      React.createElement(
+        "div",
+        { className: "readiness-list" },
+        (readiness.blockers?.length ? readiness.blockers : readiness.eligibility_reasons || []).slice(0, 4).map((item) => React.createElement("div", { className: "readiness-row", key: item }, String(item).replace(/_/g, " ")))
+      )
+    ) : React.createElement("div", { className: "empty-state" }, "No retraining readiness report has been generated yet.")
+  );
+
+  const operationsPanel = React.createElement(
+    "div",
+    { className: "card panel operations-panel" },
+    React.createElement(
+      "div",
+      { className: "panel-head" },
+      React.createElement("h2", null, "Policy + Signals"),
+      React.createElement("span", { className: "panel-note" }, operations?.generated_at ? `Updated ${prettyAgo(operations.generated_at)}` : "Waiting for next cycle")
+    ),
+    operationsError ? React.createElement("div", { className: "card error" }, operationsError) : null,
+    React.createElement(
+      "div",
+      { className: "operations-grid" },
+      React.createElement("div", { className: "operations-box" },
+        React.createElement("span", null, "Regime policy"),
+        React.createElement("strong", null, operations?.regime_policy?.regime || "unknown"),
+        React.createElement("small", null, (operations?.regime_policy?.reason_codes || []).slice(0, 2).join(", ") || "no policy event yet")
+      ),
+      React.createElement("div", { className: "operations-box" },
+        React.createElement("span", null, "Sizing"),
+        React.createElement("strong", null, operations?.latest_sizing_decision?.symbol || "none"),
+        React.createElement("small", null, operations?.latest_sizing_decision ? `${fmtUsd.format(Number(operations.latest_sizing_decision.max_allocation_usd || 0))} max` : "no sizing event yet")
+      ),
+      React.createElement("div", { className: "operations-box" },
+        React.createElement("span", null, "Signals"),
+        React.createElement("strong", null, String(operations?.latest_signal_snapshot?.signals?.length || 0)),
+        React.createElement("small", null, "normalized signal snapshots")
+      ),
+      React.createElement("div", { className: "operations-box" },
+        React.createElement("span", null, "Arbitrage"),
+        React.createElement("strong", null, operations?.latest_arbitrage_signal?.feasibility || "watch only"),
+        React.createElement("small", null, operations?.latest_arbitrage_signal ? `${operations.latest_arbitrage_signal.net_edge_pct}% net edge` : "no live execution")
+      )
+    )
   );
 
   const historyPanel = React.createElement(
@@ -1949,6 +2407,9 @@ function App() {
   const portfolioPage = React.createElement(
     "div",
     { className: "content-column-main" },
+    React.createElement(ProfessionalDashboardPanel, { professional, error: professionalError }),
+    performancePanel,
+    operationsPanel,
     portfolioPanel
   );
 
@@ -1961,6 +2422,7 @@ function App() {
   const historyPage = React.createElement(
     "div",
     { className: "content-column-main" },
+    readinessPanel,
     historyPanel
   );
 
@@ -2051,7 +2513,7 @@ function App() {
                 { className: "report-detail-section" },
                 React.createElement("div", { className: "report-detail-section-title" }, "Agents"),
                 React.createElement("div", { className: "report-agent-grid" },
-                  ["scout", "harvest", "risk", "executor", "pipeline"].map((agent) => {
+                  ["scout", "harvest", "risk", "executor", "sizer", "pipeline"].map((agent) => {
                     const item = detail.agents?.[agent] || {};
                     const notes = agent === "scout"
                       ? `${item.coverage_pct != null ? `${Math.round(Number(item.coverage_pct) * 100)}% coverage` : ""}${item.candidates_proposed != null ? ` · ${item.candidates_proposed} candidates` : ""}`
@@ -2061,7 +2523,9 @@ function App() {
                           ? `${item.approved ?? 0} approved / ${item.rejected ?? 0} rejected`
                           : agent === "executor"
                             ? `${item.paper_trades_recorded ?? 0} paper trades recorded`
-                            : `${item.cycle_duration_seconds ?? detail.cycle_duration_seconds ?? 0}s cycle`;
+                            : agent === "sizer"
+                              ? `${item.decisions_made ?? 0} decisions / ${item.blocked_by_guardrails ?? 0} blocked`
+                              : `${item.cycle_duration_seconds ?? detail.cycle_duration_seconds ?? 0}s cycle`;
                     return React.createElement(
                       "div",
                       { className: "report-agent-row", key: agent },
@@ -2155,6 +2619,40 @@ function App() {
         pipelineError ? React.createElement("div", { className: "pipeline-controls-error" }, pipelineError) : null,
         pipelineStatus?.pid ? React.createElement("div", { className: "pipeline-controls-meta" }, `PID ${pipelineStatus.pid}`) : null
       )
+    ),
+    React.createElement(
+      "section",
+      { className: "card audit-strip" },
+      React.createElement(
+        "div",
+        { className: "audit-strip-head" },
+        React.createElement("span", { className: "pipeline-controls-title" }, "Audit + Permissions"),
+        React.createElement("span", { className: auditPolicy?.decision === "allow" ? "badge badge-green" : "badge badge-red" }, auditPolicy?.decision || "unknown")
+      ),
+      React.createElement(
+        "div",
+        { className: "audit-strip-grid" },
+        React.createElement("div", { className: "audit-strip-item" },
+          React.createElement("span", null, "Current mode"),
+          React.createElement("strong", null, auditStatus?.current_mode || pipelineStatus?.mode || "stopped")
+        ),
+        React.createElement("div", { className: "audit-strip-item" },
+          React.createElement("span", null, "Local role"),
+          React.createElement("strong", null, auditPolicy?.operator?.role || "viewer")
+        ),
+        React.createElement("div", { className: "audit-strip-item" },
+          React.createElement("span", null, "Live submission"),
+          React.createElement("strong", null, auditPolicy?.live_submission_enabled ? "enabled" : "disabled")
+        ),
+        React.createElement("div", { className: "audit-strip-item" },
+          React.createElement("span", null, "Recent actions"),
+          React.createElement("strong", null, String(auditStatus?.recent_operator_actions?.length || 0))
+        )
+      ),
+      auditPolicy?.blockers?.length
+        ? React.createElement("div", { className: "pipeline-controls-error" }, `Blocked: ${auditPolicy.blockers.slice(0, 4).join(", ")}`)
+        : React.createElement("div", { className: "pipeline-controls-note" }, "Local operator records are enabled for paper, shadow, reports, resets, and promotion decisions."),
+      auditError ? React.createElement("div", { className: "pipeline-controls-error" }, auditError) : null
     ),
     React.createElement(E3DAuthPanel, {
       mode: authMode,
