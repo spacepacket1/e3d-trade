@@ -128,6 +128,59 @@ function formatPct(value, digits = 2) {
   return Number.isFinite(num) ? `${num.toFixed(digits)}%` : "—";
 }
 
+function formatCount(value) {
+  const num = Number(value);
+  return Number.isFinite(num) ? fmtNum.format(num) : "—";
+}
+
+function formatTokenUsage(value) {
+  const num = Number(value);
+  return Number.isFinite(num) ? fmtNum.format(num) : "—";
+}
+
+function compactList(values, limit = 3) {
+  return [...new Set((Array.isArray(values) ? values : [])
+    .map((value) => String(value || "").trim())
+    .filter(Boolean))].slice(0, limit);
+}
+
+function renderReportCandidateCard(item, keyPrefix = "candidate") {
+  if (!item || typeof item !== "object") return null;
+  const symbol = item.symbol || "?";
+  const status = String(item.status || item.action || "candidate").replace(/_/g, " ");
+  const labels = compactList(item.evidence_labels, 3);
+  const blockers = compactList(item.blockers, 3);
+  const warnings = compactList(item.warnings, 3);
+  return React.createElement(
+    "div",
+    { className: "report-candidate-card", key: `${keyPrefix}-${item.evidence_packet_id || item.contract_address || item.symbol || "unknown"}` },
+    React.createElement(
+      "div",
+      { className: "report-candidate-head" },
+      React.createElement(
+        "div",
+        { className: "report-candidate-identity" },
+        tokenLink(item.contract_address, symbol, "candidate-symbol"),
+        item.evidence_packet_id ? React.createElement("span", { className: "report-candidate-meta" }, item.evidence_packet_id) : null
+      ),
+      React.createElement("span", { className: "badge" }, status)
+    ),
+    React.createElement(
+      "div",
+      { className: "report-candidate-metrics" },
+      React.createElement("span", null, `Quality ${item.evidence_quality_score != null ? formatCount(item.evidence_quality_score) : "—"}`),
+      React.createElement("span", null, `Refs ${item.evidence_ref_count != null ? formatCount(item.evidence_ref_count) : "—"}`)
+    ),
+    item.decision_reason ? React.createElement("div", { className: "report-candidate-copy" }, item.decision_reason) : null,
+    labels.length ? React.createElement("div", { className: "candidate-evidence" }, labels.map((label, index) => React.createElement("span", { className: "candidate-evidence-tag", key: `${keyPrefix}-label-${index}` }, label))) : null,
+    blockers.length || warnings.length ? React.createElement(
+      "div",
+      { className: "candidate-risks" },
+      [...blockers, ...warnings].slice(0, 3).map((value, index) => React.createElement("span", { className: "candidate-risk-tag", key: `${keyPrefix}-warn-${index}` }, value))
+    ) : null
+  );
+}
+
 function normalizeDecision(value) {
   const text = String(value || "").toLowerCase();
   if (!text) return "unknown";
@@ -2462,6 +2515,8 @@ function App() {
       reports.map((report) => {
         const isExpanded = expandedReportId === report.report_id;
         const detail = reportDetails[report.report_id] || null;
+        const rowScoutVisibility = report?.dashboard_visibility?.scout || {};
+        const rowHarvestVisibility = report?.dashboard_visibility?.harvest || {};
         const toggle = async () => {
           const nextExpanded = isExpanded ? null : report.report_id;
           setExpandedReportId(nextExpanded);
@@ -2479,7 +2534,10 @@ function App() {
               React.createElement("span", null, prettyDateTime(report.generated_at)),
               React.createElement("span", { className: badgeForRegime(report.market_regime) }, String(report.market_regime || "unknown").replace(/_/g, " ")),
               React.createElement("span", null, `${report.warning_flags || 0} warnings`),
-              React.createElement("span", null, `${report.cycle_duration_seconds ?? "—"}s`)
+              React.createElement("span", null, `${report.cycle_duration_seconds ?? "—"}s`),
+              rowScoutVisibility.latest_token_usage != null ? React.createElement("span", null, `Scout ${formatTokenUsage(rowScoutVisibility.latest_token_usage)} tok`) : null,
+              rowHarvestVisibility.latest_token_usage != null ? React.createElement("span", null, `Harvest ${formatTokenUsage(rowHarvestVisibility.latest_token_usage)} tok`) : null,
+              rowScoutVisibility.shortlist_candidate_count != null ? React.createElement("span", null, `Shortlist ${formatCount(rowScoutVisibility.shortlist_candidate_count)}`) : null
             ),
             React.createElement("span", { className: "report-row-action" }, isExpanded ? "▼" : "▶")
           ),
@@ -2491,6 +2549,16 @@ function App() {
             detail ? React.createElement(
               React.Fragment,
               null,
+              (() => {
+                const visibility = detail?.dashboard_visibility || {};
+                const scoutVisibility = visibility?.scout || {};
+                const harvestVisibility = visibility?.harvest || {};
+                const candidateVisibility = detail?.candidate_visibility || {};
+                const scoutCandidateVisibility = candidateVisibility?.scout || {};
+                const harvestCandidateVisibility = candidateVisibility?.harvest || {};
+                return React.createElement(
+                  React.Fragment,
+                  null,
               React.createElement(
                 "div",
                 { className: "report-detail-head" },
@@ -2498,6 +2566,43 @@ function App() {
                   React.createElement("div", { className: "report-detail-title" }, `Cycle #${detail.cycle_index ?? report.cycle_index ?? "—"} — ${prettyDateTime(detail.generated_at || report.generated_at)}`),
                   React.createElement("div", { className: "report-detail-summary" }, detail.summary || report.summary || ""),
                   React.createElement("div", { className: "report-detail-meta" }, `${detail.overall_grade || report.overall_grade} (${detail.overall_score ?? report.overall_score})`)
+                )
+              ),
+              React.createElement(
+                "div",
+                { className: "report-detail-section" },
+                React.createElement("div", { className: "report-detail-section-title" }, "Evidence + Token Budget"),
+                React.createElement(
+                  "div",
+                  { className: "report-compact-grid" },
+                  React.createElement("div", { className: "report-compact-stat" },
+                    React.createElement("span", null, "Scout tokens"),
+                    React.createElement("strong", null, formatTokenUsage(scoutVisibility.latest_token_usage ?? detail?.agents?.scout?.llm_tokens))
+                  ),
+                  React.createElement("div", { className: "report-compact-stat" },
+                    React.createElement("span", null, "Harvest tokens"),
+                    React.createElement("strong", null, formatTokenUsage(harvestVisibility.latest_token_usage ?? detail?.agents?.harvest?.llm_tokens))
+                  ),
+                  React.createElement("div", { className: "report-compact-stat" },
+                    React.createElement("span", null, "Scout shortlist"),
+                    React.createElement("strong", null, formatCount(scoutVisibility.shortlist_candidate_count ?? detail?.evidence_summary?.scout?.shortlist_candidate_count))
+                  ),
+                  React.createElement("div", { className: "report-compact-stat" },
+                    React.createElement("span", null, "Evidence qualified"),
+                    React.createElement("strong", null, formatCount(scoutVisibility.evidence_qualified_count ?? detail?.evidence_summary?.scout?.evidence_qualified_candidates))
+                  ),
+                  React.createElement("div", { className: "report-compact-stat" },
+                    React.createElement("span", null, "Evidence blocked"),
+                    React.createElement("strong", null, formatCount(scoutVisibility.evidence_blocked_count ?? detail?.evidence_summary?.scout?.evidence_blocked_candidates))
+                  ),
+                  React.createElement("div", { className: "report-compact-stat" },
+                    React.createElement("span", null, "Weak Scout downgraded"),
+                    React.createElement("strong", null, formatCount(scoutVisibility.downgraded_weak_candidates ?? detail?.evidence_summary?.scout?.weak_candidate_downgrade_count))
+                  ),
+                  React.createElement("div", { className: "report-compact-stat" },
+                    React.createElement("span", null, "Weak Harvest downgraded"),
+                    React.createElement("strong", null, formatCount(harvestVisibility.downgraded_weak_exits ?? detail?.evidence_summary?.harvest?.weak_exit_downgrade_count ?? detail?.evidence_summary?.harvest?.evidence_downgrade_count))
+                  )
                 )
               ),
               React.createElement(
@@ -2559,6 +2664,43 @@ function App() {
                   React.createElement("div", { className: "report-kv" }, `Rotations: ${Array.isArray(detail.cycle_actions?.rotations) && detail.cycle_actions.rotations.length ? detail.cycle_actions.rotations.map((item) => item.from_symbol || item.to_symbol).filter(Boolean).join(", ") : "none"}`)
                 )
               )
+              ,
+              React.createElement(
+                "div",
+                { className: "report-detail-section report-detail-grid" },
+                React.createElement(
+                  "div",
+                  null,
+                  React.createElement("div", { className: "report-detail-section-title" }, "Scout Candidate Visibility"),
+                  React.createElement("div", { className: "report-subsection-label" }, "Qualified"),
+                  Array.isArray(scoutCandidateVisibility.qualified) && scoutCandidateVisibility.qualified.length
+                    ? React.createElement("div", { className: "report-candidate-list" }, scoutCandidateVisibility.qualified.slice(0, 6).map((item, index) => renderReportCandidateCard(item, `scout-qualified-${index}`)))
+                    : React.createElement("div", { className: "intelligence-empty" }, "No qualified Scout candidates recorded."),
+                  React.createElement("div", { className: "report-subsection-label" }, "Blocked"),
+                  Array.isArray(scoutCandidateVisibility.blocked) && scoutCandidateVisibility.blocked.length
+                    ? React.createElement("div", { className: "report-candidate-list" }, scoutCandidateVisibility.blocked.slice(0, 6).map((item, index) => renderReportCandidateCard(item, `scout-blocked-${index}`)))
+                    : React.createElement("div", { className: "intelligence-empty" }, "No evidence-blocked Scout candidates recorded."),
+                  React.createElement("div", { className: "report-subsection-label" }, "Downgraded"),
+                  Array.isArray(scoutCandidateVisibility.downgraded) && scoutCandidateVisibility.downgraded.length
+                    ? React.createElement("div", { className: "report-candidate-list" }, scoutCandidateVisibility.downgraded.slice(0, 6).map((item, index) => renderReportCandidateCard(item, `scout-downgraded-${index}`)))
+                    : React.createElement("div", { className: "intelligence-empty" }, "No Scout evidence downgrades recorded.")
+                ),
+                React.createElement(
+                  "div",
+                  null,
+                  React.createElement("div", { className: "report-detail-section-title" }, "Harvest Candidate Visibility"),
+                  React.createElement("div", { className: "report-subsection-label" }, "Exit-ready"),
+                  Array.isArray(harvestCandidateVisibility.exit_candidates) && harvestCandidateVisibility.exit_candidates.length
+                    ? React.createElement("div", { className: "report-candidate-list" }, harvestCandidateVisibility.exit_candidates.slice(0, 6).map((item, index) => renderReportCandidateCard(item, `harvest-exit-${index}`)))
+                    : React.createElement("div", { className: "intelligence-empty" }, "No Harvest exit candidates recorded."),
+                  React.createElement("div", { className: "report-subsection-label" }, "Downgraded"),
+                  Array.isArray(harvestCandidateVisibility.downgraded) && harvestCandidateVisibility.downgraded.length
+                    ? React.createElement("div", { className: "report-candidate-list" }, harvestCandidateVisibility.downgraded.slice(0, 6).map((item, index) => renderReportCandidateCard(item, `harvest-downgraded-${index}`)))
+                    : React.createElement("div", { className: "intelligence-empty" }, "No Harvest evidence downgrades recorded.")
+                )
+              )
+                );
+              })()
             ) : null
           ) : null
         );

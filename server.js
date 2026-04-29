@@ -898,6 +898,8 @@ async function buildProfessionalDashboardSummary() {
 function summarizeReport(report, filePath) {
   const criticalFlags = Number(report?.critical_flags ?? (Array.isArray(report?.flags) ? report.flags.filter((flag) => flag.severity === "critical").length : 0));
   const warningFlags = Number(report?.warning_flags ?? (Array.isArray(report?.flags) ? report.flags.filter((flag) => flag.severity === "warning").length : 0));
+  const scoutVisibility = report?.dashboard_visibility?.scout || {};
+  const harvestVisibility = report?.dashboard_visibility?.harvest || {};
   return {
     report_id: report?.report_id || null,
     generated_at: report?.generated_at || null,
@@ -908,6 +910,19 @@ function summarizeReport(report, filePath) {
     warning_flags: warningFlags,
     market_regime: report?.market_regime || "unknown",
     cycle_duration_seconds: report?.cycle_duration_seconds ?? null,
+    dashboard_visibility: {
+      scout: {
+        latest_token_usage: scoutVisibility?.latest_token_usage ?? report?.agents?.scout?.llm_tokens ?? null,
+        shortlist_candidate_count: scoutVisibility?.shortlist_candidate_count ?? report?.evidence_summary?.scout?.shortlist_candidate_count ?? report?.agents?.scout?.shortlisted_candidates ?? null,
+        evidence_qualified_count: scoutVisibility?.evidence_qualified_count ?? report?.evidence_summary?.scout?.evidence_qualified_candidates ?? null,
+        evidence_blocked_count: scoutVisibility?.evidence_blocked_count ?? report?.evidence_summary?.scout?.evidence_blocked_candidates ?? null,
+        downgraded_weak_candidates: scoutVisibility?.downgraded_weak_candidates ?? report?.evidence_summary?.scout?.weak_candidate_downgrade_count ?? null
+      },
+      harvest: {
+        latest_token_usage: harvestVisibility?.latest_token_usage ?? report?.agents?.harvest?.llm_tokens ?? null,
+        downgraded_weak_exits: harvestVisibility?.downgraded_weak_exits ?? report?.evidence_summary?.harvest?.weak_exit_downgrade_count ?? report?.evidence_summary?.harvest?.evidence_downgrade_count ?? null
+      }
+    },
     report_file: report?.report_file || path.relative(ROOT, filePath)
   };
 }

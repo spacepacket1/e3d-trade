@@ -11,6 +11,18 @@ import { buildTokenRiskScan, buildTokenRiskScanRef } from "./scripts/tokenRiskSc
 import { buildLiquidityExecutionControls } from "./scripts/liquidityExecutionControls.js";
 import { buildMarketDataQuality, buildMarketDataQualityRef } from "./scripts/marketDataQuality.js";
 import { recordOperatorAction } from "./scripts/auditTrail.js";
+import {
+  buildEvidenceDiagnosticsEvent,
+  buildHarvestEvidenceDiagnostics,
+  buildScoutEvidenceDiagnostics
+} from "./scripts/evidenceDiagnostics.js";
+import {
+  buildHarvestEvidencePacket,
+  buildScoutEvidencePacket,
+  rankScoutPacket,
+  SCOUT_EVIDENCE_SHORTLIST_DEFAULT_LIMIT,
+  SCOUT_FLOW_ONLY_PER_CYCLE_LIMIT
+} from "./scripts/evidencePackets.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -39,6 +51,7 @@ const E3D_DOSSIER_MAX_STORIES = 4;
 const E3D_DOSSIER_MAX_COUNTERPARTIES = 5;
 const PAPER_ORDER_STRATEGY_VERSION = process.env.E3D_STRATEGY_VERSION || "paper-pipeline-v1";
 const PAPER_FILL_MODEL_VERSION = "paper-portfolio-fill-v1";
+const HARVEST_EVIDENCE_PACKET_MAX_ITEMS = 8;
 
 // Rate-limit budget management.
 // Tiers: free=100/day @5000ms, premium=1000/day @1000ms, enterprise=100000/day @10ms
@@ -53,6 +66,11 @@ const E3D_API_DEBUG = process.env.E3D_API_DEBUG === "1" || process.env.E3D_DEBUG
 let ACTIVE_TRAINING_CONTEXT = null;
 const LAST_LLM_META = new Map();
 let DATABASE_SCHEMA_READY = false;
+
+const HARVEST_EXIT_RISK_TYPES = ["LIQUIDITY_DRAIN", "WASH_TRADE", "SPREAD_WIDENING", "MOMENTUM_DIVERGENCE", "EXCHANGE_FLOW", "LOOP",
+  "SECURITY_RISK", "RUG_LIQUIDITY_PULL", "TREASURY_DISTRIBUTION", "CONCENTRATION_SHIFT", "VOLUME_PROFILE_ANOMALY"];
+const HARVEST_HOLD_CONFIRM_TYPES = ["ACCUMULATION", "SMART_MONEY", "SMART_MONEY_LEADER", "FLOW", "CLUSTER", "STAGING", "FUNNEL"];
+const HARVEST_PUMP_EXHAUSTION_TYPES = ["MOVER", "SURGE"];
 
 fs.mkdirSync(LOG_DIR, { recursive: true });
 fs.mkdirSync(REPORTS_DIR, { recursive: true });
@@ -174,6 +192,11 @@ function validateHarvestPayload(payload) {
 
     if (!proposal.position || typeof proposal.position !== "object") {
       proposal.position = {};
+    }
+
+    if (!proposal.evidence_packet_id || typeof proposal.evidence_packet_id !== "string") {
+      log("harvest_invalid_candidate", { index, reason: "MISSING_HARVEST_EVIDENCE_PACKET_ID", contract_address: addr || null });
+      return;
     }
 
     validExitCandidates.push(proposal);
@@ -1026,6 +1049,7 @@ function buildBuyRiskIntent(candidate, allocationUsd, tradeKind = "buy") {
   const marketDataQuality = candidate?.market_data_quality || buildMarketDataQuality(candidate, {
     evaluated_at: candidate?.created_at || nowIso()
   });
+  const evidenceMetadata = extractEvidenceMetadata(candidate);
   return {
     side: "buy",
     symbol: token.symbol || null,
@@ -1040,6 +1064,11 @@ function buildBuyRiskIntent(candidate, allocationUsd, tradeKind = "buy") {
     slippage_bps: toNum(marketDataQuality.normalized?.slippage_bps, 0),
     market_regime: _cycleRegimePolicy?.regime || null,
     reason: tradeKind,
+    evidence_packet_id: evidenceMetadata.evidence_packet_id,
+    evidence_quality_score: evidenceMetadata.evidence_quality_score,
+    evidence_ref_count: evidenceMetadata.evidence_ref_count,
+    evidence_blockers: evidenceMetadata.evidence_blockers,
+    evidence_warnings: evidenceMetadata.evidence_warnings,
     market_data_quality_id: marketDataQuality.data_quality_id,
     market_data_quality_warnings: marketDataQuality.warnings || [],
     market_data_quality_blockers: marketDataQuality.blockers || []
@@ -1130,6 +1159,7 @@ function attachRiskDecisionMetadata(target, decision, context = {}) {
   const ref = buildRiskDecisionRef(decision, context);
   target.risk_decision_id = decision.risk_decision_id;
   target.risk_decision_ref = ref;
+  applyEvidenceMetadata(target, decision);
   if (target.paper_trade_ticket && typeof target.paper_trade_ticket === "object") {
     target.paper_trade_ticket.risk_decision_id = decision.risk_decision_id;
     target.paper_trade_ticket.risk_decision_ref = ref;
@@ -2803,6 +2833,7 @@ function fetchScoutData() {
     if (item?.type !== "token") return false;
     const addr = cleanAddress(item?.address || "");
     if (!addr) return false;
+    if (/^0+$/.test(addr)) return false; // burn address (0x0000...0000) is not a real token
     return !nonTradeablePattern.test(item?.label || "");
   });
   log("scout_watchlist", { total: watchlistRaw.length, filtered: e3dWatchlist.length });
@@ -2871,6 +2902,895 @@ function fetchScoutData() {
   }
 
   return { stories, thesisSignalStories, tokenUniverse, disqualifierTypes, buySignalTypes, lateSignalTypes, secondaryTypes, sortLabel: "storyCount:1H desc", e3dCandidates, e3dTheses, cgDetailMap, e3dWatchlist };
+}
+
+const SCOUT_EVIDENCE_PACKET_SAFE_PROMPT_CHARS = 42000;
+
+function holdingAgeHours(position, fallbackPosition = null, asOf = nowIso()) {
+  const openedAt = position?.opened_at || fallbackPosition?.opened_at || null;
+  if (!openedAt) return null;
+  const openedMs = new Date(openedAt).getTime();
+  const asOfMs = new Date(asOf).getTime();
+  if (!Number.isFinite(openedMs) || !Number.isFinite(asOfMs) || asOfMs < openedMs) return null;
+  return Number(((asOfMs - openedMs) / 3600000).toFixed(2));
+}
+
+function buildHarvestStoryEvidence(story, storyType) {
+  const type = String(storyType || story?.story_type || story?.type || "").toUpperCase();
+  if (!type) return null;
+  const hint = String(
+    story?.meta?.narrative_hint
+    || story?.ai_narrative
+    || story?.meta?.ai_narrative
+    || story?.title
+    || story?.subtitle
+    || ""
+  ).trim();
+  const direction = HARVEST_HOLD_CONFIRM_TYPES.includes(type)
+    ? "bullish"
+    : HARVEST_PUMP_EXHAUSTION_TYPES.includes(type)
+      ? "bearish"
+      : ["SECURITY_RISK", "RUG_LIQUIDITY_PULL", "TREASURY_DISTRIBUTION", "CONCENTRATION_SHIFT"].includes(type)
+        ? "risk"
+        : "bearish";
+  return {
+    source_type: "story",
+    source_ref: story?.id || story?.story_id || null,
+    label: `story_${type.toLowerCase()}`,
+    direction,
+    strength: Math.max(40, Math.min(95, Math.round(toNum(story?.score, direction === "bullish" ? 72 : 78)))),
+    summary: `${type}${hint ? `: ${hint.slice(0, 110)}` : ""}`.slice(0, 160)
+  };
+}
+
+function extractHarvestEvidenceRefs(review) {
+  const refs = Array.isArray(review?.evidence) ? review.evidence : [];
+  const normalized = [];
+  const seen = new Set();
+  for (const ref of refs) {
+    const evidenceId = String(
+      typeof ref === "string"
+        ? ref
+        : ref?.evidence_id || ref?.id || ref?.ref || ""
+    ).trim();
+    if (!evidenceId || seen.has(evidenceId)) continue;
+    seen.add(evidenceId);
+    normalized.push(evidenceId);
+  }
+  return normalized;
+}
+
+function cleanEvidenceText(value) {
+  const text = stripText(value);
+  return text || null;
+}
+
+function cleanEvidenceList(values = []) {
+  return [...new Set((Array.isArray(values) ? values : [])
+    .map((value) => cleanEvidenceText(value))
+    .filter(Boolean))];
+}
+
+function buildCompactEvidenceSummary(packet = null, refs = []) {
+  const packetEvidence = Array.isArray(packet?.evidence) ? packet.evidence : [];
+  const refsUsed = cleanEvidenceList(refs);
+  const refSet = new Set(refsUsed);
+  const highlights = packetEvidence
+    .filter((item) => refSet.size === 0 || refSet.has(item?.evidence_id))
+    .slice(0, 3)
+    .map((item) => ({
+      evidence_id: item?.evidence_id || null,
+      source_type: item?.source_type || null,
+      label: item?.label || null,
+      direction: item?.direction || null,
+      strength: item?.strength == null ? null : Math.max(0, Math.min(100, Math.round(toNum(item.strength, 0))))
+    }))
+    .filter((item) => item.evidence_id);
+  return {
+    evidence_packet_id: packet?.evidence_packet_id || null,
+    quality_score: packet?.quality_score == null ? null : Math.max(0, Math.min(100, Math.round(toNum(packet.quality_score, 0)))),
+    evidence_count: Math.max(0, Math.round(toNum(packet?.evidence_count, packetEvidence.length))),
+    refs_used: refsUsed,
+    blockers: cleanEvidenceList(packet?.blockers),
+    warnings: cleanEvidenceList(packet?.warnings),
+    highlights
+  };
+}
+
+function extractEvidenceMetadata(source = {}) {
+  const refs = extractHarvestEvidenceRefs(source);
+  const summarySource = source?.evidence_summary && typeof source.evidence_summary === "object"
+    ? source.evidence_summary
+    : null;
+  const summary = summarySource
+    ? {
+        evidence_packet_id: summarySource.evidence_packet_id || source?.evidence_packet_id || null,
+        quality_score: summarySource.quality_score == null ? null : Math.max(0, Math.min(100, Math.round(toNum(summarySource.quality_score, 0)))),
+        evidence_count: Math.max(0, Math.round(toNum(summarySource.evidence_count, 0))),
+        refs_used: cleanEvidenceList(summarySource.refs_used),
+        blockers: cleanEvidenceList(summarySource.blockers),
+        warnings: cleanEvidenceList(summarySource.warnings),
+        highlights: (Array.isArray(summarySource.highlights) ? summarySource.highlights : [])
+          .slice(0, 3)
+          .map((item) => ({
+            evidence_id: item?.evidence_id || null,
+            source_type: item?.source_type || null,
+            label: item?.label || null,
+            direction: item?.direction || null,
+            strength: item?.strength == null ? null : Math.max(0, Math.min(100, Math.round(toNum(item.strength, 0))))
+          }))
+          .filter((item) => item.evidence_id)
+      }
+    : null;
+  return {
+    evidence_packet_id: source?.evidence_packet_id || summary?.evidence_packet_id || null,
+    evidence_quality_score: source?.evidence_quality_score != null
+      ? Math.max(0, Math.min(100, Math.round(toNum(source.evidence_quality_score, 0))))
+      : (summary?.quality_score ?? null),
+    evidence_ref_count: Math.max(0, Math.round(toNum(source?.evidence_ref_count, refs.length))),
+    evidence_blockers: cleanEvidenceList(source?.evidence_blockers || summary?.blockers),
+    evidence_warnings: cleanEvidenceList(source?.evidence_warnings || summary?.warnings),
+    evidence_refs: refs,
+    evidence_summary: summary
+  };
+}
+
+function applyEvidenceMetadata(target, source = {}) {
+  if (!target || !source) return target;
+  const metadata = extractEvidenceMetadata(source);
+  if (metadata.evidence_packet_id) target.evidence_packet_id = metadata.evidence_packet_id;
+  if (metadata.evidence_quality_score != null) target.evidence_quality_score = metadata.evidence_quality_score;
+  if (metadata.evidence_ref_count > 0) target.evidence_ref_count = metadata.evidence_ref_count;
+  if (metadata.evidence_blockers.length) target.evidence_blockers = metadata.evidence_blockers;
+  if (metadata.evidence_warnings.length) target.evidence_warnings = metadata.evidence_warnings;
+  if (metadata.evidence_refs.length) target.evidence_refs = metadata.evidence_refs;
+  if (metadata.evidence_summary) target.evidence_summary = deepClone(metadata.evidence_summary);
+  return target;
+}
+
+function decorateRiskReviewWithEvidence(risk = {}, proposal = {}) {
+  return {
+    ...risk,
+    ...extractEvidenceMetadata(proposal)
+  };
+}
+
+function buildHarvestEvidenceReviewContext(portfolio, portfolioIntelligence = null, options = {}) {
+  const createdAt = options.createdAt || nowIso();
+  const dossier = portfolioIntelligence || buildPortfolioIntelligenceDossier(portfolio);
+  const positions = Object.values(portfolio?.positions || {});
+  const heldAddresses = positions.map((p) => cleanAddress(p?.contract_address || "")).filter(Boolean);
+  const addrSet = new Set(heldAddresses);
+  const { allStories: cycleHarvestStories, tokenUniverse } = getOrFetchCycleMarketContext();
+  const allHarvestStories = cycleHarvestStories || [];
+  const tokenByAddress = new Map(
+    (tokenUniverse || [])
+      .filter((token) => cleanAddress(token?.address || ""))
+      .map((token) => [cleanAddress(token.address), token])
+  );
+  const storyMatchesByType = {};
+  for (const type of [...HARVEST_EXIT_RISK_TYPES, ...HARVEST_HOLD_CONFIRM_TYPES, ...HARVEST_PUMP_EXHAUSTION_TYPES]) {
+    storyMatchesByType[type] = [];
+  }
+  for (const story of allHarvestStories) {
+    const type = String(story?.story_type || story?.type || "").toUpperCase();
+    if (!type || !storyMatchesByType[type]) continue;
+    const addr = cleanAddress(story?.meta?.token_address || story?.primary_token || story?.token_address || story?.address || "");
+    if (!addr || !addrSet.has(addr)) continue;
+    storyMatchesByType[type].push(story);
+  }
+
+  const dossierByAddress = new Map();
+  const dossierBySymbol = new Map();
+  for (const item of dossier.holdings || []) {
+    const addr = cleanAddress(item?.token?.contract_address || "");
+    const sym = String(item?.token?.symbol || "").trim().toLowerCase();
+    if (addr) dossierByAddress.set(addr, item);
+    if (sym) dossierBySymbol.set(sym, item);
+  }
+
+  const entries = positions.map((livePos) => {
+    const addr = cleanAddress(livePos?.contract_address || "");
+    const symbol = String(livePos?.symbol || "").trim().toUpperCase() || null;
+    const dossierItem = (addr && dossierByAddress.get(addr)) || (symbol && dossierBySymbol.get(symbol.toLowerCase())) || null;
+    const tokenRow = addr ? tokenByAddress.get(addr) || null : null;
+    const flowData = addr ? (_cycleQuantContext?.token_flow?.[addr] ?? null) : null;
+    const funding = symbol ? (_cycleQuantContext?.funding_rates?.[symbol] ?? _cycleQuantContext?.funding_rates?.[symbol.toLowerCase()] ?? null) : null;
+    const livePrice = toNum(
+      livePos?.current_price,
+      toNum(flowData?.price_usd, toNum(tokenRow?.price_usd, toNum(dossierItem?.market_data?.current_price, 0)))
+    );
+    const qty = toNum(livePos?.quantity, toNum(dossierItem?.position?.quantity, 0));
+    const costBasis = toNum(livePos?.cost_basis_usd, toNum(dossierItem?.position?.cost_basis_usd, qty * toNum(livePos?.avg_entry_price, toNum(dossierItem?.position?.avg_entry_price, 0))));
+    const marketValue = qty * livePrice;
+    const pnlUsd = marketValue - costBasis;
+    const pnlPct = costBasis > 0 ? Number(((pnlUsd / costBasis) * 100).toFixed(2)) : 0;
+    const holdAgeHours = holdingAgeHours(livePos, dossierItem?.position, createdAt);
+    const liquidityUsd = toNum(
+      livePos?.liquidity_usd,
+      toNum(livePos?.last_market_snapshot?.liquidity_data?.liquidity_usd, toNum(tokenRow?.liquidity_usd, NaN))
+    );
+    const executionData = {
+      ...estimateScoutExecutionData(liquidityUsd),
+      ...(livePos?.last_market_snapshot?.execution_data || {}),
+      quote_timestamp: createdAt
+    };
+    const marketData = {
+      current_price: livePrice,
+      change_24h_pct: toNum(
+        livePos?.last_market_snapshot?.market_data?.change_24h_pct,
+        toNum(tokenRow?.change_24h, toNum(dossierItem?.market_data?.change_24h_pct, NaN))
+      ),
+      change_30m_pct: toNum(
+        livePos?.last_market_snapshot?.market_data?.change_30m_pct,
+        toNum(tokenRow?.change_30m, NaN)
+      ),
+      volume_24h_usd: toNum(
+        livePos?.last_market_snapshot?.market_data?.volume_24h_usd,
+        toNum(tokenRow?.volume_24h_usd, toNum(dossierItem?.market_data?.volume_24h_usd, NaN))
+      ),
+      market_cap_usd: toNum(
+        livePos?.last_market_snapshot?.market_data?.market_cap_usd,
+        toNum(tokenRow?.market_cap_usd, toNum(dossierItem?.market_data?.market_cap_usd, NaN))
+      ),
+      price_source: livePos?.last_market_snapshot?.market_data?.price_source || (flowData?.price_usd ? "dexscreener" : "e3d"),
+      price_timestamp: createdAt
+    };
+    const liquidityData = {
+      liquidity_usd: liquidityUsd,
+      liquidity_source: livePos?.last_market_snapshot?.liquidity_data?.liquidity_source || "e3d",
+      liquidity_timestamp: createdAt
+    };
+    const evidence = [];
+    for (const type of [...HARVEST_EXIT_RISK_TYPES, ...HARVEST_HOLD_CONFIRM_TYPES, ...HARVEST_PUMP_EXHAUSTION_TYPES]) {
+      for (const story of storyMatchesByType[type]) {
+        const storyAddr = cleanAddress(story?.meta?.token_address || story?.primary_token || story?.token_address || story?.address || "");
+        if (storyAddr !== addr) continue;
+        const normalized = buildHarvestStoryEvidence(story, type);
+        if (normalized) evidence.push(normalized);
+      }
+    }
+    const flowSignal = String(flowData?.flow_signal || "").toLowerCase();
+    if (flowSignal.includes("distribution")) {
+      evidence.push({
+        source_type: "flow",
+        source_ref: "token_flow",
+        label: "flow_distribution_exit_risk",
+        direction: "bearish",
+        strength: flowSignal.includes("strong_") ? 86 : 74,
+        summary: [
+          `flow ${flowData.flow_signal}`,
+          flowData?.buy_sell_ratio_1h != null ? `b/s 1h ${toNum(flowData.buy_sell_ratio_1h, 0).toFixed(2)}` : null
+        ].filter(Boolean).join(", ").slice(0, 160)
+      });
+    } else if (flowSignal.includes("accumulation")) {
+      evidence.push({
+        source_type: "flow",
+        source_ref: "token_flow",
+        label: "flow_accumulation_hold_confirm",
+        direction: "bullish",
+        strength: flowSignal.includes("strong_") ? 84 : 72,
+        summary: [
+          `flow ${flowData.flow_signal}`,
+          flowData?.buy_sell_ratio_1h != null ? `b/s 1h ${toNum(flowData.buy_sell_ratio_1h, 0).toFixed(2)}` : null
+        ].filter(Boolean).join(", ").slice(0, 160)
+      });
+    }
+    const spreadBps = toNum(executionData?.spread_bps, NaN);
+    const slippageBps = toNum(executionData?.estimated_slippage_bps, NaN);
+    if (Number.isFinite(spreadBps) && spreadBps >= 150 || Number.isFinite(slippageBps) && slippageBps >= 200) {
+      evidence.push({
+        source_type: "liquidity",
+        source_ref: "execution_snapshot",
+        label: "spread_slippage_degradation",
+        direction: "bearish",
+        strength: Math.max(60, Math.min(95, Math.round(Math.max(toNum(spreadBps, 0) / 3, toNum(slippageBps, 0) / 4)))),
+        summary: [
+          Number.isFinite(spreadBps) ? `spread ${spreadBps.toFixed(1)}bps` : null,
+          Number.isFinite(slippageBps) ? `slip ${slippageBps.toFixed(1)}bps` : null
+        ].filter(Boolean).join(", ")
+      });
+    } else if (Number.isFinite(liquidityUsd) && liquidityUsd >= 200000 && (!Number.isFinite(spreadBps) || spreadBps <= 60) && (!Number.isFinite(slippageBps) || slippageBps <= 80)) {
+      evidence.push({
+        source_type: "liquidity",
+        source_ref: "execution_snapshot",
+        label: "improving_liquidity_hold_confirm",
+        direction: "bullish",
+        strength: 68,
+        summary: [
+          `liq $${Math.round(liquidityUsd).toLocaleString("en-US")}`,
+          Number.isFinite(spreadBps) ? `spread ${spreadBps.toFixed(1)}bps` : null,
+          Number.isFinite(slippageBps) ? `slip ${slippageBps.toFixed(1)}bps` : null
+        ].filter(Boolean).join(", ")
+      });
+    }
+
+    const harvestInput = {
+      created_at: createdAt,
+      strategy_version: PAPER_ORDER_STRATEGY_VERSION,
+      token: {
+        symbol,
+        name: livePos?.name || dossierItem?.token?.name || symbol,
+        chain: "ethereum",
+        contract_address: addr,
+        category: livePos?.category || dossierItem?.token?.category || "unknown"
+      },
+      symbol,
+      contract_address: addr,
+      position: {
+        position_id: addr || symbol,
+        symbol,
+        contract_address: addr,
+        quantity: qty,
+        avg_entry_price: toNum(livePos?.avg_entry_price, toNum(dossierItem?.position?.avg_entry_price, 0)),
+        current_price: livePrice,
+        market_value_usd: Number(marketValue.toFixed(2)),
+        cost_basis_usd: Number(costBasis.toFixed(2)),
+        unrealized_pnl_usd: Number(pnlUsd.toFixed(2)),
+        unrealized_pnl_pct: pnlPct,
+        holding_age_hours: holdAgeHours,
+        opened_at: livePos?.opened_at || dossierItem?.position?.opened_at || null,
+        risk_metadata: {
+          fraud_risk: toNum(livePos?.fraud_risk, toNum(dossierItem?.thesis?.fraud_risk, NaN)),
+          liquidity_quality: toNum(livePos?.liquidity_quality, toNum(dossierItem?.thesis?.liquidity_quality, NaN)),
+          flow_alignment: toNum(dossierItem?.thesis?.flow_alignment, NaN),
+          last_position_score: toNum(livePos?.score, NaN)
+        }
+      },
+      market_data: marketData,
+      liquidity_data: liquidityData,
+      execution_data: executionData,
+      flow: flowData ? {
+        flow_signal: flowData.flow_signal,
+        buy_sell_ratio_1h: flowData.buy_sell_ratio_1h,
+        price_change_1h_pct: flowData.price_change_1h_pct,
+        source: "dexscreener",
+        timestamp: createdAt
+      } : null,
+      thesis: dossierItem?.thesis ? {
+        thesis_id: addr || symbol,
+        conviction: dossierItem?.thesis?.strength ?? dossierItem?.recommendation?.confidence ?? null,
+        direction: dossierItem?.recommendation?.action === "exit" ? "bearish" : "bullish",
+        summary: dossierItem?.recommendation?.why_now || dossierItem?.recommendation?.invalidation || null,
+        freshness_seconds: null,
+        strength: dossierItem?.thesis?.strength ?? null
+      } : null,
+      evidence,
+      performance: {
+        expectancy_usd: pnlUsd,
+        win_rate: pnlPct > 0 ? 1 : 0
+      }
+    };
+    harvestInput.market_data_quality = buildMarketDataQuality(harvestInput, { evaluated_at: createdAt });
+    harvestInput.token_risk_scan = buildPositionTokenRiskScan({
+      symbol,
+      contract_address: addr,
+      category: harvestInput.token.category,
+      current_price: livePrice,
+      liquidity_usd: liquidityUsd,
+      liquidity_quality: harvestInput.position.risk_metadata.liquidity_quality,
+      fraud_risk: harvestInput.position.risk_metadata.fraud_risk,
+      last_market_snapshot: {
+        market_data: marketData,
+        liquidity_data: liquidityData,
+        execution_data: executionData
+      }
+    }, portfolio, { evaluated_at: createdAt, mode: "paper", side: "sell" });
+    const packet = buildHarvestEvidencePacket(harvestInput, { created_at: createdAt });
+    const packetSummary = {
+      evidence_packet_id: packet.evidence_packet_id,
+      symbol,
+      contract_address: addr,
+      token: harvestInput.token,
+      position: {
+        quantity: harvestInput.position.quantity,
+        avg_entry_price: harvestInput.position.avg_entry_price,
+        current_price: harvestInput.position.current_price,
+        market_value_usd: harvestInput.position.market_value_usd,
+        unrealized_pnl_usd: harvestInput.position.unrealized_pnl_usd,
+        unrealized_pnl_pct: harvestInput.position.unrealized_pnl_pct,
+        holding_age_hours: harvestInput.position.holding_age_hours
+      },
+      position_risk: harvestInput.position.risk_metadata,
+      quality_score: packet.quality_score,
+      warnings: packet.warnings,
+      blockers: packet.blockers,
+      evidence: packet.evidence.slice(0, HARVEST_EVIDENCE_PACKET_MAX_ITEMS).map((item) => ({
+        evidence_id: item.evidence_id,
+        source_type: item.source_type,
+        label: item.label,
+        direction: item.direction,
+        strength: item.strength,
+        summary: item.summary
+      })),
+      evidence_ids: packet.evidence.slice(0, HARVEST_EVIDENCE_PACKET_MAX_ITEMS).map((item) => item.evidence_id)
+    };
+    return {
+      address: addr,
+      symbol,
+      dossier_item: dossierItem,
+      harvest_input: harvestInput,
+      packet,
+      packet_summary: packetSummary
+    };
+  });
+
+  const storiesChecked = [...HARVEST_EXIT_RISK_TYPES, ...HARVEST_HOLD_CONFIRM_TYPES, ...HARVEST_PUMP_EXHAUSTION_TYPES].map((type) => ({
+    type,
+    found: storyMatchesByType[type]?.length || 0,
+    flagged_addresses: Array.from(new Set((storyMatchesByType[type] || []).map((story) =>
+      cleanAddress(story?.meta?.token_address || story?.primary_token || story?.token_address || story?.address || "")
+    ).filter(Boolean)))
+  }));
+
+  return {
+    dossier,
+    positions,
+    entries,
+    stories_checked: storiesChecked
+  };
+}
+
+function finalizeHarvestLLMResult(parsed, portfolio, reviewContext, dossier, createdAt, expiresAt, harvestLlmBatches) {
+  const rawParsed = parsed && typeof parsed === "object" ? parsed : {};
+  const normalizedReviews = [];
+  let downgradedForEvidenceCount = 0;
+  const parsedReviews = Array.isArray(rawParsed?.position_reviews) ? rawParsed.position_reviews : [];
+  const parsedExits = Array.isArray(rawParsed?.exit_candidates) ? rawParsed.exit_candidates : [];
+  const rawReviewByAddress = new Map();
+  const rawExitByAddress = new Map();
+
+  for (const review of parsedReviews) {
+    const addr = cleanAddress(review?.token?.contract_address || "");
+    if (addr && !rawReviewByAddress.has(addr)) rawReviewByAddress.set(addr, review);
+  }
+  for (const candidate of parsedExits) {
+    const addr = cleanAddress(candidate?.token?.contract_address || "");
+    if (addr && !rawExitByAddress.has(addr)) rawExitByAddress.set(addr, candidate);
+  }
+
+  for (const entry of reviewContext.entries) {
+    const rawReview = rawReviewByAddress.get(entry.address) || rawExitByAddress.get(entry.address) || {};
+    const validEvidenceIds = new Set(entry.packet_summary.evidence_ids);
+    const validRefs = extractHarvestEvidenceRefs(rawReview).filter((ref) => validEvidenceIds.has(ref));
+    const requestedAction = ["hold", "monitor", "trim", "exit"].includes(String(rawReview?.action || "").toLowerCase())
+      ? String(rawReview.action).toLowerCase()
+      : "monitor";
+    const finalAction = ["trim", "exit"].includes(requestedAction) && validRefs.length < 2 ? "monitor" : requestedAction;
+    if (["trim", "exit"].includes(requestedAction) && finalAction === "monitor") {
+      downgradedForEvidenceCount += 1;
+      log("harvest_candidate_downgraded", {
+        reason: "too_few_valid_evidence_refs",
+        contract_address: entry.address,
+        symbol: entry.symbol,
+        evidence_packet_id: entry.packet.evidence_packet_id,
+        valid_ref_count: validRefs.length
+      });
+    }
+
+    normalizedReviews.push({
+      ...rawReview,
+      source_agent: "harvest",
+      created_at: createdAt,
+      expires_at: expiresAt,
+      evidence_packet_id: entry.packet.evidence_packet_id,
+      evidence_quality_score: entry.packet.quality_score,
+      evidence_blockers: cleanEvidenceList(entry.packet.blockers),
+      evidence_warnings: cleanEvidenceList(entry.packet.warnings),
+      token: {
+        ...(rawReview?.token || {}),
+        ...deepClone(entry.harvest_input.token)
+      },
+      position: {
+        ...(rawReview?.position || {}),
+        ...deepClone(entry.harvest_input.position)
+      },
+      action: finalAction,
+      thesis_state: rawReview?.thesis_state || entry.dossier_item?.thesis?.state || "watch",
+      thesis_summary: rawReview?.thesis_summary || entry.dossier_item?.recommendation?.why_now || entry.packet.evidence[0]?.summary || "Evidence packet review.",
+      what_changed: rawReview?.what_changed || null,
+      why_now: rawReview?.why_now || rawReview?.summary || entry.dossier_item?.recommendation?.why_now || "Monitor packet evidence and thesis state.",
+      confidence: Math.max(0, Math.min(100, Math.round(toNum(rawReview?.confidence, entry.dossier_item?.recommendation?.confidence ?? entry.packet.quality_score)))),
+      conviction_score: Math.max(0, Math.min(100, Math.round(toNum(rawReview?.conviction_score, entry.dossier_item?.thesis?.strength ?? entry.packet.quality_score)))),
+      opportunity_score: Math.max(0, Math.min(100, Math.round(toNum(rawReview?.opportunity_score, entry.dossier_item?.thesis?.opportunity_score ?? entry.packet.quality_score)))),
+      review_priority: Math.max(1, Math.min(5, Math.round(toNum(rawReview?.review_priority, finalAction === "exit" ? 5 : finalAction === "trim" ? 4 : finalAction === "monitor" ? 3 : 2)))),
+      summary: rawReview?.summary || entry.dossier_item?.recommendation?.why_now || "Evidence-first harvest review.",
+      evidence: validRefs,
+      evidence_ref_count: validRefs.length,
+      evidence_summary: buildCompactEvidenceSummary(entry.packet, validRefs),
+      risks: Array.isArray(rawReview?.risks) ? rawReview.risks : [],
+      what_would_change_my_mind: Array.isArray(rawReview?.what_would_change_my_mind) ? rawReview.what_would_change_my_mind : [],
+      next_best_alternative: rawReview?.next_best_alternative || entry.dossier_item?.recommendation?.next_best_alternative || "Monitor next cycle evidence packet.",
+      current_regime: rawReview?.current_regime || dossier.market_regime || "unknown",
+      market_data: {
+        ...(entry.harvest_input.market_data || {}),
+        ...(rawReview?.market_data || {})
+      },
+      liquidity_data: {
+        ...(entry.harvest_input.liquidity_data || {}),
+        ...(rawReview?.liquidity_data || {})
+      },
+      narrative_data: {
+        ...(rawReview?.narrative_data || {}),
+        story_strength: Math.max(0, Math.min(100, Math.round(toNum(rawReview?.narrative_data?.story_strength, entry.dossier_item?.thesis?.strength ?? entry.packet.quality_score)))),
+        thesis_health: Math.max(0, Math.min(100, Math.round(toNum(rawReview?.narrative_data?.thesis_health, entry.dossier_item?.thesis?.freshness ?? entry.packet.quality_score)))),
+        flow_direction: rawReview?.narrative_data?.flow_direction || entry.harvest_input.flow?.flow_signal || "neutral"
+      },
+      portfolio_data: rawReview?.portfolio_data && typeof rawReview.portfolio_data === "object"
+        ? rawReview.portfolio_data
+        : { current_token_exposure_pct: 0, current_category_exposure_pct: 0, current_total_exposure_pct: 0, portfolio_timestamp: createdAt, portfolio_source: "system" },
+      market_data_quality: deepClone(entry.harvest_input.market_data_quality),
+      market_data_quality_id: entry.harvest_input.market_data_quality?.data_quality_id || null,
+      market_data_quality_ref: buildMarketDataQualityRef(entry.harvest_input.market_data_quality, { context: "harvest_packet" }),
+      token_risk_scan: deepClone(entry.harvest_input.token_risk_scan),
+      token_risk_scan_id: entry.harvest_input.token_risk_scan?.token_risk_scan_id || null,
+      token_risk_scan_ref: buildTokenRiskScanRef(entry.harvest_input.token_risk_scan, { context: "harvest_packet" }),
+      fraud_risk: toNum(entry.harvest_input.position?.risk_metadata?.fraud_risk, NaN),
+      liquidity_quality: toNum(entry.harvest_input.position?.risk_metadata?.liquidity_quality, NaN)
+    });
+  }
+
+  const exitCandidates = normalizedReviews
+    .filter((review) => ["trim", "exit"].includes(String(review?.action || "").toLowerCase()))
+    .map((review) => {
+      const rawExit = rawExitByAddress.get(cleanAddress(review?.token?.contract_address || "")) || {};
+      return {
+        ...review,
+        ...rawExit,
+        source_agent: "harvest",
+        created_at: createdAt,
+        expires_at: expiresAt,
+        evidence_packet_id: review.evidence_packet_id,
+        token: review.token,
+        position: review.position,
+        action: review.action,
+        evidence: review.evidence,
+        evidence_ref_count: review.evidence_ref_count,
+        setup_type: rawExit?.setup_type || "harvest_review",
+        edge_source: rawExit?.edge_source || "evidence_packet",
+        suggested_exit_fraction: Math.max(0.1, Math.min(1, toNum(rawExit?.suggested_exit_fraction, review.action === "exit" ? 1 : 0.5))),
+        target_exit_price: toNum(rawExit?.target_exit_price, toNum(review?.market_data?.current_price, 0)),
+        decision_price: toNum(rawExit?.decision_price, toNum(review?.market_data?.current_price, 0)),
+        exit_priority: Math.max(1, Math.min(5, Math.round(toNum(rawExit?.exit_priority, review.review_priority || (review.action === "exit" ? 5 : 4)))))
+      };
+    });
+
+  const result = {
+    scan_timestamp: rawParsed?.scan_timestamp || createdAt,
+    portfolio_summary: rawParsed?.portfolio_summary && typeof rawParsed.portfolio_summary === "object"
+      ? rawParsed.portfolio_summary
+      : {
+          market_regime: dossier.market_regime || "unknown",
+          cash_usd: portfolio.cash_usd || 0,
+          equity_usd: portfolio.equity_usd || 0,
+          position_count: Object.keys(portfolio?.positions || {}).length,
+          tracked_positions: reviewContext.entries.length,
+          average_thesis_strength: 0,
+          average_thesis_freshness: 0,
+          average_narrative_decay: 0,
+          average_opportunity_score: 0
+        },
+    position_reviews: normalizedReviews,
+    exit_candidates: exitCandidates,
+    stories_checked: reviewContext.stories_checked
+  };
+  result.evidence_diagnostics = buildHarvestEvidenceDiagnostics({
+    input_candidate_count: reviewContext.entries.length,
+    llm_batches: harvestLlmBatches,
+    positions_reviewed: result.position_reviews.length,
+    position_reviews: result.position_reviews,
+    exit_candidates: result.exit_candidates,
+    stories_checked: result.stories_checked,
+    coverage: null
+  });
+  result.evidence_diagnostics.evidence_downgrade_count = downgradedForEvidenceCount;
+  return result;
+}
+
+function buildScoutStoryEvidence(story, data) {
+  const type = String(story?.story_type || story?.type || "").toUpperCase();
+  if (!type) return null;
+  const direction = data?.disqualifierTypes?.has(type)
+    ? "risk"
+    : data?.lateSignalTypes?.has(type)
+      ? "bearish"
+      : "bullish";
+  const score = toNum(story?.score, 68);
+  const title = String(story?.title || story?.subtitle || story?.ai_narrative || story?.meta?.ai_narrative || "").trim();
+  return {
+    source_type: "story",
+    source_ref: story?.id || story?.story_id || null,
+    label: `story_${type.toLowerCase()}`,
+    direction,
+    strength: Math.max(35, Math.min(95, Math.round(score))),
+    story_type: type,
+    summary: `${type}${title ? `: ${title.slice(0, 110)}` : ""}`.slice(0, 160)
+  };
+}
+
+function estimateScoutExecutionData(liquidityUsd) {
+  const liquidity = toNum(liquidityUsd, 0);
+  const slippageBps = liquidity > 100000 ? 50 : liquidity > 20000 ? 150 : liquidity > 5000 ? 300 : 999;
+  return {
+    estimated_slippage_bps: slippageBps,
+    quote_source: "e3d"
+  };
+}
+
+function extractScoutEvidenceRefs(proposal) {
+  const refs = Array.isArray(proposal?.evidence) ? proposal.evidence : [];
+  const normalized = [];
+  const seen = new Set();
+  for (const ref of refs) {
+    const evidenceId = String(
+      typeof ref === "string"
+        ? ref
+        : ref?.evidence_id || ref?.id || ref?.ref || ""
+    ).trim();
+    if (!evidenceId || seen.has(evidenceId)) continue;
+    seen.add(evidenceId);
+    normalized.push(evidenceId);
+  }
+  return normalized;
+}
+
+function buildScoutEvidenceShortlist(data, portfolio, options = {}) {
+  const createdAt = options.createdAt || nowIso();
+  const heldAddresses = options.heldAddresses || new Set();
+  const heldSymbols = options.heldSymbols || new Set();
+  const disqualifiedAddresses = options.disqualifiedAddresses || new Set();
+  const shortlistLimit = Math.max(1, Math.trunc(toNum(process.env.SCOUT_EVIDENCE_SHORTLIST_LIMIT, SCOUT_EVIDENCE_SHORTLIST_DEFAULT_LIMIT)));
+
+  const tokenByAddr = new Map(
+    (data?.tokenUniverse || [])
+      .filter((token) => cleanAddress(token?.address || ""))
+      .map((token) => [cleanAddress(token.address), token])
+  );
+  const storyMap = new Map();
+  for (const items of Object.values(data?.stories || {})) {
+    for (const story of (items || [])) {
+      const addr = cleanAddress(story?.meta?.primary?.address || story?.meta?.token_address || story?.meta?.token?.address || story?.primary_token || story?.address || "");
+      if (!addr) continue;
+      if (!storyMap.has(addr)) storyMap.set(addr, []);
+      const normalized = buildScoutStoryEvidence(story, data);
+      if (normalized) storyMap.get(addr).push(normalized);
+    }
+  }
+
+  const candidateByAddr = new Map();
+  for (const candidate of (data?.e3dCandidates || [])) {
+    const addr = cleanAddress(candidate?.entity_address || candidate?.token_address || candidate?.address || candidate?.contract_address || "");
+    if (addr) candidateByAddr.set(addr, candidate);
+  }
+
+  const thesisByAddr = new Map();
+  for (const thesis of (data?.e3dTheses || [])) {
+    const addr = cleanAddress(thesis?.entity_address || thesis?.token_address || thesis?.address || thesis?.contract_address || "");
+    if (addr) thesisByAddr.set(addr, thesis);
+  }
+
+  const watchlistByAddr = new Map();
+  for (const watchlist of (data?.e3dWatchlist || [])) {
+    const addr = cleanAddress(watchlist?.address || "");
+    if (addr) watchlistByAddr.set(addr, watchlist);
+  }
+
+  const candidateAddresses = new Set([
+    ...tokenByAddr.keys(),
+    ...candidateByAddr.keys(),
+    ...thesisByAddr.keys(),
+    ...watchlistByAddr.keys(),
+    ...storyMap.keys()
+  ]);
+
+  const entries = [];
+  const packetErrors = [];
+  for (const addr of candidateAddresses) {
+    if (!addr || disqualifiedAddresses.has(addr) || heldAddresses.has(addr)) continue;
+
+    try {
+      const tokenRow = tokenByAddr.get(addr) || null;
+      const candidate = candidateByAddr.get(addr) || null;
+      const thesis = thesisByAddr.get(addr) || null;
+      const watchlist = watchlistByAddr.get(addr) || null;
+      const stories = storyMap.get(addr) || [];
+      const cg = data?.cgDetailMap?.get(addr) || null;
+
+      const symbol = String(
+        tokenRow?.symbol
+        || cg?.symbol
+        || thesis?.entity_symbol
+        || thesis?.symbol
+        || candidate?.entity_symbol
+        || candidate?.symbol
+        || watchlist?.label
+        || ""
+      ).trim().toUpperCase();
+      if (!symbol || heldSymbols.has(symbol.toLowerCase())) continue;
+
+      const marketData = {
+        current_price: tokenRow?.price_usd ?? cg?.price_usd ?? thesis?.price_usd ?? null,
+        change_24h_pct: tokenRow?.change_24h ?? cg?.change_24h_pct ?? null,
+        change_30m_pct: tokenRow?.change_30m ?? null,
+        volume_24h_usd: tokenRow?.volume_24h_usd ?? cg?.volume_24h_usd ?? null,
+        market_cap_usd: tokenRow?.market_cap_usd ?? cg?.market_cap_usd ?? null,
+        price_source: tokenRow?._cg_source ? "coingecko" : cg && !tokenRow ? "coingecko" : "e3d",
+        price_timestamp: createdAt
+      };
+      const liquidityData = {
+        liquidity_usd: tokenRow?.liquidity_usd ?? null,
+        liquidity_source: "e3d",
+        liquidity_timestamp: createdAt
+      };
+      const executionData = {
+        ...estimateScoutExecutionData(liquidityData.liquidity_usd),
+        quote_timestamp: createdAt
+      };
+      const flow = tokenRow ? {
+        flow_signal: tokenRow.flow_signal ?? null,
+        buy_sell_ratio_1h: tokenRow.buy_sell_ratio_1h ?? null,
+        price_change_1h_pct: tokenRow.price_change_1h_pct ?? null,
+        source: "dexscreener",
+        timestamp: createdAt
+      } : null;
+
+      const evidence = [];
+      if (candidate) {
+        evidence.push({
+          source_type: "story",
+          source_ref: candidate?.id || candidate?.candidate_id || addr,
+          label: "e3d_candidate_context",
+          direction: "bullish",
+          strength: Math.max(50, Math.min(95, Math.round(toNum(candidate?.convergence_score, 72)))),
+          summary: [
+            `E3D candidate`,
+            candidate?.convergence_score != null ? `conv ${Math.round(toNum(candidate.convergence_score, 0))}` : null,
+            Array.isArray(candidate?.story_types) && candidate.story_types.length ? `signals ${candidate.story_types.slice(0, 3).join("|")}` : null,
+            String(candidate?.signal_summary || "").trim().slice(0, 70) || null
+          ].filter(Boolean).join(", ").slice(0, 160)
+        });
+      }
+      evidence.push(...stories);
+
+      const sourceAgentHint = watchlist && !candidate && !thesis ? "user_watchlist" : "scout";
+      const scoutInput = {
+        created_at: createdAt,
+        strategy_version: PAPER_ORDER_STRATEGY_VERSION,
+        source_agent: sourceAgentHint,
+        token: {
+          symbol,
+          name: tokenRow?.name || cg?.name || thesis?.entity_name || watchlist?.label || "",
+          chain: "ethereum",
+          contract_address: addr,
+          category: "unknown"
+        },
+        evidence,
+        market_data: marketData,
+        liquidity_data: liquidityData,
+        execution_data: executionData,
+        flow,
+        thesis: thesis ? {
+          thesis_id: thesis?.id || thesis?.thesis_id || addr,
+          conviction: thesis?.conviction ?? null,
+          direction: thesis?.direction || "LONG",
+          summary: thesis?.thesis || thesis?.thesis_text || thesis?.summary || null
+        } : null,
+        watchlist: watchlist ? {
+          watchlist_id: watchlist?.id || watchlist?.watchlist_id || addr,
+          label: watchlist?.label || symbol,
+          added_at: watchlist?.added_at || null
+        } : null
+      };
+
+      scoutInput.market_data_quality = buildMarketDataQuality(scoutInput, { evaluated_at: createdAt });
+      scoutInput.token_risk_scan = buildCandidateTokenRiskScan(scoutInput, portfolio, {
+        evaluated_at: createdAt,
+        mode: "paper",
+        side: "buy"
+      });
+
+      const packet = buildScoutEvidencePacket(scoutInput, { created_at: createdAt });
+      const ranking = rankScoutPacket(packet, {
+        e3d_candidate: candidate,
+        thesis,
+        watchlist,
+        stories,
+        market_data: marketData,
+        liquidity_data: liquidityData,
+        flow
+      });
+
+      entries.push({
+        address: addr,
+        symbol,
+        scout_input: scoutInput,
+        packet,
+        ranking,
+        source_agent_hint: sourceAgentHint,
+        packet_summary: {
+          evidence_packet_id: packet.evidence_packet_id,
+          symbol,
+          contract_address: addr,
+          source_agent: sourceAgentHint,
+          flow_only: ranking.eligibility.flow_only,
+          quality_score: packet.quality_score,
+          evidence_count: packet.evidence_count,
+          market_evidence_count: packet.market_evidence_count,
+          story_evidence_count: packet.story_evidence_count,
+          candidate_score: candidate?.convergence_score ?? null,
+          thesis_conviction: thesis?.conviction ?? null,
+          market_data: marketData,
+          liquidity_data: liquidityData,
+          execution_data: executionData,
+          evidence: packet.evidence.slice(0, 8).map((item) => ({
+            evidence_id: item.evidence_id,
+            source_type: item.source_type,
+            label: item.label,
+            direction: item.direction,
+            strength: item.strength,
+            summary: item.summary
+          })),
+          evidence_ids: packet.evidence.slice(0, 8).map((item) => item.evidence_id)
+        }
+      });
+    } catch (err) {
+      packetErrors.push({ address: addr, error: String(err?.message || err).slice(0, 200) });
+    }
+  }
+
+  if (!entries.length && packetErrors.length) {
+    const error = new Error("SCOUT_EVIDENCE_PACKET_BUILD_FAILED");
+    error.packet_errors = packetErrors;
+    throw error;
+  }
+
+  const sorted = [...entries].sort((a, b) =>
+    (b.ranking.score - a.ranking.score)
+    || (b.packet.quality_score - a.packet.quality_score)
+    || String(a.symbol).localeCompare(String(b.symbol))
+    || String(a.address).localeCompare(String(b.address))
+  );
+
+  const shortlist = [];
+  const blocked = [];
+  let flowOnlyCount = 0;
+
+  for (const entry of sorted) {
+    const eligibility = entry.ranking.eligibility;
+    if (!eligibility.eligible) {
+      blocked.push({
+        symbol: entry.symbol,
+        contract_address: entry.address,
+        evidence_packet_id: entry.packet.evidence_packet_id,
+        reasons: eligibility.reasons,
+        hard_blockers: eligibility.hard_blockers
+      });
+      continue;
+    }
+    if (eligibility.flow_only) {
+      if (flowOnlyCount >= SCOUT_FLOW_ONLY_PER_CYCLE_LIMIT) {
+        blocked.push({
+          symbol: entry.symbol,
+          contract_address: entry.address,
+          evidence_packet_id: entry.packet.evidence_packet_id,
+          reasons: ["flow_only_cap_exceeded"],
+          hard_blockers: []
+        });
+        continue;
+      }
+      flowOnlyCount += 1;
+    }
+    shortlist.push(entry);
+    if (shortlist.length >= shortlistLimit) break;
+  }
+
+  return {
+    entries,
+    shortlist,
+    blocked,
+    packet_errors: packetErrors,
+    shortlist_limit: shortlistLimit
+  };
 }
 
 function parseScoutJSON(rawText) {
@@ -3039,6 +3959,325 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
       liquidity_usd: tokenMatch?.liquidity_usd ?? null,
     });
   };
+
+  try {
+    const shortlistBuild = buildScoutEvidenceShortlist(data, portfolio, {
+      createdAt,
+      heldAddresses,
+      heldSymbols,
+      disqualifiedAddresses
+    });
+    log("scout_evidence_shortlist", {
+      packets_built: shortlistBuild.entries.length,
+      shortlist_count: shortlistBuild.shortlist.length,
+      blocked_count: shortlistBuild.blocked.length,
+      packet_errors: shortlistBuild.packet_errors.length,
+      shortlist_limit: shortlistBuild.shortlist_limit
+    });
+    for (const blocked of shortlistBuild.blocked) {
+      log("scout_shortlist_blocked", blocked);
+    }
+    for (const packetError of shortlistBuild.packet_errors) {
+      log("scout_evidence_packet_error", packetError);
+    }
+
+    if (shortlistBuild.shortlist.length === 0) {
+      refreshPositionPrices(portfolio, data.tokenUniverse);
+      if (_cycleQuantContext?.token_flow) {
+        for (const pos of Object.values(portfolio.positions)) {
+          const addr = cleanAddress(pos.contract_address || "");
+          const flow = addr ? _cycleQuantContext.token_flow[addr] : null;
+          if ((flow?.price_usd ?? 0) > 0 && flow.price_usd !== pos.current_price) {
+            pos.current_price = flow.price_usd;
+            pos.market_value_usd = pos.quantity * flow.price_usd;
+            pos.last_updated_at = nowIso();
+          }
+        }
+      }
+
+      return {
+        scan_timestamp: new Date().toISOString(),
+        candidates: [],
+        holdings_updates: [],
+        stories_checked: Object.entries(data.stories).map(([type, items]) => ({
+          type,
+          found: Array.isArray(items) && items.length > 0,
+          tokens: Array.isArray(items)
+            ? items.slice(0, 5).map((s) => s.token_address || s.address || "").filter(Boolean)
+            : []
+        })),
+        token_universe: data.tokenUniverse.map((t) => ({
+          symbol: t.symbol || null,
+          address: t.address || null,
+          price_usd: t.price_usd ?? null,
+          volume_24h_usd: t.volume_24h_usd ?? null,
+          liquidity_usd: t.liquidity_usd ?? null,
+          market_cap_usd: t.market_cap_usd ?? null,
+          change_24h: t.change_24h ?? null,
+          flow_signal: t.flow_signal ?? null,
+        })),
+        evidence_diagnostics: {
+          ...buildScoutEvidenceDiagnostics({
+          input_candidate_count: shortlistBuild.entries.length,
+          llm_batches: [],
+          candidates: [],
+          stories_checked: [],
+          coverage: null
+          }),
+          evidence_qualified_candidates: 0,
+          evidence_blocked_candidates: shortlistBuild.blocked.length,
+          shortlist_candidate_reduction: shortlistBuild.entries.length,
+          shortlist_candidate_reduction_pct: shortlistBuild.entries.length > 0 ? 1 : 0
+        }
+      };
+    }
+
+    const shortlistPackets = shortlistBuild.shortlist.map((entry, index) => ({
+      rank: index + 1,
+      ...entry.packet_summary
+    }));
+    const systemPrompt = [
+      "You are Scout, a crypto trading research agent.",
+      "You are given compact evidence packets that were already ranked and filtered deterministically.",
+      "Return STRICT JSON only: one object, no markdown, no commentary.",
+      "Use only supplied evidence packets, tokens, contract addresses, evidence_packet_id values, and evidence_id values.",
+      "Do not invent evidence. Do not cite evidence from a different packet. Do not propose a token that is not in the packets.",
+      "Return up to 3 buy candidates. Prefer 0 candidates over a weak candidate.",
+      `Output shape: {scan_timestamp, candidates[], holdings_updates[], stories_checked[]}`,
+      `Each candidate: {source_agent:"scout"|"user_watchlist", created_at:"${createdAt}", expires_at:"${expiresAt}", evidence_packet_id, token:{symbol,name,chain:"ethereum",contract_address,category}, setup_type, action:"buy", confidence:integer(0-100), conviction_score:integer(0-100), opportunity_score:integer(0-100), why_now, evidence:["evi_..."], risks[], entry_zone:{low,high}, invalidation_price, targets:{target_1,target_2,target_3}, market_data:{current_price,change_24h_pct,change_30m_pct,price_source,volume_24h_usd,market_cap_usd}, liquidity_data:{liquidity_usd,liquidity_source}, execution_data:{estimated_slippage_bps,quote_source}, portfolio_data:{current_token_exposure_pct:0,current_category_exposure_pct:0,current_total_exposure_pct:0}}`,
+      "evidence[] must contain 3 to 5 evidence_id strings copied exactly from that candidate packet.",
+      "stories_checked[] may be []. holdings_updates[] should normally be []."
+    ].join("\n");
+    const userMessage = [
+      `Scout task — ${createdAt} [evidence shortlist]`,
+      `Portfolio: cash=$${portfolio?.cash_usd ?? 100000} positions=${Object.keys(portfolio?.positions || {}).length}`,
+      `Shortlist packets=${shortlistPackets.length} limit=${shortlistBuild.shortlist_limit}`,
+      JSON.stringify({ scout_packets: shortlistPackets })
+    ].join("\n");
+    const promptChars = systemPrompt.length + userMessage.length;
+
+    if (promptChars <= SCOUT_EVIDENCE_PACKET_SAFE_PROMPT_CHARS) {
+      const scoutLlmBatches = [];
+      let batchRaw = "";
+      try {
+        batchRaw = callLLMDirect(systemPrompt, userMessage, { agent: "scout" });
+        const batchMeta = getLastLLMMeta("scout") || {};
+        scoutLlmBatches.push({
+          prompt_chars: promptChars,
+          prompt_tokens: batchMeta.prompt_tokens,
+          completion_tokens: batchMeta.completion_tokens,
+          total_tokens: batchMeta.total_tokens,
+          duration_ms: batchMeta.duration_ms
+        });
+      } catch (err) {
+        const batchMeta = getLastLLMMeta("scout") || {};
+        scoutLlmBatches.push({
+          prompt_chars: promptChars,
+          prompt_tokens: batchMeta.prompt_tokens,
+          completion_tokens: batchMeta.completion_tokens,
+          total_tokens: batchMeta.total_tokens,
+          duration_ms: batchMeta.duration_ms
+        });
+        throw err;
+      }
+
+      const batchResult = parseScoutJSON(batchRaw);
+      const shortlistMap = new Map(shortlistBuild.shortlist.map((entry) => [entry.address, entry]));
+      const validatedCandidates = [];
+      const seenCandidateAddresses = new Set();
+      for (const proposal of (Array.isArray(batchResult?.candidates) ? batchResult.candidates : [])) {
+        const addr = cleanAddress(proposal?.token?.contract_address || "");
+        if (!addr || seenCandidateAddresses.has(addr)) continue;
+        const shortlistEntry = shortlistMap.get(addr);
+        if (!shortlistEntry) {
+          log("scout_candidate_downgraded", {
+            reason: "candidate_not_in_evidence_shortlist",
+            contract_address: addr,
+            symbol: proposal?.token?.symbol || null
+          });
+          continue;
+        }
+        const validEvidenceIds = new Set(shortlistEntry.packet_summary.evidence_ids);
+        const validRefs = extractScoutEvidenceRefs(proposal).filter((ref) => validEvidenceIds.has(ref));
+        if (validRefs.length < 3) {
+          log("scout_candidate_downgraded", {
+            reason: "too_few_valid_evidence_refs",
+            contract_address: addr,
+            symbol: shortlistEntry.symbol,
+            evidence_packet_id: shortlistEntry.packet.evidence_packet_id,
+            valid_ref_count: validRefs.length
+          });
+          continue;
+        }
+
+        const mergedCandidate = {
+          ...proposal,
+          source_agent: shortlistEntry.source_agent_hint,
+          created_at: createdAt,
+          expires_at: expiresAt,
+          evidence_packet_id: shortlistEntry.packet.evidence_packet_id,
+          evidence: validRefs,
+          evidence_ref_count: validRefs.length,
+          evidence_quality_score: shortlistEntry.packet.quality_score,
+          evidence_blockers: cleanEvidenceList(shortlistEntry.packet.blockers),
+          evidence_warnings: cleanEvidenceList(shortlistEntry.packet.warnings),
+          evidence_summary: buildCompactEvidenceSummary(shortlistEntry.packet, validRefs),
+          token: {
+            ...(proposal?.token || {}),
+            symbol: shortlistEntry.scout_input.token.symbol,
+            name: shortlistEntry.scout_input.token.name,
+            chain: shortlistEntry.scout_input.token.chain || "ethereum",
+            contract_address: addr,
+            category: shortlistEntry.scout_input.token.category || "unknown"
+          },
+          market_data: {
+            ...(shortlistEntry.scout_input.market_data || {}),
+            ...(proposal?.market_data || {})
+          },
+          liquidity_data: {
+            ...(shortlistEntry.scout_input.liquidity_data || {}),
+            ...(proposal?.liquidity_data || {})
+          },
+          execution_data: {
+            ...(shortlistEntry.scout_input.execution_data || {}),
+            ...(proposal?.execution_data || {})
+          },
+          market_data_quality: deepClone(shortlistEntry.scout_input.market_data_quality),
+          market_data_quality_id: shortlistEntry.scout_input.market_data_quality?.data_quality_id || null,
+          market_data_quality_ref: buildMarketDataQualityRef(shortlistEntry.scout_input.market_data_quality, { context: "scout_shortlist" }),
+          token_risk_scan: deepClone(shortlistEntry.scout_input.token_risk_scan),
+          token_risk_scan_id: shortlistEntry.scout_input.token_risk_scan?.token_risk_scan_id || null,
+          token_risk_scan_ref: buildTokenRiskScanRef(shortlistEntry.scout_input.token_risk_scan, { context: "scout_shortlist" }),
+          portfolio_data: proposal?.portfolio_data && typeof proposal.portfolio_data === "object"
+            ? proposal.portfolio_data
+            : { current_token_exposure_pct: 0, current_category_exposure_pct: 0, current_total_exposure_pct: 0 }
+        };
+        seenCandidateAddresses.add(addr);
+        validatedCandidates.push(mergedCandidate);
+      }
+
+      validatedCandidates.sort((a, b) => (b.conviction_score ?? 0) - (a.conviction_score ?? 0));
+      const result = {
+        scan_timestamp: new Date().toISOString(),
+        candidates: validatedCandidates.slice(0, 3),
+        holdings_updates: Array.isArray(batchResult?.holdings_updates) ? batchResult.holdings_updates : [],
+        stories_checked: Array.isArray(batchResult?.stories_checked) ? batchResult.stories_checked : []
+      };
+
+      const now = new Date().toISOString();
+      for (const candidate of result.candidates || []) {
+        const addr = cleanAddress(candidate?.token?.contract_address || "");
+        if (!addr) continue;
+
+        let tokenRow = null;
+        try {
+          const rows = endpointArray(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
+            dataSource: 1, search: addr, limit: 1
+          }));
+          tokenRow = rows.find((row) => cleanAddress(row.address || "") === addr) || rows[0] || null;
+        } catch (_) {}
+
+        const storyPrice = storyPriceMap.get(addr);
+        if (tokenRow || storyPrice) {
+          if (!candidate.token.name && tokenRow?.name) candidate.token.name = tokenRow.name;
+          if (!candidate.token.name && storyPrice?.symbol) candidate.token.name = storyPrice.symbol;
+          const price = tokenRow?.priceUSD ?? tokenRow?.price_usd ?? storyPrice?.price ?? candidate.market_data?.current_price ?? 0;
+          const liq = tokenRow?.effectiveLiquidityUSD || tokenRow?.liquidityUSD || tokenRow?.liquidity_usd || storyPrice?.liq || candidate.liquidity_data?.liquidity_usd || 0;
+          const mcap = tokenRow?.marketCapUSD ?? tokenRow?.market_cap_usd ?? storyPrice?.mcap ?? candidate.market_data?.market_cap_usd ?? 0;
+          const vol24 = tokenRow?.volume24hUSD ?? tokenRow?.volume_24h_usd ?? candidate.market_data?.volume_24h_usd ?? 0;
+          const chg30m = tokenRow?.changes?.["30M"]?.percent ?? candidate.market_data?.change_30m_pct ?? 0;
+          const chg24h = tokenRow?.changes?.["24H"]?.percent ?? candidate.market_data?.change_24h_pct ?? 0;
+          candidate.market_data = {
+            ...candidate.market_data,
+            current_price: price,
+            change_24h_pct: chg24h,
+            change_30m_pct: chg30m,
+            price_timestamp: now,
+            price_source: "e3d",
+            volume_24h_usd: vol24,
+            market_cap_usd: mcap
+          };
+          candidate.liquidity_data = {
+            ...candidate.liquidity_data,
+            liquidity_usd: liq,
+            liquidity_timestamp: now,
+            liquidity_source: "e3d"
+          };
+          candidate.execution_data = {
+            ...candidate.execution_data,
+            estimated_slippage_bps: estimateScoutExecutionData(liq).estimated_slippage_bps,
+            quote_source: "e3d"
+          };
+          if (tokenRow?.fragilityScore != null) candidate._fragility_score = tokenRow.fragilityScore;
+        }
+      }
+
+      if (!Array.isArray(result.stories_checked)) result.stories_checked = [];
+      const reportedTypes = new Set(result.stories_checked.map((story) => String(story?.type || "").toUpperCase()));
+      for (const [type, items] of Object.entries(data.stories)) {
+        if (reportedTypes.has(type.toUpperCase())) continue;
+        result.stories_checked.push({
+          type,
+          found: Array.isArray(items) && items.length > 0,
+          tokens: Array.isArray(items)
+            ? items.slice(0, 5).map((s) => s.token_address || s.address || "").filter(Boolean)
+            : []
+        });
+      }
+
+      result.candidates = (result.candidates || []).filter((candidate) => {
+        const change7d = candidate?._coingecko?.change_7d_pct;
+        if (change7d != null && change7d > 300) {
+          log("scout_pump_filter", { symbol: candidate.token?.symbol, change_7d_pct: change7d });
+          return false;
+        }
+        return true;
+      });
+
+      refreshPositionPrices(portfolio, data.tokenUniverse);
+      if (_cycleQuantContext?.token_flow) {
+        for (const pos of Object.values(portfolio.positions)) {
+          const addr = cleanAddress(pos.contract_address || "");
+          const flow = addr ? _cycleQuantContext.token_flow[addr] : null;
+          if ((flow?.price_usd ?? 0) > 0 && flow.price_usd !== pos.current_price) {
+            pos.current_price = flow.price_usd;
+            pos.market_value_usd = pos.quantity * flow.price_usd;
+            pos.last_updated_at = nowIso();
+          }
+        }
+      }
+
+      result.token_universe = data.tokenUniverse.map((t) => ({
+        symbol: t.symbol || null,
+        address: t.address || null,
+        price_usd: t.price_usd ?? null,
+        volume_24h_usd: t.volume_24h_usd ?? null,
+        liquidity_usd: t.liquidity_usd ?? null,
+        market_cap_usd: t.market_cap_usd ?? null,
+        change_24h: t.change_24h ?? null,
+        flow_signal: t.flow_signal ?? null,
+      }));
+      result.evidence_diagnostics = buildScoutEvidenceDiagnostics({
+        input_candidate_count: shortlistBuild.entries.length,
+        llm_batches: scoutLlmBatches,
+        candidates: result.candidates,
+        stories_checked: result.stories_checked,
+        coverage: null
+      });
+      result.evidence_diagnostics.evidence_qualified_candidates = shortlistBuild.shortlist.length;
+      result.evidence_diagnostics.evidence_blocked_candidates = shortlistBuild.blocked.length;
+      result.evidence_diagnostics.shortlist_candidate_reduction = Math.max(0, shortlistBuild.entries.length - shortlistBuild.shortlist.length);
+      result.evidence_diagnostics.shortlist_candidate_reduction_pct = shortlistBuild.entries.length > 0
+        ? Number((Math.max(0, shortlistBuild.entries.length - shortlistBuild.shortlist.length) / shortlistBuild.entries.length).toFixed(4))
+        : 0;
+      return result;
+    }
+  } catch (err) {
+    log("scout_evidence_shortlist_fallback", {
+      error: String(err?.message || err).slice(0, 200),
+      packet_errors: Array.isArray(err?.packet_errors) ? err.packet_errors.slice(0, 10) : []
+    });
+  }
 
   const systemPrompt = [
     "You are Scout, an elite crypto trading research agent for a quantitative hedge fund.",
@@ -3356,16 +4595,34 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
   const allScoutCandidates = [];
   const seenCandidateAddresses = new Set();
   let mergedStoriesChecked = null;
+  const scoutLlmBatches = [];
 
   for (let bi = 0; bi < batches.length; bi++) {
     const batchStr = batches[bi].join("\n");
     const batchLabel = batches.length > 1 ? `[batch ${bi + 1}/${batches.length} — sorted by convergence_score desc]\n` : "";
     const userMessage = [beforeStr, batchLabel + batchStr, afterStr].join("\n");
+    const promptChars = systemPrompt.length + userMessage.length;
 
     let batchRaw;
     try {
       batchRaw = callLLMDirect(systemPrompt, userMessage, { agent: "scout" });
+      const batchMeta = getLastLLMMeta("scout") || {};
+      scoutLlmBatches.push({
+        prompt_chars: promptChars,
+        prompt_tokens: batchMeta.prompt_tokens,
+        completion_tokens: batchMeta.completion_tokens,
+        total_tokens: batchMeta.total_tokens,
+        duration_ms: batchMeta.duration_ms
+      });
     } catch (batchErr) {
+      const batchMeta = getLastLLMMeta("scout") || {};
+      scoutLlmBatches.push({
+        prompt_chars: promptChars,
+        prompt_tokens: batchMeta.prompt_tokens,
+        completion_tokens: batchMeta.completion_tokens,
+        total_tokens: batchMeta.total_tokens,
+        duration_ms: batchMeta.duration_ms
+      });
       log("scout_batch_error", { batch: bi + 1, error: String(batchErr).slice(0, 200) });
       continue;
     }
@@ -3574,19 +4831,27 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
     flow_signal:    t.flow_signal ?? null,
   }));
 
+  result.evidence_diagnostics = buildScoutEvidenceDiagnostics({
+    input_candidate_count: data.e3dCandidates.length,
+    llm_batches: scoutLlmBatches,
+    candidates: result.candidates,
+    stories_checked: result.stories_checked,
+    coverage: null
+  });
+
   return result;
 }
 
 function runHarvestDirect(portfolio, portfolioIntelligence = null) {
   const createdAt = nowIso();
   const expiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString();
-  const dossier = portfolioIntelligence || buildPortfolioIntelligenceDossier(portfolio);
-
-  const positions = Object.values(portfolio?.positions || {});
+  const reviewContext = buildHarvestEvidenceReviewContext(portfolio, portfolioIntelligence, { createdAt });
+  const dossier = reviewContext.dossier;
+  const positions = reviewContext.positions;
 
   // No positions — nothing to harvest
   if (positions.length === 0) {
-    return {
+    const emptyResult = {
       scan_timestamp: createdAt,
       portfolio_summary: {
         market_regime: dossier.market_regime || "unknown",
@@ -3603,98 +4868,31 @@ function runHarvestDirect(portfolio, portfolioIntelligence = null) {
       exit_candidates: [],
       stories_checked: []
     };
+    emptyResult.evidence_diagnostics = buildHarvestEvidenceDiagnostics({
+      input_candidate_count: 0,
+      llm_batches: [],
+      positions_reviewed: 0,
+      position_reviews: [],
+      exit_candidates: [],
+      stories_checked: [],
+      coverage: null
+    });
+    return emptyResult;
   }
-
-  // Use cycle-level cached stories — already fetched once by getOrFetchCycleMarketContext().
-  const heldAddresses = positions.map((p) => cleanAddress(p?.contract_address || "")).filter(Boolean);
-  const exitRiskTypes = ["LIQUIDITY_DRAIN", "WASH_TRADE", "SPREAD_WIDENING", "MOMENTUM_DIVERGENCE", "EXCHANGE_FLOW", "LOOP",
-    "SECURITY_RISK", "RUG_LIQUIDITY_PULL", "TREASURY_DISTRIBUTION", "CONCENTRATION_SHIFT", "VOLUME_PROFILE_ANOMALY"];
-  const holdConfirmTypes = ["ACCUMULATION", "SMART_MONEY", "SMART_MONEY_LEADER", "FLOW", "CLUSTER", "STAGING", "FUNNEL"];
-  const pumpExhaustionTypes = ["MOVER", "SURGE"];
-
-  const { allStories: cycleHarvestStories } = getOrFetchCycleMarketContext();
-  const allHarvestStories = cycleHarvestStories || [];
-  const exitStories = {};
-  for (const s of allHarvestStories) {
-    const t = String(s?.story_type || s?.type || "").toUpperCase();
-    if (!t) continue;
-    if (!exitStories[t]) exitStories[t] = [];
-    exitStories[t].push(s);
-  }
-
-  // Build per-position story matches
-  const addrSet = new Set(heldAddresses);
-  const storyMatches = {};
-  for (const [type, items] of Object.entries(exitStories)) {
-    storyMatches[type] = items.filter((s) => {
-      const addr = cleanAddress(s?.meta?.token_address || s?.primary_token || s?.token_address || s?.address || "");
-      return addrSet.has(addr);
-    }).map((s) => ({
-      address: cleanAddress(s?.meta?.token_address || s?.token_address || s?.address || ""),
-      symbol: s?.meta?.token_symbol || s?.symbol || "",
-      score: s?.score,
-      hint: s?.meta?.narrative_hint || ""
-    }));
-  }
-
-  // Build positionData using live portfolio prices (refreshed by runScoutDirect) rather than
-  // the stale dossier prices, and augment with DexScreener flow + funding rate signals.
-  const dossierByAddress = new Map();
-  const dossierBySymbol = new Map();
-  for (const item of dossier.holdings || []) {
-    const addr = cleanAddress(item?.token?.contract_address || "");
-    const sym = String(item?.token?.symbol || "").trim().toLowerCase();
-    if (addr) dossierByAddress.set(addr, item);
-    if (sym) dossierBySymbol.set(sym, item);
-  }
-
-  const positionData = positions.map((livePos) => {
-    const sym  = livePos?.symbol || null;
-    const addr = cleanAddress(livePos?.contract_address || "");
-    const item = (addr && dossierByAddress.get(addr)) || (sym && dossierBySymbol.get(String(sym).toLowerCase())) || {};
-    // Prefer live portfolio position price over dossier (dossier is built before price refresh).
-    const livePrice  = toNum(livePos?.current_price, toNum(item?.market_data?.current_price, 0));
-    const costBasis  = toNum(livePos?.cost_basis_usd, toNum(item?.position?.cost_basis_usd, 0));
-    const qty        = toNum(livePos?.quantity, toNum(item?.position?.quantity, 0));
-    const marketVal  = qty * livePrice;
-    const pnlUsd     = marketVal - costBasis;
-    const pnlPct     = costBasis > 0 ? +(pnlUsd / costBasis * 100).toFixed(2) : 0;
-    const flowData   = addr ? (_cycleQuantContext?.token_flow?.[addr] ?? null) : null;
-    const funding    = sym  ? (_cycleQuantContext?.funding_rates?.[sym] ?? null) : null;
-    return {
-      symbol:              sym,
-      contract_address:    addr || null,
-      category:            livePos?.category || item?.token?.category || "unknown",
-      quantity:            qty,
-      avg_entry_price:     toNum(livePos?.avg_entry_price, toNum(item?.position?.avg_entry_price, 0)),
-      current_price:       livePrice,
-      market_value_usd:    +marketVal.toFixed(2),
-      cost_basis_usd:      costBasis,
-      unrealized_pnl_usd:  +pnlUsd.toFixed(2),
-      unrealized_pnl_pct:  pnlPct,
-      thesis_strength:     item?.thesis?.strength ?? null,
-      thesis_freshness:    item?.thesis?.freshness ?? null,
-      narrative_decay:     item?.thesis?.decay ?? null,
-      opportunity_score:   item?.thesis?.opportunity_score ?? null,
-      fraud_risk:          item?.thesis?.fraud_risk ?? null,
-      ...(flowData ? {
-        flow_signal:          flowData.flow_signal,
-        buy_sell_ratio_1h:    flowData.buy_sell_ratio_1h,
-        price_change_1h_pct:  flowData.price_change_1h_pct,
-      } : {}),
-      ...(funding ? {
-        funding_signal:       funding.signal,
-        funding_rate_per_8h:  funding.rate_per_8h,
-      } : {}),
-    };
-  });
+  const entryByAddress = new Map(reviewContext.entries.map((entry) => [entry.address, entry]));
+  const harvestPackets = reviewContext.entries.map((entry, index) => ({
+    rank: index + 1,
+    ...entry.packet_summary
+  }));
 
   const systemPrompt = [
     "You are Harvest, a crypto portfolio exit-scan agent.",
-    "You have been given pre-fetched E3D exit-risk story data for held positions, live quant signals, and macro context. Analyze all of it and return STRICT JSON only — one object, no markdown.",
+    "You have been given compact per-position evidence packets built deterministically before this call.",
+    "Return STRICT JSON only — one object, no markdown.",
+    "Use only the supplied packets, token fields, evidence_packet_id values, and evidence_id values. Do not invent evidence or cite evidence from a different packet.",
     `Classify every held position as hold, monitor, trim, or exit based on ALL available evidence. position_reviews[] MUST contain exactly one entry per held position (${positions.length} total) — never skip a position.`,
     "Only add a position to exit_candidates if action is trim or exit.",
-    "EVIDENCE RULE: Every exit_candidate MUST include at least 2 strings in evidence[] citing specific story types, flow signals, or price/liquidity data. Do NOT put a position in exit_candidates without at least 2 evidence items — move it to monitor instead.",
+    "EVIDENCE RULE: Every trim/exit review and every exit_candidate MUST include at least 2 evidence_id strings in evidence[] copied exactly from that same packet. If you do not have 2 valid evidence refs, use action='monitor' instead.",
     "MASS EXIT RULE: Do not propose trim or exit for more than half the portfolio in a single cycle unless you have direct exit-risk story matches (LIQUIDITY_DRAIN, RUG_LIQUIDITY_PULL, TREASURY_DISTRIBUTION, SECURITY_RISK) for those positions. When evidence is weak or absent, use monitor, not exit.",
     "",
     "SIGNAL TIMING — know whether you're in the setup, the move, or the dump:",
@@ -3714,9 +4912,9 @@ function runHarvestDirect(portfolio, portfolioIntelligence = null) {
     "- unrealized_pnl_pct < -8%: flag for stop review; exit if thesis invalid and no recovery signal",
     "",
     `Output shape: {scan_timestamp, portfolio_summary, position_reviews[], exit_candidates[], stories_checked[]}`,
-    `Each position_review: {source_agent:"harvest", created_at:"${createdAt}", expires_at:"${expiresAt}", token:{symbol,name,chain:"ethereum",contract_address,category}, position:{quantity,avg_entry_price,current_price,market_value_usd,cost_basis_usd,unrealized_pnl_usd,unrealized_pnl_pct}, action:"hold"|"monitor"|"trim"|"exit", thesis_state, thesis_summary, what_changed, why_now, confidence:integer(0-100), conviction_score:integer(0-100), opportunity_score:integer(0-100), review_priority, summary, evidence[], risks[], what_would_change_my_mind[], next_best_alternative, current_regime, market_data:{current_price,change_24h_pct,price_source:"e3d"}, narrative_data:{story_strength,thesis_health,flow_direction}}`,
-    `Each exit_candidate: same as position_review plus {setup_type, edge_source, suggested_exit_fraction, target_exit_price, decision_price, exit_priority}`,
-    `stories_checked[]: REQUIRED — one entry per story type listed in EXIT RISK STORIES, HOLD CONFIRM SIGNALS, and PUMP EXHAUSTION SIGNALS sections — {type:string, found:number, flagged_addresses:string[]}. Include ALL types even when found=0. This field must not be empty or null.`
+    `Each position_review: {source_agent:"harvest", created_at:"${createdAt}", expires_at:"${expiresAt}", evidence_packet_id, token:{symbol,name,chain:"ethereum",contract_address,category}, position:{quantity,avg_entry_price,current_price,market_value_usd,cost_basis_usd,unrealized_pnl_usd,unrealized_pnl_pct}, action:"hold"|"monitor"|"trim"|"exit", thesis_state, thesis_summary, what_changed, why_now, confidence:integer(0-100), conviction_score:integer(0-100), opportunity_score:integer(0-100), review_priority, summary, evidence:["evi_..."], risks[], what_would_change_my_mind[], next_best_alternative, current_regime, market_data:{current_price,change_24h_pct,price_source}, liquidity_data:{liquidity_usd,liquidity_source}, narrative_data:{story_strength,thesis_health,flow_direction}, portfolio_data:{current_token_exposure_pct,current_category_exposure_pct,current_total_exposure_pct,portfolio_timestamp,portfolio_source:"system"}}`,
+    `Each exit_candidate: same as position_review plus {setup_type, edge_source, suggested_exit_fraction, target_exit_price, decision_price, exit_priority}. evidence[] must contain 2 to 4 packet evidence_id strings.`,
+    `stories_checked[] may be [].`
   ].join("\n");
 
   // Build macro context block for Harvest
@@ -3735,29 +4933,29 @@ function runHarvestDirect(portfolio, portfolioIntelligence = null) {
   ] : [];
 
   const userMessage = [
-    `Harvest task — ${createdAt}`,
-    `Held positions (${positionData.length}) — prices are live (refreshed this cycle), pnl_pct is real:`,
-    JSON.stringify(positionData),
+    `Harvest task — ${createdAt} [evidence packets]`,
+    `Held positions=${reviewContext.entries.length}`,
+    `Evidence packets=${harvestPackets.length}`,
+    `Portfolio baseline: ${JSON.stringify({
+      market_regime: dossier.market_regime || "unknown",
+      portfolio: dossier.prompt_snapshot?.portfolio || null,
+      thesis_snapshot: dossier.prompt_snapshot?.thesis_snapshot || null
+    })}`,
     ...harvestMacroLines,
     ...harvestPolicyLines,
-    `\n--- EXIT RISK STORIES (matched to held addresses) ---`,
-    ...exitRiskTypes.map((type) => {
-      const matches = storyMatches[type] || [];
-      return `${type}: ${matches.length} matches — ${JSON.stringify(matches.slice(0, 3))}`;
-    }),
-    `\n--- HOLD CONFIRM SIGNALS (fresh accumulation = thesis intact) ---`,
-    ...holdConfirmTypes.map((type) => {
-      const matches = storyMatches[type] || [];
-      return `${type}: ${matches.length} matches — ${JSON.stringify(matches.slice(0, 3))}`;
-    }),
-    `\n--- PUMP EXHAUSTION SIGNALS (MOVER/SURGE on a declining position = dump phase, consider exit) ---`,
-    ...pumpExhaustionTypes.map((type) => {
-      const matches = storyMatches[type] || [];
-      return `${type}: ${matches.length} matches — ${JSON.stringify(matches.slice(0, 3))}`;
-    })
+    JSON.stringify({ harvest_packets: harvestPackets, stories_checked: reviewContext.stories_checked })
   ].join("\n");
 
+  const harvestLlmBatches = [];
   const rawText = callLLMDirect(systemPrompt, userMessage, { agent: "harvest" });
+  const harvestMeta = getLastLLMMeta("harvest") || {};
+  harvestLlmBatches.push({
+    prompt_chars: systemPrompt.length + userMessage.length,
+    prompt_tokens: harvestMeta.prompt_tokens,
+    completion_tokens: harvestMeta.completion_tokens,
+    total_tokens: harvestMeta.total_tokens,
+    duration_ms: harvestMeta.duration_ms
+  });
 
   // Extract JSON
   let jsonStr = rawText.trim();
@@ -3775,13 +4973,14 @@ function runHarvestDirect(portfolio, portfolioIntelligence = null) {
   }
 
   try {
-    return JSON.parse(jsonStr);
+    const parsed = JSON.parse(jsonStr);
+    return finalizeHarvestLLMResult(parsed, portfolio, reviewContext, dossier, createdAt, expiresAt, harvestLlmBatches);
   } catch (parseErr) {
     // LLM may have hit max_tokens mid-response — try to repair truncated JSON
     try {
       const repaired = JSON.parse(repairTruncatedJson(jsonStr));
       log("harvest_json_repaired", { raw_length: rawText.length });
-      return repaired;
+      return finalizeHarvestLLMResult(repaired, portfolio, reviewContext, dossier, createdAt, expiresAt, harvestLlmBatches);
     } catch (_) {
       throw new Error(`HARVEST_REPLY_NOT_JSON\n${rawText.slice(0, 500)}`);
     }
@@ -3848,130 +5047,27 @@ function buildScoutPrompt(portfolio, portfolioIntelligence = null) {
 function buildHarvestPrompt(portfolio, portfolioIntelligence = null) {
   const createdAt = nowIso();
   const expiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString();
-  const dossier = portfolioIntelligence || buildPortfolioIntelligenceDossier(portfolio);
-
-  const positions = dossier.holdings.map((item) => ({
-    symbol: item?.token?.symbol || null,
-    contract_address: item?.token?.contract_address || null,
-    category: item?.token?.category || "unknown",
-    quantity: toNum(item?.position?.quantity, 0),
-    avg_entry_price: toNum(item?.position?.avg_entry_price, 0),
-    current_price: toNum(item?.market_data?.current_price, 0),
-    market_value_usd: toNum(item?.position?.market_value_usd, 0),
-    cost_basis_usd: toNum(item?.position?.cost_basis_usd, 0),
-    unrealized_pnl_usd: toNum(item?.position?.market_value_usd, 0) - toNum(item?.position?.cost_basis_usd, 0),
-    stop_price: item?.position?.stop_price || null,
-    targets: item?.position?.targets || null,
-    opened_at: item?.position?.opened_at || null,
-    thesis: item?.thesis || null,
-    recommendation: item?.recommendation || null
-  }));
-  const compactHoldings = dossier.holdings.slice(0, 8).map((item) => ({
-    symbol: item?.token?.symbol || null,
-    contract_address: item?.token?.contract_address || null,
-    category: item?.token?.category || "unknown",
-    thesis_strength: item?.thesis?.strength ?? null,
-    thesis_freshness: item?.thesis?.freshness ?? null,
-    narrative_decay: item?.thesis?.decay ?? null,
-    opportunity_score: item?.thesis?.opportunity_score ?? null,
-    flow_alignment: item?.thesis?.flow_alignment ?? null,
-    fraud_risk: item?.thesis?.fraud_risk ?? null,
-    liquidity_quality: item?.thesis?.liquidity_quality ?? null,
-    recommendation_action: item?.recommendation?.action || null,
-    why_now: item?.recommendation?.why_now || null
-  }));
-  const portfolioBaseline = {
-    market_regime: dossier.market_regime,
-    portfolio: dossier.prompt_snapshot.portfolio,
-    thesis_snapshot: dossier.prompt_snapshot.thesis_snapshot,
-    holdings: compactHoldings
+  const reviewContext = buildHarvestEvidenceReviewContext(portfolio, portfolioIntelligence, { createdAt });
+  const baseline = {
+    market_regime: reviewContext.dossier.market_regime || "unknown",
+    portfolio: reviewContext.dossier.prompt_snapshot?.portfolio || null,
+    thesis_snapshot: reviewContext.dossier.prompt_snapshot?.thesis_snapshot || null
   };
 
-  const taskPrompt = `
-You are Harvest. Return STRICT JSON only.
-
-Your job:
-1. Use the pre-computed thesis scores in the dossier as the baseline for every held position
-2. Fetch live risk stories, flow, and wallet signals via WebFetch (endpoints in TOOLS.md) for each position
-3. Classify every position as hold, monitor, trim, or exit using live evidence vs the baseline scores
-4. Return STRICT JSON only — no markdown, no questions, no buy ideas
-
-REQUIRED RESEARCH — follow the full Research Protocol in TOOLS.md before classifying:
-1. Run the immediate-exit sweep (LIQUIDITY_DRAIN, RUG_LIQUIDITY_PULL, SPREAD_WIDENING, EXCHANGE_FLOW, MOMENTUM_DIVERGENCE, WASH_TRADE, LOOP) — match against every held address.
-2. Run the positioning-risk sweep (CONCENTRATION_SHIFT, WHALE net OUT, VOLUME_PROFILE_ANOMALY, MIRROR).
-3. Check hold-confirmation signals (ACCUMULATION, SMART_MONEY, EXCHANGE_FLOW net withdrawals).
-4. For each held position: fetch /stories?q={address}&scope=opportunity&limit=10 and /stories?q={address}&scope=risk&limit=10.
-5. Compare live signals against pre-computed thesis scores in context. Live signals take priority.
-
-PORTFOLIO INTELLIGENCE DOSSIER (pre-computed baseline scores):
-${JSON.stringify(portfolioBaseline)}
-
-DECISION PRINCIPLES:
-- hold when thesis strength, freshness, and flow remain intact
-- monitor when the position is intact but the thesis is aging or mixed
-- trim when thesis decay, distribution pressure, or opportunity cost starts to dominate
-- exit when fraud risk, liquidity deterioration, or thesis break clearly overwhelms the setup
-- use momentum as a secondary input, never the sole reason to sell
-
-POSITION REVIEW RULES:
-- emit a position review for every held position
-- only include entries in exit_candidates when the action is trim or exit
-- if the best action is hold or monitor, include the position in position_reviews with that action and a concise reason
-- compare each position against the weakest holding and the strongest alternative when deciding whether to trim or exit
-- surface the single strongest invalidation condition for each position
-
-Current held positions (use these for position fields in your output):
-${JSON.stringify(positions)}
-
-CRITICAL: You MUST produce exactly ${positions.length} entries in position_reviews — one for every position listed above. Do not stop or close the JSON until all ${positions.length} positions have been reviewed.
-
-Return EXACTLY this shape — one JSON object, no markdown:
-{
-  "scan_timestamp": "${createdAt}",
-  "portfolio_summary": { "market_regime": string, "cash_usd": number, "equity_usd": number, "position_count": number, "tracked_positions": number, "average_thesis_strength": number, "average_thesis_freshness": number, "average_narrative_decay": number, "average_opportunity_score": number },
-  "position_reviews": [
-    {
-      "proposal_version": "1.0", "source_agent": "harvest", "created_at": "${createdAt}", "expires_at": "${expiresAt}",
-      "token": { "symbol": string, "name": string, "chain": "ethereum", "contract_address": string, "category": string },
-      "position": { "quantity": number, "avg_entry_price": number, "current_price": number, "market_value_usd": number, "cost_basis_usd": number, "unrealized_pnl_usd": number },
-      "action": "hold"|"monitor"|"trim"|"exit",
-      "thesis_state": "confirmed"|"watch"|"weak"|"decaying",
-      "thesis_summary": string, "what_changed": string, "why_now": string,
-      "confidence": number(0-100), "conviction_score": number(0-100), "opportunity_score": number(0-100), "review_priority": number(1-5),
-      "summary": string, "evidence": string[], "risks": string[], "what_would_change_my_mind": string[], "next_best_alternative": string,
-      "current_regime": string,
-      "market_data": { "current_price": number, "change_24h_pct": number, "price_timestamp": string, "price_source": string, "volume_24h_usd": number, "market_cap_usd": number },
-      "liquidity_data": { "liquidity_usd": number, "liquidity_timestamp": string, "liquidity_source": string },
-      "narrative_data": { "story_strength": number(0-100), "thesis_health": number(0-100), "flow_direction": string },
-      "portfolio_data": { "current_token_exposure_pct": number, "current_category_exposure_pct": number, "current_total_exposure_pct": number, "portfolio_timestamp": string, "portfolio_source": "system" }
-    }
-  ],
-  "exit_candidates": [
-    {
-      "proposal_version": "1.0", "source_agent": "harvest", "created_at": "${createdAt}", "expires_at": "${expiresAt}",
-      "token": { "symbol": string, "name": string, "chain": "ethereum", "contract_address": string, "category": string },
-      "position": { "quantity": number, "avg_entry_price": number, "current_price": number, "market_value_usd": number, "cost_basis_usd": number, "unrealized_pnl_usd": number },
-      "setup_type": string, "edge_source": string, "action": "trim"|"exit",
-      "confidence": number(0-100), "conviction_score": number(0-100), "opportunity_score": number(0-100), "exit_priority": number(1-5),
-      "suggested_exit_fraction": number(0-1), "target_exit_price": number, "decision_price": number,
-      "summary": string, "why_now": string, "evidence": string[], "risks": string[], "what_would_change_my_mind": string[], "next_best_alternative": string,
-      "current_regime": string,
-      "market_data": { "current_price": number, "change_24h_pct": number, "price_timestamp": string, "price_source": string, "volume_24h_usd": number, "market_cap_usd": number },
-      "liquidity_data": { "liquidity_usd": number, "liquidity_timestamp": string, "liquidity_source": string },
-      "narrative_data": { "story_strength": number(0-100), "thesis_health": number(0-100), "flow_direction": string },
-      "portfolio_data": { "current_token_exposure_pct": number, "current_category_exposure_pct": number, "current_total_exposure_pct": number, "portfolio_timestamp": string, "portfolio_source": "system" }
-    }
-  ],
-  "stories_checked": [
-    { "type": string, "found": number, "flagged_addresses": string[] }
-  ]
-}
-
-RULES: position_reviews covers every held position — exit_candidates only for trim/exit — valid lowercase addresses — one object only.
-stories_checked must include one entry per story type endpoint you fetched (all of them), with "found" = count of stories returned and "flagged_addresses" = addresses that matched a held position.
-`.trim();
-
-  return taskPrompt.trim();
+  return [
+    "You are Harvest. Return STRICT JSON only.",
+    "Use only the supplied harvest evidence packets and cite evidence_id strings copied from the matching packet.",
+    `Review every held position exactly once (${reviewContext.entries.length} total).`,
+    `Trim/exit requires at least 2 valid evidence refs from the same packet; otherwise use monitor.`,
+    `Each position_review and each exit_candidate must include evidence_packet_id.`,
+    `Portfolio baseline: ${JSON.stringify(baseline)}`,
+    `Harvest packets: ${JSON.stringify(reviewContext.entries.map((entry, index) => ({ rank: index + 1, ...entry.packet_summary })))}`,
+    `stories_checked baseline: ${JSON.stringify(reviewContext.stories_checked)}`,
+    `Output shape: {scan_timestamp, portfolio_summary, position_reviews[], exit_candidates[], stories_checked[]}`,
+    `Each position_review: {source_agent:"harvest", created_at:"${createdAt}", expires_at:"${expiresAt}", evidence_packet_id, token:{symbol,name,chain:"ethereum",contract_address,category}, position:{quantity,avg_entry_price,current_price,market_value_usd,cost_basis_usd,unrealized_pnl_usd,unrealized_pnl_pct}, action:"hold"|"monitor"|"trim"|"exit", thesis_state, thesis_summary, what_changed, why_now, confidence, conviction_score, opportunity_score, review_priority, summary, evidence:["evi_..."], risks[], what_would_change_my_mind[], next_best_alternative, current_regime, market_data:{current_price,change_24h_pct,price_source}, liquidity_data:{liquidity_usd,liquidity_source}, narrative_data:{story_strength,thesis_health,flow_direction}, portfolio_data:{current_token_exposure_pct,current_category_exposure_pct,current_total_exposure_pct,portfolio_timestamp,portfolio_source:"system"}}`,
+    `Each exit_candidate: same as position_review plus {setup_type, edge_source, suggested_exit_fraction, target_exit_price, decision_price, exit_priority}.`,
+    "One JSON object only."
+  ].join("\n");
 }
 
 function buildRiskPrompt(proposal) {
@@ -4164,7 +5260,7 @@ function deterministicBuyGate(proposal, portfolio) {
 }
 
 function deterministicRiskReject(proposal, gate, paperMode) {
-  return {
+  return decorateRiskReviewWithEvidence({
     decision: "reject",
     reason_summary: `Rejected by deterministic buy gate: ${gate.blockers.join(", ")}`,
     reason_codes: gate.blockers,
@@ -4175,7 +5271,7 @@ function deterministicRiskReject(proposal, gate, paperMode) {
     deterministic_gate: true,
     paper_mode: Boolean(paperMode),
     gate_metrics: gate.metrics
-  };
+  }, proposal);
 }
 
 function runRiskForCandidates(candidates, portfolio) {
@@ -4200,7 +5296,7 @@ function runRiskForCandidates(candidates, portfolio) {
     }, portfolio);
     const gate = deterministicBuyGate(proposal, portfolio);
     const risk = gate.ok
-      ? runRiskDirect(proposal, paperMode)
+      ? decorateRiskReviewWithEvidence(runRiskDirect(proposal, paperMode), proposal)
       : deterministicRiskReject(proposal, gate, paperMode);
     const entry = { proposal, risk };
 
@@ -4266,7 +5362,7 @@ function runRiskForExitCandidates(candidates, portfolio) {
   for (const proposal of candidates) {
     const gate = validateExitProposal(proposal, portfolio);
     const risk = gate.ok
-      ? {
+      ? decorateRiskReviewWithEvidence({
           decision: approveDecision,
           reason_summary: "Exit reduces exposure on an existing held position.",
           reason_codes: ["valid_exit_reduces_position_risk"],
@@ -4276,8 +5372,8 @@ function runRiskForExitCandidates(candidates, portfolio) {
           blocker_list: [],
           deterministic_gate: true,
           approved_exit_fraction: gate.fraction
-        }
-      : {
+        }, proposal)
+      : decorateRiskReviewWithEvidence({
           decision: "reject",
           reason_summary: `Rejected exit: ${gate.blockers.join(", ")}`,
           reason_codes: gate.blockers,
@@ -4286,7 +5382,7 @@ function runRiskForExitCandidates(candidates, portfolio) {
           checks_failed: gate.blockers,
           blocker_list: gate.blockers,
           deterministic_gate: true
-        };
+        }, proposal);
     const entry = { proposal, risk };
     const handoffToExecutor = gate.ok;
     recordRiskDecisionEvent(proposal, risk, portfolio, getTrainingContext(), handoffToExecutor);
@@ -4447,7 +5543,7 @@ function buildPaperTradeTicket(candidate, allocationUsd, review, reason) {
     evaluated_at: candidate?.created_at || nowIso()
   });
   const assumedEntry = toNum(marketDataQuality.normalized?.price_usd, toNum(candidate?.market_data?.current_price, 0));
-  return {
+  const ticket = {
     created_at: nowIso(),
     assumed_entry: assumedEntry,
     stop: saneStopPrice(candidate?.invalidation_price, assumedEntry),
@@ -4471,6 +5567,8 @@ function buildPaperTradeTicket(candidate, allocationUsd, review, reason) {
     token_risk_scan_ref: candidate?.token_risk_scan_ref || null,
     token_risk_scan: candidate?.token_risk_scan ? deepClone(candidate.token_risk_scan) : null
   };
+  applyEvidenceMetadata(ticket, candidate);
+  return ticket;
 }
 
 function buildPaperFillExecution(trade) {
@@ -4548,7 +5646,10 @@ function attachPaperOrderLifecycle(trade, options = {}) {
       cycle_id: context.cycle_id || null,
       cycle_index: context.cycle_index ?? null,
       token_risk_scan_id: trade.token_risk_scan_id || trade.paper_trade_ticket?.token_risk_scan_id || null
-    }
+    },
+    evidence_packet_id: trade.evidence_packet_id || trade.paper_trade_ticket?.evidence_packet_id || null,
+    evidence_summary: trade.evidence_summary || trade.paper_trade_ticket?.evidence_summary || null,
+    evidence_refs: trade.evidence_refs || trade.paper_trade_ticket?.evidence_refs || []
   });
   trade.order_id = order.order_id;
   trade.order_ids = [order.order_id];
@@ -4734,6 +5835,7 @@ function executeSell(portfolio, action) {
   };
 
   trade.trade_id = buildTradeId(trade, getTrainingContext());
+  applyEvidenceMetadata(trade, action);
   const sellTokenRiskScan = buildPositionTokenRiskScan(pos, portfolio, {
     evaluated_at: trade.ts,
     side: "sell",
@@ -5013,6 +6115,8 @@ function openPosition(portfolio, candidate, allocationUsd, reason = "buy", optio
   if (options.paperTradeTicket) {
     trade.paper_trade_ticket = deepClone(options.paperTradeTicket);
   }
+  applyEvidenceMetadata(trade, candidate);
+  applyEvidenceMetadata(trade, trade.paper_trade_ticket || {});
   if (tokenRiskScan) {
     attachTokenRiskScanMetadata(trade, tokenRiskScan, context);
   }
@@ -5145,13 +6249,61 @@ function pushManagerFlag(flags, severity, agent, code, message) {
 function summarizeManagerSummary(report) {
   const criticalFlags = report.flags.filter((flag) => flag.severity === "critical").length;
   const warningFlags = report.flags.filter((flag) => flag.severity === "warning").length;
+  const qualified = toNum(report?.evidence_summary?.scout?.evidence_qualified_candidates, 0);
+  const blocked = toNum(report?.evidence_summary?.scout?.evidence_blocked_candidates, 0);
+  const reductionPct = normalizeCoveragePct(report?.evidence_summary?.scout?.shortlist_candidate_reduction_pct);
+  const harvestDowngrades = toNum(report?.evidence_summary?.harvest?.evidence_downgrade_count, 0);
+  const evidenceTail = ` Evidence: qualified=${qualified}, blocked=${blocked}, scout_reduction=${reductionPct == null ? "n/a" : `${Math.round(reductionPct * 100)}%`}, harvest_downgrades=${harvestDowngrades}.`;
   if (criticalFlags > 0) {
-    return `Cycle finished with ${criticalFlags} critical flag${criticalFlags === 1 ? "" : "s"} and ${warningFlags} warning${warningFlags === 1 ? "" : "s"}.`;
+    return `Cycle finished with ${criticalFlags} critical flag${criticalFlags === 1 ? "" : "s"} and ${warningFlags} warning${warningFlags === 1 ? "" : "s"}.${evidenceTail}`;
   }
   if (warningFlags > 0) {
-    return `Cycle was mostly healthy with ${warningFlags} warning${warningFlags === 1 ? "" : "s"} and no critical issues.`;
+    return `Cycle was mostly healthy with ${warningFlags} warning${warningFlags === 1 ? "" : "s"} and no critical issues.${evidenceTail}`;
   }
-  return "Clean cycle with no critical issues detected.";
+  return `Clean cycle with no critical issues detected.${evidenceTail}`;
+}
+
+function clipManagerText(value, limit = 180) {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  if (text.length <= limit) return text;
+  return `${text.slice(0, Math.max(0, limit - 1)).trimEnd()}…`;
+}
+
+function compactEvidenceLabels(source = {}) {
+  const highlights = Array.isArray(source?.evidence_summary?.highlights) ? source.evidence_summary.highlights : [];
+  const labels = highlights
+    .map((item) => clipManagerText(item?.label, 48))
+    .filter(Boolean);
+  return [...new Set(labels)].slice(0, 3);
+}
+
+function compactReasonList(values = [], limit = 4) {
+  return [...new Set((Array.isArray(values) ? values : [])
+    .map((value) => clipManagerText(value, 72))
+    .filter(Boolean))].slice(0, limit);
+}
+
+function candidateAddressKey(candidate = {}) {
+  return cleanAddress(candidate?.token?.contract_address || candidate?.contract_address || "");
+}
+
+function buildManagerCandidateSnapshot(source = {}, extra = {}) {
+  const symbol = source?.token?.symbol || source?.symbol || extra.symbol || null;
+  const contractAddress = candidateAddressKey(source) || cleanAddress(extra.contract_address || "");
+  return {
+    symbol,
+    contract_address: contractAddress || null,
+    action: source?.action || extra.action || null,
+    status: extra.status || null,
+    decision_reason: clipManagerText(extra.decision_reason || source?.why_now || source?.summary || null, 180),
+    evidence_packet_id: source?.evidence_packet_id || extra.evidence_packet_id || null,
+    evidence_quality_score: source?.evidence_quality_score ?? extra.evidence_quality_score ?? source?.evidence_summary?.quality_score ?? null,
+    evidence_ref_count: source?.evidence_ref_count ?? extra.evidence_ref_count ?? (Array.isArray(source?.evidence) ? source.evidence.length : 0),
+    evidence_labels: compactEvidenceLabels(source),
+    blockers: compactReasonList(source?.evidence_blockers || extra.blockers || source?.evidence_summary?.blockers),
+    warnings: compactReasonList(source?.evidence_warnings || extra.warnings || source?.evidence_summary?.warnings)
+  };
 }
 
 function writeManagerReportFile(report) {
@@ -5188,6 +6340,8 @@ function buildManagerReport(cycleState, portfolio) {
   const harvestCoverage = normalizeCoveragePct(cycleState.harvest_coverage?.coverage_pct);
   const scoutMeta = cycleState.scout_llm_meta || getLastLLMMeta("scout") || {};
   const harvestMeta = cycleState.harvest_llm_meta || getLastLLMMeta("harvest") || {};
+  const scoutEvidenceDiagnostics = cycleState.scout_evidence_diagnostics || scout.evidence_diagnostics || null;
+  const harvestEvidenceDiagnostics = cycleState.harvest_evidence_diagnostics || harvest.evidence_diagnostics || null;
   const riskDecisions = Array.isArray(cycleState.risk_decisions) ? cycleState.risk_decisions : [];
   const executorDecisions = Array.isArray(cycleState.executor_decisions) ? cycleState.executor_decisions : [];
   const cycleTrainingEvents = Array.isArray(cycleState.cycle_training_events) ? cycleState.cycle_training_events : [];
@@ -5197,6 +6351,19 @@ function buildManagerReport(cycleState, portfolio) {
   const rotations = Array.isArray(cycleState.cycle_actions?.rotations) ? cycleState.cycle_actions.rotations : [];
   const portfolioSnapshot = cycleState.portfolio_snapshot || {};
   const pipelineLogEntries = Array.isArray(cycleState.pipeline_log_entries) ? cycleState.pipeline_log_entries : [];
+  const scoutShortlistEvent = [...pipelineLogEntries].reverse().find((entry) => entry?.stage === "scout_evidence_shortlist")?.data || {};
+  const scoutShortlistBlockedEntries = pipelineLogEntries
+    .filter((entry) => entry?.stage === "scout_shortlist_blocked")
+    .map((entry) => entry?.data || {})
+    .filter((entry) => entry && typeof entry === "object");
+  const scoutDowngradedEntries = pipelineLogEntries
+    .filter((entry) => entry?.stage === "scout_candidate_downgraded")
+    .map((entry) => entry?.data || {})
+    .filter((entry) => entry && typeof entry === "object");
+  const harvestDowngradedEntries = pipelineLogEntries
+    .filter((entry) => entry?.stage === "harvest_candidate_downgraded")
+    .map((entry) => entry?.data || {})
+    .filter((entry) => entry && typeof entry === "object");
 
   const scoutFlags = [];
   const scoutCandidates = Array.isArray(scout.candidates) ? scout.candidates : [];
@@ -5209,6 +6376,14 @@ function buildManagerReport(cycleState, portfolio) {
     ...(cycleState.scout_coverage?.evidence_cited_types || []).map((t) => String(t).toUpperCase()),
   ]);
   const scoutCandidatesWithFullEvidence = scoutCandidates.filter((candidate) => Array.isArray(candidate?.evidence) && candidate.evidence.length >= 3).length;
+  const scoutEvidenceQualifiedCandidates = toNum(scoutEvidenceDiagnostics?.evidence_qualified_candidates, scoutCandidatesWithFullEvidence);
+  const scoutEvidenceBlockedCandidates = toNum(scoutEvidenceDiagnostics?.evidence_blocked_candidates, 0);
+  const scoutShortlistReductionCount = toNum(scoutEvidenceDiagnostics?.shortlist_candidate_reduction, 0);
+  const scoutShortlistReductionPct = normalizeCoveragePct(scoutEvidenceDiagnostics?.shortlist_candidate_reduction_pct);
+  const scoutShortlistedCandidates = toNum(
+    scoutShortlistEvent?.shortlist_count,
+    Math.max(0, toNum(scoutEvidenceDiagnostics?.input_candidate_count, scoutCandidates.length) - scoutShortlistReductionCount)
+  );
 
   if (!Array.isArray(scout.candidates)) {
     pushManagerFlag(scoutFlags, "critical", "scout", "SCOUT_OUTPUT_INVALID", "Scout output is missing a candidates array.");
@@ -5251,6 +6426,51 @@ function buildManagerReport(cycleState, portfolio) {
   const positionsHeld = toNum(portfolioSnapshot.position_count, Object.keys(portfolio?.positions || {}).length);
   const positionsReviewed = harvestPositions.length || toNum(harvest?.portfolio_summary?.position_count, 0);
   const exitsWithEvidence = harvestCandidates.filter((candidate) => Array.isArray(candidate?.evidence) && candidate.evidence.length >= 2).length;
+  const harvestEvidenceDowngradeCount = toNum(harvestEvidenceDiagnostics?.evidence_downgrade_count, 0);
+  const scoutRiskDecisionByAddress = new Map(
+    riskDecisions.map((record) => {
+      const proposal = record?.payload?.proposal || {};
+      const review = record?.payload?.risk_review || record?.payload?.risk || {};
+      return [candidateAddressKey(proposal), { proposal, review }];
+    }).filter(([key]) => key)
+  );
+  const scoutQualifiedSnapshots = scoutCandidates.map((candidate) => {
+    const riskBundle = scoutRiskDecisionByAddress.get(candidateAddressKey(candidate)) || {};
+    const review = riskBundle.review || {};
+    return buildManagerCandidateSnapshot(candidate, {
+      status: String(review?.decision || "").toLowerCase() === "approve_for_executor" ? "qualified" : "reviewed",
+      decision_reason: review?.reason_summary || review?.summary || candidate?.why_now || candidate?.summary || null
+    });
+  });
+  const scoutBlockedSnapshots = scoutShortlistBlockedEntries.slice(0, 12).map((entry) => buildManagerCandidateSnapshot({}, {
+    symbol: entry?.symbol || null,
+    contract_address: entry?.contract_address || null,
+    status: "blocked",
+    decision_reason: compactReasonList(entry?.reasons, 3).join(", ") || compactReasonList(entry?.hard_blockers, 3).join(", ") || "blocked by evidence gate",
+    evidence_packet_id: entry?.evidence_packet_id || null,
+    blockers: [...compactReasonList(entry?.hard_blockers, 4), ...compactReasonList(entry?.reasons, 4)].slice(0, 4)
+  }));
+  const scoutDowngradedSnapshots = scoutDowngradedEntries.slice(0, 12).map((entry) => buildManagerCandidateSnapshot({}, {
+    symbol: entry?.symbol || null,
+    contract_address: entry?.contract_address || null,
+    status: "downgraded",
+    decision_reason: entry?.reason || "downgraded by evidence validation",
+    evidence_packet_id: entry?.evidence_packet_id || null,
+    warnings: compactReasonList([entry?.reason, entry?.valid_ref_count != null ? `valid refs ${entry.valid_ref_count}` : null])
+  }));
+  const harvestDowngradedSnapshots = harvestDowngradedEntries.slice(0, 12).map((entry) => buildManagerCandidateSnapshot({}, {
+    symbol: entry?.symbol || null,
+    contract_address: entry?.contract_address || null,
+    action: "monitor",
+    status: "downgraded",
+    decision_reason: entry?.reason || "downgraded to monitor",
+    evidence_packet_id: entry?.evidence_packet_id || null,
+    warnings: compactReasonList([entry?.reason, entry?.valid_ref_count != null ? `valid refs ${entry.valid_ref_count}` : null])
+  }));
+  const harvestExitSnapshots = harvestCandidates.map((candidate) => buildManagerCandidateSnapshot(candidate, {
+    status: String(candidate?.action || "").toLowerCase() === "exit" ? "exit" : "trim",
+    decision_reason: candidate?.summary || candidate?.why_now || null
+  }));
 
   if (!Array.isArray(harvest.position_reviews)) {
     pushManagerFlag(harvestFlags, "critical", "harvest", "HARVEST_OUTPUT_INVALID", "Harvest output is missing position reviews.");
@@ -5440,6 +6660,49 @@ function buildManagerReport(cycleState, portfolio) {
     overall_grade: gradeFromScore(overallScore),
     overall_score: overallScore,
     summary: "",
+    evidence_summary: {
+      scout: {
+        shortlist_candidate_count: scoutShortlistedCandidates,
+        evidence_qualified_candidates: scoutEvidenceQualifiedCandidates,
+        evidence_blocked_candidates: scoutEvidenceBlockedCandidates,
+        weak_candidate_downgrade_count: scoutDowngradedEntries.length,
+        shortlist_candidate_reduction: scoutShortlistReductionCount,
+        shortlist_candidate_reduction_pct: scoutShortlistReductionPct == null ? null : Number(scoutShortlistReductionPct.toFixed(2))
+      },
+      harvest: {
+        evidence_downgrade_count: harvestEvidenceDowngradeCount,
+        weak_exit_downgrade_count: harvestDowngradedEntries.length
+      }
+    },
+    evidence_diagnostics: {
+      scout: scoutEvidenceDiagnostics,
+      harvest: harvestEvidenceDiagnostics
+    },
+    dashboard_visibility: {
+      scout: {
+        latest_token_usage: scoutMeta.total_tokens ?? scoutEvidenceDiagnostics?.total_tokens ?? null,
+        shortlist_candidate_count: scoutShortlistedCandidates,
+        shortlisted_candidate_count: scoutShortlistedCandidates,
+        evidence_qualified_count: scoutEvidenceQualifiedCandidates,
+        evidence_blocked_count: scoutEvidenceBlockedCandidates,
+        downgraded_weak_candidates: scoutDowngradedEntries.length
+      },
+      harvest: {
+        latest_token_usage: harvestMeta.total_tokens ?? harvestEvidenceDiagnostics?.total_tokens ?? null,
+        downgraded_weak_exits: harvestDowngradedEntries.length
+      }
+    },
+    candidate_visibility: {
+      scout: {
+        qualified: scoutQualifiedSnapshots,
+        blocked: scoutBlockedSnapshots,
+        downgraded: scoutDowngradedSnapshots
+      },
+      harvest: {
+        exit_candidates: harvestExitSnapshots,
+        downgraded: harvestDowngradedSnapshots
+      }
+    },
     flags: [...scoutFlags, ...harvestFlags, ...riskFlags, ...executorFlags, ...sizerFlags, ...pipelineFlags],
     agents: {
       scout: {
@@ -5447,7 +6710,13 @@ function buildManagerReport(cycleState, portfolio) {
         score: scoutScore,
         coverage_pct: scoutCoveragePct,
         candidates_proposed: scoutCandidates.length,
+        shortlisted_candidates: scoutShortlistedCandidates,
         candidates_with_full_evidence: scoutCandidatesWithFullEvidence,
+        evidence_qualified_candidates: scoutEvidenceQualifiedCandidates,
+        evidence_blocked_candidates: scoutEvidenceBlockedCandidates,
+        weak_candidate_downgrade_count: scoutDowngradedEntries.length,
+        shortlist_candidate_reduction: scoutShortlistReductionCount,
+        shortlist_candidate_reduction_pct: scoutShortlistReductionPct == null ? null : Number(scoutShortlistReductionPct.toFixed(2)),
         llm_finish_reason: scoutMeta.finish_reason || null,
         llm_tokens: scoutMeta.total_tokens ?? null,
         llm_duration_ms: scoutMeta.duration_ms ?? null,
@@ -5461,6 +6730,8 @@ function buildManagerReport(cycleState, portfolio) {
         positions_held: positionsHeld,
         exit_candidates: harvestCandidates.length,
         exits_with_evidence: exitsWithEvidence,
+        evidence_downgrade_count: harvestEvidenceDowngradeCount,
+        weak_exit_downgrade_count: harvestDowngradedEntries.length,
         llm_finish_reason: harvestMeta.finish_reason || null,
         llm_tokens: harvestMeta.total_tokens ?? null,
         llm_duration_ms: harvestMeta.duration_ms ?? null,
@@ -5752,6 +7023,8 @@ async function runCycle(runContext = {}) {
           approved_exit_fraction: toNum(item.review?.approved_exit_fraction, 0) || fraction,
           follow_up_action: item.review?.follow_up_action ?? null
         };
+        applyEvidenceMetadata(trade.paper_trade_ticket, item.action);
+        applyEvidenceMetadata(trade, item.action);
         attachPaperOrderLifecycle(trade);
         harvestTrades.push(trade);
       }
@@ -5937,13 +7210,35 @@ async function runCycle(runContext = {}) {
 
     const cycleEndTs = nowIso();
     const cycleTrainingEvents = readJsonLines(TRAINING_EVENT_LOG, 1000).filter((record) => record.cycle_id === trainingContext.cycle_id);
+    const scoutCoverageLog = buildAgentCoverageLog("scout", scoutPayload);
+    const harvestCoverageLog = buildAgentCoverageLog("harvest", harvestPayload);
+    const scoutEvidenceDiagnostics = buildScoutEvidenceDiagnostics({
+      ...(scoutPayload.evidence_diagnostics || {}),
+      coverage: scoutCoverageLog,
+      stories_checked: scoutPayload.stories_checked,
+      candidates: scoutPayload.candidates
+    });
+    const harvestEvidenceDiagnostics = buildHarvestEvidenceDiagnostics({
+      ...(harvestPayload.evidence_diagnostics || {}),
+      coverage: harvestCoverageLog,
+      stories_checked: harvestPayload.stories_checked,
+      position_reviews: harvestPayload.position_reviews,
+      exit_candidates: harvestPayload.exit_candidates
+    });
+    const evidenceDiagnosticsEvent = buildEvidenceDiagnosticsEvent({
+      cycle_id: trainingContext.cycle_id,
+      pipeline_run_id: trainingContext.pipeline_run_id,
+      scout: scoutEvidenceDiagnostics,
+      harvest: harvestEvidenceDiagnostics
+    });
+    log("evidence_diagnostics", evidenceDiagnosticsEvent);
     const cyclePipelineLogEntries = [
       { stage: "quant_context", data: { macro_regime: _cycleQuantContext?.macro?.regime, new_positions_ok: _cycleQuantContext?.macro?.new_positions_ok, tighten_stops: _cycleQuantContext?.macro?.tighten_stops } },
       { stage: "scout", data: scoutPayload },
-      { stage: "agent_coverage", data: buildAgentCoverageLog("scout", scoutPayload) },
+      { stage: "agent_coverage", data: scoutCoverageLog },
       { stage: "sell_trades", data: sellTrades },
       { stage: "harvest", data: harvestPayload },
-      { stage: "agent_coverage", data: buildAgentCoverageLog("harvest", harvestPayload) },
+      { stage: "agent_coverage", data: harvestCoverageLog },
       { stage: "harvest_approved", data: harvestApproved },
       { stage: "harvest_rejected", data: harvestRejected },
       { stage: "executor_exit", data: harvestReviews },
@@ -5955,18 +7250,21 @@ async function runCycle(runContext = {}) {
       { stage: "rotations", data: rotationResults },
       { stage: "executor_buy", data: buyReviews },
       { stage: "buy_trades", data: buyTrades },
-      { stage: "stats", data: stats }
+      { stage: "stats", data: stats },
+      { stage: "evidence_diagnostics", data: evidenceDiagnosticsEvent }
     ];
     const managerReport = runManagerDirect({
       ...trainingContext,
       cycle_start_ts: cycleStartTs,
       cycle_end_ts: cycleEndTs,
       scout_result: scoutPayload,
-      scout_coverage: buildAgentCoverageLog("scout", scoutPayload),
+      scout_coverage: scoutCoverageLog,
       scout_llm_meta: getLastLLMMeta("scout"),
+      scout_evidence_diagnostics: scoutEvidenceDiagnostics,
       harvest_result: harvestPayload,
-      harvest_coverage: buildAgentCoverageLog("harvest", harvestPayload),
+      harvest_coverage: harvestCoverageLog,
       harvest_llm_meta: getLastLLMMeta("harvest"),
+      harvest_evidence_diagnostics: harvestEvidenceDiagnostics,
       risk_decisions: cycleTrainingEvents.filter((record) => record.event_type === "risk_decision"),
       executor_decisions: cycleTrainingEvents.filter((record) => record.event_type === "executor_decision"),
       cycle_actions: {

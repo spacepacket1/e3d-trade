@@ -71,6 +71,7 @@ const two = evaluateRiskDecision({
 assert.equal(one.risk_decision_id, two.risk_decision_id, "risk decision id should be stable");
 assert.equal(one.decision, "allow", "healthy buy should be allowed");
 assert.equal(buildRiskDecisionRef(one)?.risk_decision_id, one.risk_decision_id, "ref should preserve id");
+assert.equal(one.evidence_packet_id, null, "base fixture should not set evidence metadata");
 
 const lossBlocked = evaluateRiskDecision({
   ...baseInput,
@@ -134,5 +135,25 @@ const cooldownBlocked = evaluateRiskDecision({
 });
 assert.equal(cooldownBlocked.decision, "block", "stop-loss cooldown should block re-entry");
 assert(cooldownBlocked.blockers.includes("cooldown_after_stop_loss"), "stop-loss cooldown blocker missing");
+
+const evidenceBlocked = evaluateRiskDecision({
+  ...baseInput,
+  portfolio: portfolioFixture(),
+  intent: {
+    ...baseInput.intent,
+    evidence_packet_id: "ep_fixture_1",
+    evidence_quality_score: 41,
+    evidence_ref_count: 2,
+    evidence_blockers: ["thin_story_support"],
+    evidence_warnings: ["flow_only_candidate"]
+  }
+});
+assert.equal(evidenceBlocked.decision, "block", "evidence blockers should block new buys");
+assert.equal(evidenceBlocked.evidence_packet_id, "ep_fixture_1", "risk decision should preserve evidence packet id");
+assert.equal(evidenceBlocked.evidence_quality_score, 41, "risk decision should preserve evidence quality");
+assert.equal(evidenceBlocked.evidence_ref_count, 2, "risk decision should preserve evidence ref count");
+assert(evidenceBlocked.blockers.includes("evidence_packet_blockers"), "evidence packet blocker should be auditable");
+assert.deepEqual(evidenceBlocked.evidence_blockers, ["thin_story_support"], "risk decision should preserve evidence blockers");
+assert.deepEqual(evidenceBlocked.evidence_warnings, ["flow_only_candidate"], "risk decision should preserve evidence warnings");
 
 console.log("verifyRiskEngine: ok");

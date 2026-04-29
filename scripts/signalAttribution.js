@@ -86,6 +86,12 @@ function cleanAddress(value) {
   return text || null;
 }
 
+function cleanList(values = []) {
+  return [...new Set((Array.isArray(values) ? values : [])
+    .map((value) => String(value ?? "").trim())
+    .filter(Boolean))];
+}
+
 function reasonRoot(reason) {
   const text = normalizeKey(reason);
   return text.includes(":") ? text.split(":")[0] || "unknown" : text;
@@ -285,7 +291,39 @@ function latestEvent(events, predicate) {
   return [...events].reverse().find(predicate) || null;
 }
 
-function storyTypesFromReviewOrProposal(review, proposal) {
+function extractEvidenceMetadata(...sources) {
+  for (const source of sources) {
+    if (!source || typeof source !== "object") continue;
+    const summary = source?.evidence_summary && typeof source.evidence_summary === "object"
+      ? source.evidence_summary
+      : null;
+    const refs = cleanList(source?.evidence_refs || source?.evidence || summary?.refs_used);
+    const storyTypes = cleanList((Array.isArray(summary?.highlights) ? summary.highlights : [])
+      .flatMap((item) => [item?.label, item?.source_type]));
+    const evidencePacketId = source?.evidence_packet_id || summary?.evidence_packet_id || null;
+    if (!evidencePacketId && !refs.length && !storyTypes.length) continue;
+    return {
+      evidence_packet_id: evidencePacketId,
+      evidence_quality_score: source?.evidence_quality_score ?? summary?.quality_score ?? null,
+      evidence_ref_count: source?.evidence_ref_count ?? refs.length,
+      evidence_refs: refs,
+      story_types: storyTypes
+    };
+  }
+  return {
+    evidence_packet_id: null,
+    evidence_quality_score: null,
+    evidence_ref_count: 0,
+    evidence_refs: [],
+    story_types: []
+  };
+}
+
+function storyTypesFromReviewOrProposal(review, proposal, ...sources) {
+  const evidenceMetadata = extractEvidenceMetadata(review, proposal, ...sources);
+  if (evidenceMetadata.story_types.length) {
+    return evidenceMetadata.story_types;
+  }
   const reviewLabels = Array.isArray(review?.story_signal_labels) ? review.story_signal_labels : [];
   if (reviewLabels.length) return [...new Set(reviewLabels.map((label) => normalizeKey(label)).filter(Boolean))];
   const evidence = Array.isArray(proposal?.evidence) ? proposal.evidence : [];
@@ -354,6 +392,16 @@ function buildTradeAttributionRows(portfolio, eventIndex, reviewMap) {
       openTrade?.ts || closeTrade.ts
     );
     const matchedSignal = signalMatch?.signal || null;
+    const evidenceMetadata = extractEvidenceMetadata(
+      review,
+      closeTrade,
+      openTrade,
+      openTrade?.paper_trade_ticket,
+      openTrade?.order_lifecycle,
+      closeTrade?.order_lifecycle,
+      proposal,
+      riskEvent?.payload?.risk_review
+    );
     const riskReasonCodes = Array.isArray(riskEvent?.payload?.risk_review?.reason_codes)
       ? riskEvent.payload.risk_review.reason_codes
       : Array.isArray(review?.evidence?.risk_reason_codes)
@@ -391,7 +439,7 @@ function buildTradeAttributionRows(portfolio, eventIndex, reviewMap) {
     const costBasisUsd = round(toNum(closeTrade.cost_portion_usd, toNum(closeTrade.cost_usd, toNum(openTrade?.cost_usd, 0))), 2);
     const feeUsd = totalFeeUsd(openTrade, closeTrade);
     const slippageUsd = totalSlippageUsd(openTrade, closeTrade);
-    const storyTypes = storyTypesFromReviewOrProposal(review, proposal);
+    const storyTypes = storyTypesFromReviewOrProposal(review, proposal, openTrade, closeTrade, openTrade?.paper_trade_ticket, orderLifecycle);
     const entrySignalSet = signalReasonSet(matchedSignal);
     const exitSignals = exitSignalSet(closeTrade, review);
     const riskCodeSet = riskReasonCodes.length ? [...new Set(riskReasonCodes.map((code) => normalizeKey(code)))].sort() : ["none"];
@@ -412,6 +460,10 @@ function buildTradeAttributionRows(portfolio, eventIndex, reviewMap) {
       position_id: closeTrade.position_id || null,
       candidate_id: closeTrade.candidate_id || openTrade?.candidate_id || closeTrade.contract_address || null,
       order_id: orderLifecycle?.order_id || null,
+      evidence_packet_id: evidenceMetadata.evidence_packet_id,
+      evidence_quality_score: evidenceMetadata.evidence_quality_score,
+      evidence_ref_count: evidenceMetadata.evidence_ref_count,
+      evidence_refs: evidenceMetadata.evidence_refs,
       order_state: normalizeKey(orderLifecycle?.current_state, "unknown"),
       strategy_version: strategyVersion,
       setup_type: setupType,
@@ -463,6 +515,14 @@ function buildDecisionRows(eventIndex, actionIndex) {
     const actionMatches = candidateId ? (actionIndex.byCandidate.get(candidateId) || []) : [];
     const candidateTsMs = optionalMs(candidateEvent.ts);
     const traded = actionMatches.find((trade) => trade.ts_ms != null && candidateTsMs != null && trade.ts_ms >= candidateTsMs);
+    const evidenceMetadata = extractEvidenceMetadata(
+      riskEvent?.payload?.risk_review,
+      riskEvent?.payload?.proposal,
+      candidate,
+      traded,
+      traded?.paper_trade_ticket,
+      traded?.order_lifecycle
+    );
     const riskDecision = normalizeKey(riskEvent?.payload?.risk_review?.decision || riskEvent?.payload?.decision, "not_reviewed");
     const executorDecision = normalizeKey(executorEvent?.payload?.decision, "not_executed");
     const allowedByRisk = riskDecision === "paper_trade" || riskDecision === "approve" || Boolean(riskEvent?.payload?.handoff_to_executor);
@@ -492,6 +552,10 @@ function buildDecisionRows(eventIndex, actionIndex) {
       candidate_id: candidateId,
       trade_id: traded?.trade_id || null,
       position_id: traded?.position_id || null,
+      evidence_packet_id: evidenceMetadata.evidence_packet_id,
+      evidence_quality_score: evidenceMetadata.evidence_quality_score,
+      evidence_ref_count: evidenceMetadata.evidence_ref_count,
+      evidence_refs: evidenceMetadata.evidence_refs,
       strategy_version: normalizeKey(traded?.strategy_version || riskEvent?.payload?.proposal?.strategy_version, "unknown"),
       setup_type: normalizeKey(riskEvent?.payload?.proposal?.setup_type || candidate.setup_type || "unknown"),
       source_agent: normalizeKey(riskEvent?.payload?.proposal?.source_agent || candidateEvent?.actor || "unknown"),

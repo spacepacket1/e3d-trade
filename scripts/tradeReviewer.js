@@ -52,6 +52,12 @@ function cleanAddress(value) {
   return String(value || "").trim().toLowerCase();
 }
 
+function cleanList(values = []) {
+  return [...new Set((Array.isArray(values) ? values : [])
+    .map((value) => String(value ?? "").trim())
+    .filter(Boolean))];
+}
+
 function hoursBetween(start, end) {
   const startMs = new Date(start || 0).getTime();
   const endMs = new Date(end || 0).getTime();
@@ -119,7 +125,48 @@ function latest(events, predicate) {
   return [...events].reverse().find(predicate) || null;
 }
 
-function storyLabels(proposal) {
+function extractEvidenceMetadata(...sources) {
+  for (const source of sources) {
+    if (!source || typeof source !== "object") continue;
+    const summary = source?.evidence_summary && typeof source.evidence_summary === "object"
+      ? source.evidence_summary
+      : null;
+    const refs = cleanList(
+      source?.evidence_refs
+      || source?.evidence
+      || summary?.refs_used
+    );
+    const labels = cleanList((Array.isArray(summary?.highlights) ? summary.highlights : [])
+      .flatMap((item) => [item?.label, item?.source_type]));
+    const evidencePacketId = source?.evidence_packet_id || summary?.evidence_packet_id || null;
+    if (!evidencePacketId && !refs.length && !labels.length) continue;
+    return {
+      evidence_packet_id: evidencePacketId,
+      evidence_quality_score: source?.evidence_quality_score ?? summary?.quality_score ?? null,
+      evidence_ref_count: source?.evidence_ref_count ?? refs.length,
+      evidence_refs: refs,
+      story_labels: labels
+    };
+  }
+  return {
+    evidence_packet_id: null,
+    evidence_quality_score: null,
+    evidence_ref_count: 0,
+    evidence_refs: [],
+    story_labels: []
+  };
+}
+
+function storyLabels(proposal, trade = null) {
+  const evidenceMetadata = extractEvidenceMetadata(
+    trade,
+    trade?.paper_trade_ticket,
+    trade?.order_lifecycle,
+    proposal
+  );
+  if (evidenceMetadata.story_labels.length) {
+    return evidenceMetadata.story_labels;
+  }
   const labels = [];
   if (proposal?.setup_type) labels.push(proposal.setup_type);
   const evidence = Array.isArray(proposal?.evidence) ? proposal.evidence : [];
@@ -138,6 +185,13 @@ function reviewTrade(trade, events, reviewedAt) {
   const executorEvent = latest(events, (event) => event.event_type === "executor_decision");
   const harvestEvent = latest(events, (event) => event.event_type === "harvest_decision");
   const proposal = riskEvent?.payload?.proposal || executorEvent?.payload?.proposal || harvestEvent?.payload?.proposal || null;
+  const evidenceMetadata = extractEvidenceMetadata(
+    trade,
+    trade?.paper_trade_ticket,
+    trade?.order_lifecycle,
+    proposal,
+    riskEvent?.payload?.risk_review
+  );
   const riskCodes = riskEvent?.payload?.risk_review?.reason_codes || [];
   const executorDecision = executorEvent?.payload?.decision || executorEvent?.payload?.review?.executor_decision || trade.paper_trade_ticket?.executor_decision || null;
   const holdHours = hoursBetween(trade.opened_at, trade.ts);
@@ -202,7 +256,7 @@ function reviewTrade(trade, events, reviewedAt) {
     avoidable_loss: avoidableLoss,
     avoidable_loss_reason: avoidableLoss ? `${exitReason}:${sizingQuality}` : "",
     setup_label: normalize(proposal?.setup_type || reasonRoot(trade.reason)),
-    story_signal_labels: storyLabels(proposal),
+    story_signal_labels: storyLabels(proposal, trade),
     market_regime_label: normalize(trade.market_regime || riskEvent?.market_regime || executorEvent?.market_regime, "unknown"),
     lessons,
     training_label: trainingLabel,
@@ -215,7 +269,11 @@ function reviewTrade(trade, events, reviewedAt) {
       hold_time_hours: holdHours == null ? null : Number(holdHours.toFixed(2)),
       risk_reason_codes: Array.isArray(riskCodes) ? riskCodes : [],
       executor_decision: executorDecision,
-      liquidity_usd: liquidity || null
+      liquidity_usd: liquidity || null,
+      evidence_packet_id: evidenceMetadata.evidence_packet_id,
+      evidence_quality_score: evidenceMetadata.evidence_quality_score,
+      evidence_ref_count: evidenceMetadata.evidence_ref_count,
+      evidence_refs: evidenceMetadata.evidence_refs
     }
   };
 }

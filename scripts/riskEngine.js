@@ -16,6 +16,9 @@ export const DEFAULT_RISK_POLICY = Object.freeze({
   max_open_positions: 8,
   max_daily_turnover_usd: 250000,
   cooldown_after_stop_loss_hours: 12,
+  token_repeated_loss_stop_count: 2,
+  token_repeated_loss_window_days: 30,
+  token_repeated_loss_cooldown_days: 30,
   strategy_loss_cluster_window_hours: 24,
   strategy_loss_cluster_count: 2,
   strategy_loss_cluster_loss_limit_usd: 1500,
@@ -63,6 +66,12 @@ function cleanAddress(value) {
 
 function cleanSide(value) {
   return String(value || "").trim().toLowerCase() === "sell" ? "sell" : "buy";
+}
+
+function cleanList(values = []) {
+  return [...new Set((Array.isArray(values) ? values : [])
+    .map((value) => cleanText(value))
+    .filter(Boolean))];
 }
 
 function localDayKey(ts, timezone = null) {
@@ -260,6 +269,38 @@ function summarizeStopLossCooldown(portfolio = {}, intent = {}, evaluationTs, po
   };
 }
 
+function summarizeTokenRepeatedLossBlock(portfolio = {}, intent = {}, evaluationTs, policy = DEFAULT_RISK_POLICY) {
+  const evaluationMs = optionalMs(evaluationTs);
+  const symbol = cleanText(intent?.symbol);
+  const contractAddress = cleanAddress(intent?.contract_address);
+  if (evaluationMs == null || (!symbol && !contractAddress)) {
+    return { blocked: false, stop_loss_count: 0, cooldown_until: null };
+  }
+  const windowMs = policy.token_repeated_loss_window_days * 24 * 60 * 60 * 1000;
+  const cutoff = evaluationMs - windowMs;
+  const tokenStopLosses = (Array.isArray(portfolio?.closed_trades) ? portfolio.closed_trades : [])
+    .map((trade) => ({ trade, ts_ms: optionalMs(trade?.ts) }))
+    .filter(({ ts_ms }) => ts_ms != null && ts_ms >= cutoff && ts_ms <= evaluationMs)
+    .filter(({ trade }) => classifyExitReason(trade?.reason) === "stop_loss")
+    .filter(({ trade }) => {
+      const tradeSymbol = cleanText(trade?.symbol);
+      const tradeAddress = cleanAddress(trade?.contract_address);
+      return (symbol && tradeSymbol === symbol) || (contractAddress && tradeAddress === contractAddress);
+    })
+    .sort((a, b) => b.ts_ms - a.ts_ms);
+  if (tokenStopLosses.length < policy.token_repeated_loss_stop_count) {
+    return { blocked: false, stop_loss_count: tokenStopLosses.length, cooldown_until: null };
+  }
+  const latestMs = tokenStopLosses[0].ts_ms;
+  const cooldownMs = policy.token_repeated_loss_cooldown_days * 24 * 60 * 60 * 1000;
+  const cooldownUntilMs = latestMs + cooldownMs;
+  return {
+    blocked: cooldownUntilMs > evaluationMs,
+    stop_loss_count: tokenStopLosses.length,
+    cooldown_until: new Date(cooldownUntilMs).toISOString()
+  };
+}
+
 function buildCheckedLimit(key, label, limit, actual, status, extras = {}) {
   return {
     key,
@@ -323,6 +364,13 @@ export function evaluateRiskDecision(input = {}) {
   const liquidityUsd = round(Math.max(0, toNum(intent?.liquidity_usd, 0)), 2);
   const spreadBps = round(Math.max(0, toNum(intent?.spread_bps, 0)), 4);
   const slippageBps = round(Math.max(0, toNum(intent?.slippage_bps, 0)), 4);
+  const evidencePacketId = cleanText(intent?.evidence_packet_id);
+  const evidenceQualityScore = intent?.evidence_quality_score == null
+    ? null
+    : round(Math.max(0, toNum(intent?.evidence_quality_score, 0)), 4);
+  const evidenceRefCount = Math.max(0, Math.round(toNum(intent?.evidence_ref_count, 0)));
+  const evidenceBlockers = cleanList(intent?.evidence_blockers);
+  const evidenceWarnings = cleanList(intent?.evidence_warnings);
   const equityUsd = computeEquityUsd(portfolio);
   const currentPositionKey = symbol || contractAddress;
   const currentPosition = Object.values(portfolio?.positions || {}).find((position) => {
@@ -348,6 +396,7 @@ export function evaluateRiskDecision(input = {}) {
   const dailyEquityDrawdownPct = dayStartEquityUsd > 0 ? round(Math.max(0, (dayStartEquityUsd - equityUsd) / dayStartEquityUsd), 6) : 0;
   const marketRegime = cleanText(intent?.market_regime || analytics?.market_regime || portfolio?.stats?.market_regime || "unknown");
   const stopLossCooldown = summarizeStopLossCooldown(portfolio, intent, evaluationTs, policy);
+  const tokenRepeatedLossBlock = summarizeTokenRepeatedLossBlock(portfolio, intent, evaluationTs, policy);
   const strategyLossCluster = summarizeStrategyLossCluster(portfolio, intent, evaluationTs, policy);
   const expectancyRegime = summarizeExpectancyRegime(intent, analytics, policy);
   const blockers = [];
@@ -414,6 +463,19 @@ export function evaluateRiskDecision(input = {}) {
     ));
   }
 
+  addLimit(checked_limits, blockers, warnings, buildCheckedLimit(
+    "evidence_packet_blockers",
+    "Evidence packet blockers",
+    { evidence_blockers_present: false },
+    {
+      evidence_packet_id: evidencePacketId,
+      evidence_quality_score: evidenceQualityScore,
+      evidence_ref_count: evidenceRefCount,
+      evidence_blockers: evidenceBlockers,
+      evidence_warnings: evidenceWarnings
+    },
+    isBuy && evidenceBlockers.length > 0 ? "block" : "pass"
+  ));
   addLimit(checked_limits, blockers, warnings, buildCheckedLimit(
     "daily_realized_loss_limit",
     "Daily realized loss limit",
@@ -485,6 +547,17 @@ export function evaluateRiskDecision(input = {}) {
     isBuy && stopLossCooldown.blocked ? "block" : "pass"
   ));
   addLimit(checked_limits, blockers, warnings, buildCheckedLimit(
+    "token_repeated_loss_block",
+    "Block re-entry on tokens with repeated stop losses",
+    {
+      stop_loss_count_threshold: policy.token_repeated_loss_stop_count,
+      window_days: policy.token_repeated_loss_window_days,
+      cooldown_days: policy.token_repeated_loss_cooldown_days
+    },
+    tokenRepeatedLossBlock,
+    isBuy && tokenRepeatedLossBlock.blocked ? "block" : "pass"
+  ));
+  addLimit(checked_limits, blockers, warnings, buildCheckedLimit(
     "cooldown_after_strategy_loss_cluster",
     "Cooldown after strategy-level loss cluster",
     {
@@ -540,6 +613,11 @@ export function evaluateRiskDecision(input = {}) {
     contract_address: contractAddress,
     category,
     strategy_version: strategyVersion,
+    evidence_packet_id: evidencePacketId,
+    evidence_quality_score: evidenceQualityScore,
+    evidence_ref_count: evidenceRefCount,
+    evidence_blockers: evidenceBlockers,
+    evidence_warnings: evidenceWarnings,
     requested_notional_usd: requestedNotionalUsd,
     liquidity_usd: liquidityUsd,
     spread_bps: spreadBps,
@@ -600,6 +678,11 @@ export function evaluateRiskDecision(input = {}) {
     symbol,
     contract_address: contractAddress,
     category,
+    evidence_packet_id: evidencePacketId,
+    evidence_quality_score: evidenceQualityScore,
+    evidence_ref_count: evidenceRefCount,
+    evidence_blockers: evidenceBlockers,
+    evidence_warnings: evidenceWarnings,
     requested_notional_usd: requestedNotionalUsd,
     requested_quantity: round(toNum(intent?.requested_quantity, 0), 8),
     live_submission_enabled: false,

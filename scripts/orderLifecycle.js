@@ -52,6 +52,16 @@ function cleanSide(value) {
   return side === "sell" ? "sell" : "buy";
 }
 
+function cleanText(value) {
+  return String(value || "").trim() || null;
+}
+
+function cleanList(values = []) {
+  return [...new Set((Array.isArray(values) ? values : [])
+    .map((value) => cleanText(value))
+    .filter(Boolean))];
+}
+
 function extractRiskDecisionId(ref = null) {
   if (!ref || typeof ref !== "object") return null;
   return ref.risk_decision_id || null;
@@ -79,6 +89,52 @@ function inferRequestedQuantity(trade = {}, execution = null, requestedNotionalU
     toNum(execution?.requested_quantity,
       toNum(trade?.quantity, price > 0 && requestedNotionalUsd > 0 ? requestedNotionalUsd / price : 0))
   );
+}
+
+function extractEvidencePacketId(input = {}) {
+  return cleanText(
+    input.evidence_packet_id
+    || input.trade?.evidence_packet_id
+    || input.trade?.paper_trade_ticket?.evidence_packet_id
+    || input.trade?.evidence_summary?.evidence_packet_id
+    || input.trade?.paper_trade_ticket?.evidence_summary?.evidence_packet_id
+  );
+}
+
+function extractEvidenceRefs(input = {}) {
+  return cleanList(
+    input.evidence_refs
+    || input.trade?.evidence_refs
+    || input.trade?.paper_trade_ticket?.evidence_refs
+    || input.trade?.evidence_summary?.refs_used
+    || input.trade?.paper_trade_ticket?.evidence_summary?.refs_used
+  );
+}
+
+function extractEvidenceSummary(input = {}) {
+  const summary = input.evidence_summary
+    || input.trade?.evidence_summary
+    || input.trade?.paper_trade_ticket?.evidence_summary
+    || null;
+  if (!summary || typeof summary !== "object") return null;
+  return {
+    evidence_packet_id: cleanText(summary.evidence_packet_id || extractEvidencePacketId(input)),
+    quality_score: summary.quality_score == null ? null : round(toNum(summary.quality_score, 0), 4),
+    evidence_count: Math.max(0, Math.round(toNum(summary.evidence_count, 0))),
+    refs_used: cleanList(summary.refs_used),
+    blockers: cleanList(summary.blockers),
+    warnings: cleanList(summary.warnings),
+    highlights: (Array.isArray(summary.highlights) ? summary.highlights : [])
+      .slice(0, 3)
+      .map((item) => ({
+        evidence_id: cleanText(item?.evidence_id),
+        source_type: cleanText(item?.source_type),
+        label: cleanText(item?.label),
+        direction: cleanText(item?.direction),
+        strength: item?.strength == null ? null : Math.max(0, Math.min(100, Math.round(toNum(item.strength, 0))))
+      }))
+      .filter((item) => item.evidence_id)
+  };
 }
 
 export function assertOrderMode(mode) {
@@ -184,6 +240,9 @@ export function createOrderLifecycleRecord(input = {}) {
   const executionControlRef = input.execution_control_ref || buildLiquidityExecutionControlRef(execution?.liquidity_execution_control || null, {
     order_id: orderId
   });
+  const evidencePacketId = extractEvidencePacketId(input);
+  const evidenceRefs = extractEvidenceRefs(input);
+  const evidenceSummary = extractEvidenceSummary(input);
   const stateHistory = createLifecycleHistory(
     input.transitions || transitionsForExecution(execution, Boolean(input.risk_rejected)),
     { ts: plannedAt, actor: "order_lifecycle" }
@@ -216,6 +275,9 @@ export function createOrderLifecycleRecord(input = {}) {
     execution_control_ref: executionControlRef,
     execution_control_id: extractExecutionControlId(execution, executionControlRef),
     quote_id: executionControlRef?.quote_id || execution?.quote_id || execution?.liquidity_execution_control?.quote_id || null,
+    evidence_packet_id: evidencePacketId,
+    evidence_summary: evidenceSummary,
+    evidence_refs: evidenceRefs,
     simulated_execution: execution || null,
     venue_response_payloads: [],
     portfolio_mutation_ref: input.portfolio_mutation_ref || null,

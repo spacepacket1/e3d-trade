@@ -261,6 +261,18 @@ button { font: inherit; }
 .report-detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .report-detail-grid .report-kv { color: var(--muted); font-size: 0.78rem; line-height: 1.45; margin-top: 6px; }
 .report-detail-grid .report-kv:first-of-type { margin-top: 0; }
+.report-compact-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.report-compact-stat { padding: 11px 12px; border-radius: 14px; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.04); }
+.report-compact-stat span { display: block; color: var(--muted); font-size: 0.64rem; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 5px; }
+.report-compact-stat strong { display: block; font-size: 0.86rem; }
+.report-subsection-label { margin: 10px 0 8px; color: var(--muted); font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.08em; }
+.report-candidate-list { display: flex; flex-direction: column; gap: 8px; }
+.report-candidate-card { padding: 11px 12px; border-radius: 14px; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.04); }
+.report-candidate-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.report-candidate-identity { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.report-candidate-meta { color: var(--muted); font-size: 0.68rem; overflow-wrap: anywhere; }
+.report-candidate-metrics { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 8px; color: var(--muted); font-size: 0.74rem; }
+.report-candidate-copy { margin-top: 8px; color: var(--muted); font-size: 0.78rem; line-height: 1.45; }
 .page-column { min-width: 0; }
 .page-column-portfolio { display: flex; }
 .page-column-portfolio > .panel { width: 100%; }
@@ -513,6 +525,7 @@ button { font: inherit; }
   .pipeline-controls-strip-head { min-width: 0; }
   .pipeline-controls-strip-body { align-items: stretch; }
   .audit-strip-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .report-compact-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .portfolio-row { grid-template-columns: minmax(0, 1.25fr) repeat(5, minmax(0, 0.58fr)); }
   .orbit-stage { min-height: 760px; }
   .orbit-node { width: min(260px, 36vw); }
@@ -552,6 +565,8 @@ button { font: inherit; }
   .pipeline-control-row-inline { flex-direction: column; align-items: stretch; }
   .pipeline-control-row-inline .pipeline-control-input { width: 100%; }
   .audit-strip-grid { grid-template-columns: 1fr; }
+  .report-detail-grid,
+  .report-compact-grid { grid-template-columns: 1fr; }
   .orbit-stage { min-height: 980px; }
   .orbit-node,
   .orbit-wallet { width: min(100%, 360px); left: 50%; right: auto; top: auto; bottom: auto; transform: translateX(-50%); }
