@@ -4183,7 +4183,8 @@ function runRiskForCandidates(candidates, portfolio) {
   const rejected = [];
 
   const paperMode = Boolean(portfolio?.settings?.paper_mode);
-  for (const proposal of candidates) {
+  for (const candidate of candidates) {
+    const proposal = deepClone(candidate);
     const marketDataQuality = buildMarketDataQuality(proposal, {
       evaluated_at: proposal?.created_at || proposal?.signal_snapshot?.generated_at || nowIso()
     });
@@ -5189,13 +5190,13 @@ function buildManagerReport(cycleState, portfolio) {
   const harvestMeta = cycleState.harvest_llm_meta || getLastLLMMeta("harvest") || {};
   const riskDecisions = Array.isArray(cycleState.risk_decisions) ? cycleState.risk_decisions : [];
   const executorDecisions = Array.isArray(cycleState.executor_decisions) ? cycleState.executor_decisions : [];
+  const cycleTrainingEvents = Array.isArray(cycleState.cycle_training_events) ? cycleState.cycle_training_events : [];
   const sizingDecisions = cycleTrainingEvents.filter((record) => record.event_type === "position_sizing_decision");
   const buys = Array.isArray(cycleState.cycle_actions?.buys) ? cycleState.cycle_actions.buys : [];
   const sells = Array.isArray(cycleState.cycle_actions?.sells) ? cycleState.cycle_actions.sells : [];
   const rotations = Array.isArray(cycleState.cycle_actions?.rotations) ? cycleState.cycle_actions.rotations : [];
   const portfolioSnapshot = cycleState.portfolio_snapshot || {};
   const pipelineLogEntries = Array.isArray(cycleState.pipeline_log_entries) ? cycleState.pipeline_log_entries : [];
-  const cycleTrainingEvents = Array.isArray(cycleState.cycle_training_events) ? cycleState.cycle_training_events : [];
 
   const scoutFlags = [];
   const scoutCandidates = Array.isArray(scout.candidates) ? scout.candidates : [];
