@@ -2711,7 +2711,7 @@ function fetchScoutData() {
   // Strip stablecoins, gold tokens, and base/wrapped assets — these are not momentum-trading
   // candidates and dominate the volume ranking, causing the LLM to propose them when
   // there are no stories to guide it toward real opportunities.
-  const nonTradeablePattern = /^(USDC?|USDT|DAI|USDS|BUSD|TUSD|FRAX|LUSD|SUSD|GUSD|PYUSD|FDUSD|USDE|SUSDE|USDY|USDP|HUSD|MUSD|CRVUSD|GHO|PYUSD|XAUt|PAXG|CACHE|XAUT|WETH|WBTC|cbBTC|rETH|stETH|wstETH|cbETH|ankrETH|BETH|sETH2|ETH2x|STETH)$/i;
+  const nonTradeablePattern = /^(USDC?|USDT|DAI|USDS|BUSD|TUSD|FRAX|LUSD|SUSD|GUSD|PYUSD|FDUSD|USDE|SUSDE|USDY|USDP|HUSD|MUSD|CRVUSD|GHO|PYUSD|XAUt|PAXG|CACHE|XAUT|WETH|WBTC|cbBTC|rETH|stETH|wstETH|cbETH|ankrETH|BETH|sETH2|ETH2x|STETH|ETH|TBTC|E3D)$/i;
   const tokenUniverse = tokenUniverseAll.filter(t => !nonTradeablePattern.test(t.symbol || ""));
 
   // Enrich universe with story-mentioned tokens not in the top-volume list.
@@ -2817,8 +2817,16 @@ function fetchScoutData() {
   // Fetch pre-computed multi-signal convergence candidates from the E3D agent system.
   // These are tokens where multiple story types have converged — much stronger signal
   // than any single story type alone. Joined with thesis data when one exists.
-  const e3dCandidates = endpointArray(fetchJson("/candidates", { status: "new,promoted", limit: 100 }));
-  log("scout_e3d_candidates", { count: e3dCandidates.length });
+  const e3dCandidatesRaw = endpointArray(fetchJson("/candidates", { status: "new,promoted", limit: 100 }));
+  const e3dCandidates = e3dCandidatesRaw.filter(c => {
+    const addr = cleanAddress(c?.entity_address || c?.token_address || c?.address || c?.contract_address || "");
+    if (!addr || /^0+$/.test(addr) || addr === "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee") return false;
+    const sym = String(c?.entity_symbol || c?.symbol || "");
+    if (nonTradeablePattern.test(sym)) return false;
+    if (/[\s#]/.test(sym)) return false; // NFT-style names (e.g. "BURN GHOST BOUNTY BOX #273")
+    return true;
+  });
+  log("scout_e3d_candidates", { count: e3dCandidates.length, filtered_out: e3dCandidatesRaw.length - e3dCandidates.length });
 
   // Fetch structured investment theses — direction, conviction, price targets, invalidation.
   // Higher signal quality than THESIS-type stories since these are the agent's finalised views.
