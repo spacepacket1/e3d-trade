@@ -1230,11 +1230,11 @@ function buildRegimeSentinelPolicy(portfolio, quantContext) {
   let maxRotations = toNum(base.max_rotations_per_cycle, settings.max_rotations_per_cycle);
 
   if (toNum(perf24.profit_factor, 1) < 0.7 && toNum(perf24.realized_pnl_usd, 0) < 0) {
-    allowBuys = false;
-    maxBuys = 0;
-    allocationMultiplier = 0;
+    allowBuys = Boolean(base.allow_buys);
+    maxBuys = allowBuys ? Math.min(Math.max(1, maxBuys), 1) : 0;
+    allocationMultiplier = allowBuys ? Math.min(allocationMultiplier, 0.2) : 0;
     reasonCodes.push("negative_recent_profit_factor");
-    reasonCodes.push("new_buys_blocked_by_recent_losses");
+    reasonCodes.push("new_buys_throttled_by_recent_losses");
   }
   if (toNum(perf24.stop_loss_count, 0) >= 2) {
     allowBuys = false;
@@ -4467,9 +4467,13 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
   ].filter(Boolean) : [];
   const policyLines = _cycleRegimePolicy ? [
     `\n--- REGIME SENTINEL POLICY ---`,
-    `regime=${_cycleRegimePolicy.regime} allow_new_buys=${_cycleRegimePolicy.allow_new_buys} allow_rotations=${_cycleRegimePolicy.allow_rotations} allocation_multiplier=${_cycleRegimePolicy.allocation_multiplier}`,
+    `regime=${_cycleRegimePolicy.regime} allow_new_buys=${_cycleRegimePolicy.allow_new_buys} max_buys_per_cycle=${_cycleRegimePolicy.max_buys_per_cycle} allow_rotations=${_cycleRegimePolicy.allow_rotations} allocation_multiplier=${_cycleRegimePolicy.allocation_multiplier}`,
     `reason_codes=${(_cycleRegimePolicy.reason_codes || []).join(", ")}`,
-    !_cycleRegimePolicy.allow_new_buys ? "Policy blocks speculative new buys unless a deterministic later gate explicitly allows them." : ""
+    !_cycleRegimePolicy.allow_new_buys
+      ? "Policy blocks speculative new buys unless a deterministic later gate explicitly allows them."
+      : _cycleRegimePolicy.reason_codes?.includes("new_buys_throttled_by_recent_losses")
+        ? "Policy is in loss-throttle mode: propose at most one high-conviction, fully evidenced probe-sized buy."
+        : ""
   ].filter(Boolean) : [];
 
   // Build funding rate warning for Scout (overcrowded longs to avoid)
