@@ -34,6 +34,7 @@ const PIPELINE_LOG = path.join(LOG_DIR, "pipeline.jsonl");
 const AGENT_RAW_LOG = path.join(LOG_DIR, "agent-raw.jsonl");
 const TRAINING_EVENT_LOG = path.join(LOG_DIR, "training-events.jsonl");
 const TRADE_REVIEWS_LOG = path.join(LOG_DIR, "trade-reviews.jsonl");
+const RUN_LEDGER_LOG = path.join(LOG_DIR, "run-ledger.jsonl");
 const RETRAINING_READINESS_FILE = path.join(REPORTS_DIR, "retraining-readiness.json");
 const TRAINING_EVENT_SCHEMA_VERSION = "1.0";
 const MONGO_CONTAINER_NAME = process.env.E3D_MONGO_CONTAINER || "e3d-mongo";
@@ -699,6 +700,133 @@ function recordCycleEvent(stage, context, portfolio, details = {}) {
   const record = buildTrainingEventRecord(stage, "pipeline", portfolio, context, details);
   appendTrainingEvent(record);
   return record;
+}
+
+function writeRunLedgerEntry(entry) {
+  try {
+    fs.appendFileSync(RUN_LEDGER_LOG, JSON.stringify(entry) + "\n");
+  } catch (err) {
+    log("run_ledger_error", { message: String(err?.message || err) });
+  }
+}
+
+function buildRunLedgerRecord({ trainingContext, cycleStartTs, cycleEndTs, scoutPayload, harvestPayload, approved, rejected, buyTrades, sellTrades, harvestTrades, stats, portfolio, quantContext }) {
+  const cogState = _lastCognitiveState;
+  const scoutMeta = getLastLLMMeta("scout") || {};
+  const harvestMeta = getLastLLMMeta("harvest") || {};
+
+  const scoutCandidates = (scoutPayload?.candidates || []).map(c => ({
+    symbol: c?.token?.symbol || "",
+    address: cleanAddress(c?.token?.contract_address || ""),
+    source: c?.source || "unknown",
+    signal_types: Array.isArray(c?.signal_types) ? c.signal_types : [],
+    story_ids: Array.isArray(c?.story_ids) ? c.story_ids : [],
+    conviction: c?.conviction_score || 0,
+    confidence: c?.confidence || 0,
+    scorecard: c?.scorecard || null,
+    why_now: c?.why_now || "",
+    entry_zone: c?.entry_zone || null,
+    market_at_signal: {
+      price_usd: c?.market_data?.current_price ?? null,
+      liquidity_usd: c?.liquidity_data?.liquidity_usd ?? null,
+      volume_24h_usd: c?.market_data?.volume_24h_usd ?? null,
+      market_cap_usd: c?.market_data?.market_cap_usd ?? null,
+      change_30m_pct: c?.market_data?.change_30m_pct ?? null,
+      change_24h_pct: c?.market_data?.change_24h_pct ?? null
+    }
+  }));
+
+  // Count harvest actions
+  const harvestActionCounts = { hold: 0, monitor: 0, trim: 0, exit: 0 };
+  for (const r of harvestPayload?.position_reviews || []) {
+    const act = String(r?.action || "hold").toLowerCase();
+    if (act in harvestActionCounts) harvestActionCounts[act]++;
+    else harvestActionCounts.hold++;
+  }
+
+  const allTrades = [...(buyTrades || []), ...(sellTrades || []), ...(harvestTrades || [])];
+  const tradeRecords = allTrades.map(t => ({
+    symbol: t?.symbol || t?.token?.symbol || "",
+    address: cleanAddress(t?.contract_address || t?.token?.contract_address || ""),
+    side: t?.side || (t?.action === "sell" ? "sell" : "buy"),
+    price_usd: t?.price || t?.avg_entry_price || null,
+    cost_usd: t?.cost_usd || null,
+    ts: t?.opened_at || t?.closed_at || cycleEndTs
+  }));
+
+  const macro = quantContext?.macro || {};
+
+  return {
+    ledger_version: "1.0",
+    cycle_id: trainingContext.cycle_id,
+    cycle_ts: cycleStartTs,
+    pipeline_run_id: trainingContext.pipeline_run_id,
+
+    perception: {
+      mode: "cognitive_state",
+      api_calls: cogState?.meta?.api_calls ?? 3,
+      e3d_candidates_found: cogState?.meta?.e3d_candidates ?? 0,
+      story_signals_found: cogState?.meta?.story_signals ?? 0,
+      disqualified_count: cogState?.meta?.disqualified ?? 0,
+      cognitive_state_candidates: cogState?.meta?.output_candidates ?? 0,
+      duration_ms: cogState?.meta?.duration_ms ?? null
+    },
+
+    scout: {
+      tool_rounds: scoutMeta.tool_rounds ?? 0,
+      tool_calls: _cycleScoutToolCalls,
+      prompt_tokens: scoutMeta.prompt_tokens ?? null,
+      completion_tokens: scoutMeta.completion_tokens ?? null,
+      duration_ms: scoutMeta.duration_ms ?? null,
+      candidates_raw: (scoutPayload?.candidates?.length || 0),
+      candidates_after_quality_gate: scoutCandidates.length,
+      candidates: scoutCandidates
+    },
+
+    harvest: {
+      positions_reviewed: (harvestPayload?.position_reviews?.length || 0),
+      tool_rounds: harvestMeta.tool_rounds ?? 0,
+      exits_proposed: (harvestPayload?.exit_candidates?.length || 0),
+      actions: harvestActionCounts
+    },
+
+    risk: {
+      approved: (approved?.length || 0),
+      rejected: (rejected?.length || 0),
+      rejection_reasons: (rejected || []).map(r => r?.reason || r?.reject_reason || "").filter(Boolean)
+    },
+
+    execution: {
+      buys: (buyTrades?.length || 0),
+      sells: ((sellTrades?.length || 0) + (harvestTrades?.length || 0)),
+      trades: tradeRecords
+    },
+
+    portfolio_snapshot: {
+      cash_usd: portfolio?.cash_usd ?? null,
+      equity_usd: stats?.equity_usd ?? null,
+      position_count: Object.keys(portfolio?.positions || {}).length,
+      unrealized_pnl_usd: stats?.unrealized_pnl_usd ?? null
+    },
+
+    macro: {
+      regime: macro.regime || "unknown",
+      new_positions_ok: macro.new_positions_ok ?? null,
+      tighten_stops: macro.tighten_stops ?? null,
+      btc_change_24h_pct: macro.btc?.change_24h_pct ?? null,
+      fear_greed: macro.fear_greed?.value ?? null
+    },
+
+    outcomes: {
+      recorded_at: null,
+      price_1h_pct: null,
+      price_4h_pct: null,
+      price_24h_pct: null,
+      price_7d_pct: null,
+      signal_detected_before_move: null,
+      outcome_label: null
+    }
+  };
 }
 
 function recordHarvestDecisionEvent(proposal, harvest, portfolio, context = {}, intelligence = null) {
@@ -2831,6 +2959,14 @@ const E3D_AGENT_TOOLS = [
   }
 ];
 
+const NONTRADEABLE_ADDRESSES = new Set([
+  "0xdac17f958d2ee523a2206206994597c13d831ec7", // USDT
+  "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", // USDC
+  "0x6b175474e89094c44da98b954eedeac495271d0f", // DAI
+  "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2", // WETH
+  "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599", // WBTC
+]);
+
 function executeE3DTool(name, rawArgs) {
   const args = rawArgs && typeof rawArgs === "object" ? rawArgs : {};
   try {
@@ -2861,17 +2997,29 @@ function executeE3DTool(name, rawArgs) {
     if (name === "e3d_get_token_info") {
       const address = cleanAddress(String(args.address || ""));
       if (!address) return JSON.stringify({ error: "address required" });
+      if (NONTRADEABLE_ADDRESSES.has(address)) {
+        log("tool_blocked_nontradeable", { tool: name, address });
+        return JSON.stringify({ error: "non-tradeable address, skip", address });
+      }
       return truncateToolResult(fetchJson(`/token-info/${encodeURIComponent(address)}`) ?? { error: "not found" });
     }
     if (name === "e3d_get_transactions") {
       const address = cleanAddress(String(args.address || ""));
       if (!address) return JSON.stringify({ error: "address required" });
+      if (NONTRADEABLE_ADDRESSES.has(address)) {
+        log("tool_blocked_nontradeable", { tool: name, address });
+        return JSON.stringify({ error: "non-tradeable address, skip", address });
+      }
       const limit = Math.min(Number(args.limit) || 25, 50);
       return truncateToolResult(fetchJson("/fetchTransactionsDB", { dataSource: E3D_TRANSACTIONS_DATA_SOURCE, search: address, limit }) ?? []);
     }
     if (name === "e3d_get_address_meta") {
       const address = cleanAddress(String(args.address || ""));
       if (!address) return JSON.stringify({ error: "address required" });
+      if (NONTRADEABLE_ADDRESSES.has(address)) {
+        log("tool_blocked_nontradeable", { tool: name, address });
+        return JSON.stringify({ error: "non-tradeable address, skip", address });
+      }
       return truncateToolResult(fetchJson("/addressMeta", { address }) ?? { error: "not found" });
     }
     return JSON.stringify({ error: `unknown tool: ${name}` });
@@ -2892,6 +3040,87 @@ const DRILL_DOWN_MAX_ROUNDS = 4;
 // Symbols that are never trading candidates — filtered out before the LLM sees them.
 const NONTRADEABLE_RE = /^(USDC?|USDT|DAI|USDS|BUSD|TUSD|FRAX|LUSD|SUSD|GUSD|PYUSD|FDUSD|USDE|SUSDE|USDY|USDP|HUSD|MUSD|CRVUSD|GHO|XAUt|PAXG|CACHE|XAUT|WETH|WBTC|cbBTC|rETH|stETH|wstETH|cbETH|ankrETH|BETH|sETH2|ETH2x|STETH|ETH|TBTC|E3D)$/i;
 
+function computeCandidateScorecard(candidate, storySig) {
+  const signalTypes = Array.isArray(candidate.signal_types) ? candidate.signal_types : [];
+  const nonE3dSignals = signalTypes.filter(t => t !== "E3D_CANDIDATE");
+  const strongSignals = new Set(["ACCUMULATION", "SMART_MONEY", "SMART_MONEY_LEADER", "STEALTH_ACCUMULATION", "WHALE"]);
+  const thesisSignals = new Set(["THESIS"]);
+
+  // story_signal_score
+  let story_signal_score = 0;
+  if (nonE3dSignals.length > 0) {
+    const hasThesis = nonE3dSignals.some(t => thesisSignals.has(t));
+    const hasStrong = nonE3dSignals.some(t => strongSignals.has(t));
+    if (hasThesis) story_signal_score = 60;
+    else if (hasStrong) story_signal_score = 50;
+    else story_signal_score = 30;
+    if (nonE3dSignals.length > 1) story_signal_score = Math.min(100, story_signal_score + 15 * (nonE3dSignals.length - 1));
+  }
+
+  // thesis_signal_score
+  const conviction = Number(candidate.conviction || 0);
+  let thesis_signal_score = 0;
+  if (signalTypes.includes("THESIS") || conviction > 0) {
+    if (conviction > 80) thesis_signal_score = 95;
+    else if (conviction >= 65) thesis_signal_score = 75;
+    else if (conviction >= 50) thesis_signal_score = 55;
+    else if (conviction > 0) thesis_signal_score = 30;
+  }
+
+  // liquidity_score — hard fail if < 100k
+  const liq = Number(candidate.market?.liquidity_usd || 0);
+  let liquidity_score = 0;
+  let liq_hard_fail = false;
+  if (liq < 100000) { liquidity_score = 0; liq_hard_fail = true; }
+  else if (liq < 250000) liquidity_score = 40;
+  else if (liq < 500000) liquidity_score = 65;
+  else if (liq < 1000000) liquidity_score = 80;
+  else liquidity_score = 100;
+
+  // momentum_score — hard fail if change_7d > 300%
+  const change30m = Number(candidate.market?.change_30m_pct ?? 0);
+  const change7d = Number(candidate.market?.change_7d_pct ?? 0);
+  let momentum_score = 0;
+  let momentum_hard_fail = false;
+  if (change7d > 300) { momentum_score = 0; momentum_hard_fail = true; }
+  else if (change30m < 0) momentum_score = 20;
+  else if (change30m < 2) momentum_score = 50;
+  else if (change30m < 5) momentum_score = 70;
+  else if (change30m < 10) momentum_score = 85;
+  else momentum_score = 60;
+
+  // risk_score
+  let risk_score = 100;
+  if (storySig?.has_warning) risk_score = 60;
+
+  // bonuses
+  const signalTypeCount = new Set(nonE3dSignals).size;
+  const multi_signal_bonus = signalTypeCount >= 3 ? 25 : signalTypeCount >= 2 ? 15 : 0;
+  const e3d_candidate_bonus = candidate.source === "e3d_candidate" ? 50 : 0;
+
+  const raw = (story_signal_score * 0.25) + (thesis_signal_score * 0.20) + (liquidity_score * 0.20)
+    + (momentum_score * 0.15) + (risk_score * 0.20) + multi_signal_bonus + e3d_candidate_bonus;
+  const composite_score = Math.min(100, Math.round(raw));
+
+  const hard_fail = liq_hard_fail || momentum_hard_fail;
+  let decision;
+  if (hard_fail || composite_score < 40) decision = "fail";
+  else if (composite_score < 60) decision = "weak";
+  else if (composite_score < 75) decision = "watch";
+  else decision = "pass";
+
+  const decision_reasons = [];
+  if (liq_hard_fail) decision_reasons.push("liquidity below 100k hard floor");
+  if (momentum_hard_fail) decision_reasons.push("change_7d > 300% already pumped");
+  if (candidate.source === "e3d_candidate") decision_reasons.push("e3d_candidate +50 bonus");
+  if (multi_signal_bonus > 0) decision_reasons.push(`multi_signal_bonus +${multi_signal_bonus}`);
+
+  return {
+    story_signal_score, thesis_signal_score, liquidity_score, momentum_score, risk_score,
+    multi_signal_bonus, e3d_candidate_bonus, composite_score, decision, decision_reasons
+  };
+}
+
 // buildCognitiveState — the Node.js perception layer.
 // Makes 3 targeted API calls, fuses the results, and returns a compact ranked
 // candidate list. This is the "E3D visual cortex" — Qwen acts as the strategist
@@ -2901,6 +3130,7 @@ function buildCognitiveState(portfolio) {
     Object.values(portfolio?.positions || {}).map(p => cleanAddress(p?.contract_address || "")).filter(Boolean)
   );
   const startMs = nowMs();
+  const warningSignalTypes = new Set(["MOVER", "SURGE"]);
 
   // Three focused API calls — candidates, stories, and tokens sorted by signal activity
   const e3dCandidates  = endpointArray(fetchJson("/candidates", { limit: 20 }));
@@ -2931,14 +3161,21 @@ function buildCognitiveState(portfolio) {
       disqualifiedAddresses.add(addr);
       continue;
     }
+    if (warningSignalTypes.has(type)) {
+      if (!storySignals.has(addr)) storySignals.set(addr, { types: new Set(), conviction: 0, summaries: [], ids: [], has_warning: false });
+      storySignals.get(addr).has_warning = true;
+      continue;
+    }
     if (!buySignalTypes.has(type)) continue;
 
-    if (!storySignals.has(addr)) storySignals.set(addr, { types: new Set(), conviction: 0, summaries: [] });
+    if (!storySignals.has(addr)) storySignals.set(addr, { types: new Set(), conviction: 0, summaries: [], ids: [], has_warning: false });
     const sig = storySignals.get(addr);
     sig.types.add(type);
     sig.conviction = Math.max(sig.conviction, Number(s?.meta?.conviction_score || s?.conviction || 0));
     const blurb = compactText(s?.title || s?.subtitle || "", 80);
     if (blurb && sig.summaries.length < 2) sig.summaries.push(`${type}: ${blurb}`);
+    const sid = String(s?.id || s?.story_id || "");
+    if (sid && !sig.ids.includes(sid)) sig.ids.push(sid);
   }
 
   // Build market data lookup from active tokens
@@ -2972,6 +3209,7 @@ function buildCognitiveState(portfolio) {
       address:      addr,
       source:       "e3d_candidate",
       signal_types: ["E3D_CANDIDATE", ...(storySig ? [...storySig.types] : [])],
+      story_ids:    storySig ? [...storySig.ids] : [],
       conviction:   Math.max(Number(c?.conviction_score || c?.score || 65), storySig?.conviction || 0),
       why_now:      compactText(c?.why_now || c?.rationale || c?.description || "", 120),
       market,
@@ -2994,6 +3232,7 @@ function buildCognitiveState(portfolio) {
       address:      addr,
       source:       isMulti ? "multi_signal" : "single_signal",
       signal_types: [...sig.types],
+      story_ids:    [...sig.ids],
       conviction:   sig.conviction,
       why_now:      sig.summaries.join("; ") || [...sig.types].join(", "),
       market,
@@ -3007,7 +3246,10 @@ function buildCognitiveState(portfolio) {
     .map(c => ({ ...c, _score: (sourceWeight[c.source] || 0) + c.conviction + (c.signal_types.length * 5) }))
     .sort((a, b) => b._score - a._score)
     .slice(0, COGNITIVE_STATE_MAX_CANDIDATES)
-    .map(({ _score, ...c }, i) => ({ rank: i + 1, ...c }));
+    .map(({ _score, ...c }, i) => {
+      const storySig = storySignals.get(c.address);
+      return { rank: i + 1, ...c, scorecard: computeCandidateScorecard(c, storySig) };
+    });
 
   log("cognitive_state_built", {
     api_calls: 3, e3d_candidates: e3dCandidates.length, story_signals: storySignals.size,
@@ -3015,7 +3257,9 @@ function buildCognitiveState(portfolio) {
     duration_ms: nowMs() - startMs
   });
 
-  return { generated_at: nowIso(), candidates: ranked, meta: { e3d_candidates: e3dCandidates.length, story_signals: storySignals.size, api_calls: 3 } };
+  const cogStateDurationMs = nowMs() - startMs;
+  _lastCognitiveState = { generated_at: nowIso(), candidates: ranked, meta: { e3d_candidates: e3dCandidates.length, story_signals: storySignals.size, api_calls: 3, disqualified: disqualifiedAddresses.size, output_candidates: ranked.length, duration_ms: cogStateDurationMs } };
+  return _lastCognitiveState;
 }
 
 function callLLMWithTools(systemPrompt, userMessage, tools, toolExecutor, { agent = "unknown", maxRounds = MAX_TOOL_ROUNDS } = {}) {
@@ -3075,6 +3319,7 @@ function callLLMWithTools(systemPrompt, userMessage, tools, toolExecutor, { agen
         let toolArgs = {};
         try { toolArgs = JSON.parse(tc?.function?.arguments || "{}"); } catch (_) {}
         log("llm_tool_call", { req_id: reqId, agent, round, tool: toolName, args: toolArgs });
+        if (agent === "scout") _cycleScoutToolCalls.push({ tool: toolName, args: toolArgs, round });
         const result = toolExecutor(toolName, toolArgs);
         log("llm_tool_result", { req_id: reqId, agent, round, tool: toolName, chars: String(result).length });
         messages.push({ role: "tool", tool_call_id: tc.id, content: String(result) });
@@ -3104,6 +3349,8 @@ function callLLMWithTools(systemPrompt, userMessage, tools, toolExecutor, { agen
   throw new Error(`LLM_MAX_TOOL_ROUNDS: exceeded ${maxRounds} rounds without final response`);
 }
 
+let _lastCognitiveState = null;
+let _cycleScoutToolCalls = [];
 let _scoutCycleIndex = 0;
 
 function fetchScoutData() {
@@ -4390,6 +4637,11 @@ function runScoutWithTools(portfolio, portfolioIntelligence = null) {
     "4. source=single_signal — only if signal is strong (SMART_MONEY, ACCUMULATION) and market data is clean",
     `5. FLOW-ONLY (last resort): buy_sell_ratio_1h >= 3.5, liquidity > 150k, vol > 75k, mcap > 5M. Max ${SCOUT_FLOW_ONLY_PER_CYCLE_LIMIT}.`,
     "",
+    "",
+    "SCORECARD: Each candidate in the cognitive state has a scorecard{} with composite_score (0–100) and decision (pass/watch/weak/fail).",
+    "Prefer candidates with decision=pass or watch. You may propose weak candidates only with explicit justification.",
+    "Reference the scorecard in your why_now field.",
+    "",
     "QUALITY GATE — required for ALL proposals: price_usd > 0, liquidity_usd > 100000, market_cap_usd > 2000000, volume_24h_usd > 10000.",
     "SKIP: stablecoins, wrapped assets, change_7d_pct > 300% (already pumped), MOVER/SURGE alone.",
     `SKIP ALREADY HELD: symbols=${JSON.stringify([...heldSymbols])}, addresses=${JSON.stringify([...heldAddresses])}`,
@@ -4400,6 +4652,7 @@ function runScoutWithTools(portfolio, portfolioIntelligence = null) {
     `Output shape: {scan_timestamp, candidates[], holdings_updates:[], stories_checked[]}`,
     `Each candidate: {source_agent:"scout", created_at:"${createdAt}", expires_at:"${expiresAt}", token:{symbol,name,chain:"ethereum",contract_address,category}, setup_type, action:"buy", confidence:integer(0-100), conviction_score:integer(0-100), opportunity_score:integer(0-100), why_now, evidence:["string"], risks:[], entry_zone:{low,high}, invalidation_price, targets:{target_1,target_2,target_3}, market_data:{current_price,change_24h_pct,change_30m_pct,price_source:"e3d",volume_24h_usd,market_cap_usd}, liquidity_data:{liquidity_usd,liquidity_source:"e3d"}, execution_data:{estimated_slippage_bps,quote_source:"e3d"}, portfolio_data:{current_token_exposure_pct:0,current_category_exposure_pct:0,current_total_exposure_pct:0}}`,
     `evidence[] must contain 2-5 strings describing WHY this candidate qualifies (signal type, conviction, price action).`,
+    `story_ids[]: copy the story_ids array exactly from the candidate's cognitive_state entry into your output for each candidate. These are the source story IDs that justify the pick.`,
     `stories_checked[]: list story types you examined — {type, found:bool, tokens:[]}. May be empty.`
   ].filter(Boolean).join("\n");
 
@@ -7918,6 +8171,8 @@ async function runCycle(runContext = {}) {
   _cycleSignalSnapshot = null;
   _cycleArbitrageSignals = [];
   _cycleAvailableStoryTypes = null;
+  _lastCognitiveState = null;
+  _cycleScoutToolCalls = [];
 
   const portfolio = loadPortfolio();
   pruneCooldowns(portfolio);
@@ -8260,6 +8515,18 @@ async function runCycle(runContext = {}) {
     });
 
     const cycleEndTs = nowIso();
+    try {
+      const ledgerRecord = buildRunLedgerRecord({
+        trainingContext, cycleStartTs, cycleEndTs,
+        scoutPayload, harvestPayload, approved, rejected,
+        buyTrades, sellTrades, harvestTrades, stats, portfolio,
+        quantContext: _cycleQuantContext
+      });
+      writeRunLedgerEntry(ledgerRecord);
+      log("run_ledger_written", { cycle_id: trainingContext.cycle_id });
+    } catch (ledgerErr) {
+      log("run_ledger_error", { message: String(ledgerErr?.message || ledgerErr) });
+    }
     const cycleTrainingEvents = readJsonLines(TRAINING_EVENT_LOG, 1000).filter((record) => record.cycle_id === trainingContext.cycle_id);
     const scoutCoverageLog = buildAgentCoverageLog("scout", scoutPayload);
     const harvestCoverageLog = buildAgentCoverageLog("harvest", harvestPayload);

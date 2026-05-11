@@ -1826,6 +1826,65 @@ function E3DAuthPanel({
   );
 }
 
+function LedgerView() {
+  const [entries, setEntries] = React.useState([]);
+  const [loading, setLoading] = React.useState(true);
+  const [error, setError] = React.useState(null);
+
+  React.useEffect(() => {
+    fetch("/api/run-ledger?limit=50")
+      .then(r => r.json())
+      .then(data => { setEntries(Array.isArray(data.entries) ? data.entries.reverse() : []); setLoading(false); })
+      .catch(e => { setError(String(e)); setLoading(false); });
+  }, []);
+
+  if (loading) return React.createElement("div", { className: "card" }, "Loading ledger…");
+  if (error) return React.createElement("div", { className: "card error" }, `Ledger error: ${error}`);
+  if (!entries.length) return React.createElement("div", { className: "card" }, "No ledger entries yet. Run a pipeline cycle to generate data.");
+
+  return React.createElement(
+    "div", { className: "card" },
+    React.createElement("h2", null, "Run Ledger"),
+    React.createElement("p", { className: "panel-note" }, `${entries.length} cycles — most recent first`),
+    React.createElement(
+      "div", { style: { overflowX: "auto" } },
+      React.createElement(
+        "table", { style: { width: "100%", borderCollapse: "collapse", fontSize: "0.8rem" } },
+        React.createElement(
+          "thead", null,
+          React.createElement(
+            "tr", null,
+            ["Cycle", "Time", "E3D Found", "Story Signals", "Scout Cands", "Approved", "Buys", "Sells", "Equity", "Regime", "Outcomes"].map(h =>
+              React.createElement("th", { key: h, style: { textAlign: "left", padding: "6px 10px", borderBottom: "1px solid var(--border, #333)", whiteSpace: "nowrap" } }, h)
+            )
+          )
+        ),
+        React.createElement(
+          "tbody", null,
+          entries.map((e, i) => {
+            const outcomeLabel = e?.outcomes?.outcome_label;
+            const outcomeStyle = outcomeLabel === "win" ? { color: "#4ade80" } : outcomeLabel === "loss" ? { color: "#f87171" } : { color: "#9ca3af" };
+            return React.createElement(
+              "tr", { key: e?.cycle_id || i, style: { borderBottom: "1px solid var(--border-subtle, #222)" } },
+              React.createElement("td", { style: { padding: "6px 10px", fontFamily: "monospace", fontSize: "0.75rem" } }, (e?.cycle_id || "").slice(0, 8)),
+              React.createElement("td", { style: { padding: "6px 10px", whiteSpace: "nowrap" } }, e?.cycle_ts ? new Date(e.cycle_ts).toLocaleString() : "—"),
+              React.createElement("td", { style: { padding: "6px 10px", textAlign: "right" } }, e?.perception?.e3d_candidates_found ?? "—"),
+              React.createElement("td", { style: { padding: "6px 10px", textAlign: "right" } }, e?.perception?.story_signals_found ?? "—"),
+              React.createElement("td", { style: { padding: "6px 10px", textAlign: "right" } }, e?.scout?.candidates_after_quality_gate ?? "—"),
+              React.createElement("td", { style: { padding: "6px 10px", textAlign: "right" } }, e?.risk?.approved ?? "—"),
+              React.createElement("td", { style: { padding: "6px 10px", textAlign: "right" } }, e?.execution?.buys ?? "—"),
+              React.createElement("td", { style: { padding: "6px 10px", textAlign: "right" } }, e?.execution?.sells ?? "—"),
+              React.createElement("td", { style: { padding: "6px 10px", textAlign: "right" } }, e?.portfolio_snapshot?.equity_usd != null ? `$${Math.round(e.portfolio_snapshot.equity_usd).toLocaleString()}` : "—"),
+              React.createElement("td", { style: { padding: "6px 10px" } }, e?.macro?.regime || "—"),
+              React.createElement("td", { style: { padding: "6px 10px", ...outcomeStyle } }, outcomeLabel || (e?.outcomes?.recorded_at ? "neutral" : "pending"))
+            );
+          })
+        )
+      )
+    )
+  );
+}
+
 function App() {
   const [summary, setSummary] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -2824,7 +2883,8 @@ function App() {
     reports: "Reports",
     settings: "Settings",
     orbit: "Orbit + wallet",
-    activity: "Agent Activity"
+    activity: "Agent Activity",
+    ledger: "Run Ledger"
   };
   const pageNoteMap = {
     portfolio: "Open positions with entry, current value, and delta",
@@ -2833,7 +2893,8 @@ function App() {
     reports: "Cycle-by-cycle manager reports with flags and agent grades",
     settings: "Manage e3d.ai login, API key access, and pipeline controls",
     orbit: "Agent orbit and wallet view",
-    activity: "Per-cycle story signals, tokens considered, and risk decisions"
+    activity: "Per-cycle story signals, tokens considered, and risk decisions",
+    ledger: "Per-cycle record: signals detected, candidates scored, decisions made"
   };
   const pageLabel = pageLabelMap[page] || pageLabelMap.portfolio;
   const pageNote = pageNoteMap[page] || pageNoteMap.portfolio;
@@ -2854,7 +2915,9 @@ function App() {
           ? orbitPage
           : page === "activity"
             ? activityPage
-            : portfolioPage;
+            : page === "ledger"
+              ? React.createElement(LedgerView, null)
+              : portfolioPage;
 
   return React.createElement(
     React.Fragment,
@@ -2880,6 +2943,7 @@ function App() {
           React.createElement("button", { className: cls("button", page === "activity" && "button-active"), onClick: () => goToPage("activity") }, "Activity"),
           React.createElement("button", { className: cls("button", page === "reports" && "button-active"), onClick: () => goToPage("reports") }, "Reports"),
           React.createElement("button", { className: cls("button", page === "settings" && "button-active"), onClick: () => goToPage("settings") }, "Settings"),
+          React.createElement("button", { className: cls("button", page === "ledger" && "button-active"), onClick: () => goToPage("ledger") }, "Ledger"),
           React.createElement("button", { className: "button button-primary", onClick: load }, "Refresh now"),
           React.createElement("a", { className: "button button-secondary", href: "/api/activity", target: "_blank", rel: "noreferrer" }, "Raw activity API")
         )

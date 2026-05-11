@@ -56,6 +56,7 @@ const PORTFOLIO_FILE = path.join(ROOT, "portfolio.json");
 const PIPELINE_LOG = path.join(LOG_DIR, "pipeline.jsonl");
 const TRAINING_EVENT_LOG = path.join(LOG_DIR, "training-events.jsonl");
 const TRADE_REVIEWS_LOG = path.join(LOG_DIR, "trade-reviews.jsonl");
+const RUN_LEDGER_LOG = path.join(LOG_DIR, "run-ledger.jsonl");
 const DASHBOARD_HEARTBEAT_FILE = path.join(LOG_DIR, "dashboard-heartbeat.json");
 const RETRAINING_READINESS_FILE = path.join(REPORTS_DIR, "retraining-readiness.json");
 const MONGO_CONTAINER_NAME = process.env.E3D_MONGO_CONTAINER || "e3d-mongo";
@@ -2726,6 +2727,17 @@ async function handleRequest(req, res) {
     const all = readJsonLines(PIPELINE_LOG, 2000);
     const filtered = all.filter(e => DEBUGGER_STAGES.has(e.stage)).slice(-400);
     sendJson(res, 200, { entries: filtered });
+    return;
+  }
+
+  if (url.pathname === "/api/run-ledger") {
+    const limit = Math.min(Number(url.searchParams?.get("limit") || 100), 500);
+    const since = url.searchParams?.get("since") || null;
+    const entries = readJsonLines(RUN_LEDGER_LOG, limit);
+    const filtered = since
+      ? entries.filter(e => e?.cycle_ts && e.cycle_ts >= since)
+      : entries;
+    sendJson(res, 200, { entries: filtered.slice(-limit) });
     return;
   }
 
