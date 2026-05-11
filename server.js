@@ -3,6 +3,7 @@ import http from "http";
 import path from "path";
 import os from "os";
 import crypto from "crypto";
+import readline from "readline";
 import { fileURLToPath } from "url";
 import { execFileSync, spawn } from "child_process";
 import {
@@ -19,6 +20,7 @@ import { buildOperatorPermissionPolicy, readOperatorActionRecords, recordOperato
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const IS_MAIN_MODULE = process.argv[1] ? path.resolve(process.argv[1]) === __filename : false;
 
 // Load .env file from project root if present — simple key=value parser, no npm package needed.
 try {
@@ -992,6 +994,725 @@ function readJsonLines(filePath, limit = 250) {
   }
 }
 
+function readAllJsonLines(filePath) {
+  try {
+    if (!fs.existsSync(filePath)) return [];
+    return fs.readFileSync(filePath, "utf8")
+      .split(/\n+/)
+      .filter(Boolean)
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+const FUNNEL_WINDOWS_MS = Object.freeze({
+  "1h": 60 * 60 * 1000,
+  "6h": 6 * 60 * 60 * 1000,
+  "24h": 24 * 60 * 60 * 1000,
+  "7d": 7 * 24 * 60 * 60 * 1000
+});
+
+const ATTRIBUTION_MIN_MATCHED_TRADES = 3;
+const ATTRIBUTION_VERDICT_DELTA_PCT = 1;
+
+const FUNNEL_TRANSITIONS = Object.freeze([
+  { from: "universe_seen", to: "universe_filtered" },
+  { from: "universe_filtered", to: "shortlist_built" },
+  { from: "shortlist_built", to: "shortlist_blocked" },
+  { from: "shortlist_built", to: "llm_input" },
+  { from: "llm_input", to: "llm_returned" },
+  { from: "llm_returned", to: "address_repaired" },
+  { from: "llm_returned", to: "risk_input" },
+  { from: "risk_input", to: "risk_approved" },
+  { from: "risk_approved", to: "executor_input" },
+  { from: "executor_input", to: "trade_opened" }
+]);
+
+function parseFunnelWindow(rawWindow = "24h") {
+  const normalized = String(rawWindow || "24h").trim().toLowerCase();
+  if (!Object.prototype.hasOwnProperty.call(FUNNEL_WINDOWS_MS, normalized)) {
+    const error = new Error("INVALID_WINDOW");
+    error.statusCode = 400;
+    error.details = {
+      ok: false,
+      error: "INVALID_WINDOW",
+      allowed: Object.keys(FUNNEL_WINDOWS_MS)
+    };
+    throw error;
+  }
+  return {
+    label: normalized,
+    duration_ms: FUNNEL_WINDOWS_MS[normalized]
+  };
+}
+
+function parseTimestampMs(value) {
+  const ms = Date.parse(value || "");
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function normalizeArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function toFunnelCount(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function buildReasonHistogram() {
+  return new Map();
+}
+
+function addReason(reasonMap, value) {
+  const normalized = String(value || "").trim();
+  if (!normalized) return;
+  reasonMap.set(normalized, (reasonMap.get(normalized) || 0) + 1);
+}
+
+function addReasons(reasonMap, values) {
+  for (const value of normalizeArray(values)) addReason(reasonMap, value);
+}
+
+function reasonMapToTop3(reasonMap) {
+  return [...reasonMap.entries()]
+    .map(([reason_code, count]) => ({ reason_code, count }))
+    .sort((a, b) => b.count - a.count || a.reason_code.localeCompare(b.reason_code))
+    .slice(0, 3);
+}
+
+function extractRiskReasonCodes(item) {
+  const codes = [];
+  const push = (values) => {
+    for (const value of normalizeArray(values)) {
+      const normalized = String(value || "").trim();
+      if (normalized) codes.push(normalized);
+    }
+  };
+  push(item?.reason_codes);
+  push(item?.blockers);
+  push(item?.blocker_list);
+  push(item?.risk_review?.reason_codes);
+  push(item?.risk_review?.blocker_list);
+  push(item?.proposal?._risk?.reason_codes);
+  push(item?.proposal?._risk?.blocker_list);
+  push(item?.proposal?.evidence_blockers);
+  push(item?.proposal?.evidence_warnings);
+  return codes;
+}
+
+function extractExecutorReasonCodes(record) {
+  const payload = record?.payload || {};
+  const review = payload?.review || {};
+  const proposal = payload?.proposal || {};
+  const actionCandidate = payload?.action?.candidate || {};
+  const codes = [];
+  const push = (values) => {
+    for (const value of normalizeArray(values)) {
+      const normalized = String(value || "").trim();
+      if (normalized) codes.push(normalized);
+    }
+  };
+  push(review?.blocker_list);
+  push(review?.risk_checks);
+  push(review?.execution_checks);
+  push(review?.portfolio_checks);
+  push(proposal?._risk?.blocker_list);
+  push(proposal?._risk?.checks_failed);
+  push(actionCandidate?.evidence_blockers);
+  return codes;
+}
+
+function buildCycleWindowMap(trainingEntries) {
+  const cycles = new Map();
+  let latestTsMs = 0;
+
+  for (const entry of trainingEntries) {
+    const tsMs = parseTimestampMs(entry?.ts);
+    if (tsMs != null) latestTsMs = Math.max(latestTsMs, tsMs);
+    const cycleId = String(entry?.cycle_id || "").trim();
+    if (!cycleId || tsMs == null) continue;
+
+    let cycle = cycles.get(cycleId);
+    if (!cycle) {
+      cycle = {
+        cycle_id: cycleId,
+        start_ms: null,
+        end_ms: null,
+        min_ts_ms: tsMs,
+        max_ts_ms: tsMs
+      };
+      cycles.set(cycleId, cycle);
+    }
+
+    cycle.min_ts_ms = Math.min(cycle.min_ts_ms, tsMs);
+    cycle.max_ts_ms = Math.max(cycle.max_ts_ms, tsMs);
+
+    if (entry.event_type === "cycle_start") {
+      cycle.start_ms = cycle.start_ms == null ? tsMs : Math.min(cycle.start_ms, tsMs);
+    } else if (entry.event_type === "cycle_end") {
+      cycle.end_ms = cycle.end_ms == null ? tsMs : Math.max(cycle.end_ms, tsMs);
+    }
+  }
+
+  return {
+    latest_ts_ms: latestTsMs,
+    cycles: [...cycles.values()]
+      .map((cycle) => ({
+        cycle_id: cycle.cycle_id,
+        start_ms: cycle.start_ms ?? cycle.min_ts_ms,
+        end_ms: cycle.end_ms ?? cycle.max_ts_ms
+      }))
+      .sort((a, b) => a.start_ms - b.start_ms)
+  };
+}
+
+function intervalContains(tsMs, interval) {
+  return tsMs != null && tsMs >= interval.start_ms && tsMs <= interval.end_ms;
+}
+
+function buildEmptyFunnelCycle(cycleId) {
+  return {
+    cycle_id: cycleId,
+    universe_seen: 0,
+    universe_filtered: 0,
+    shortlist_packets: 0,
+    shortlist_built: 0,
+    shortlist_blocked: 0,
+    llm_request_seen: false,
+    llm_input: 0,
+    llm_response_seen: false,
+    llm_returned: 0,
+    address_repaired: 0,
+    risk_input: 0,
+    risk_approved: 0,
+    risk_rejected: 0,
+    executor_input: 0,
+    trade_opened: 0
+  };
+}
+
+export function buildFunnelRollup({ window = "24h", cycleId = null } = {}) {
+  const parsedWindow = parseFunnelWindow(window);
+  const normalizedCycleId = cycleId == null ? null : String(cycleId).trim() || null;
+  const pipelineEntries = readAllJsonLines(PIPELINE_LOG);
+  const trainingEntries = readAllJsonLines(TRAINING_EVENT_LOG);
+  const pipelineLatestTsMs = pipelineEntries.reduce((max, entry) => Math.max(max, parseTimestampMs(entry?.ts) || 0), 0);
+  const cycleWindowData = buildCycleWindowMap(trainingEntries);
+  const referenceNowMs = Math.max(Date.now(), pipelineLatestTsMs, cycleWindowData.latest_ts_ms);
+  const windowStartMs = referenceNowMs - parsedWindow.duration_ms;
+
+  const selectedCycleWindows = cycleWindowData.cycles.filter((cycle) => {
+    if (normalizedCycleId && cycle.cycle_id !== normalizedCycleId) return false;
+    return cycle.end_ms >= windowStartMs && cycle.start_ms <= referenceNowMs;
+  });
+  const selectedCycleIds = new Set(selectedCycleWindows.map((cycle) => cycle.cycle_id));
+  const cycleSummaries = new Map(selectedCycleWindows.map((cycle) => [cycle.cycle_id, buildEmptyFunnelCycle(cycle.cycle_id)]));
+  const pseudoCycleId = "__window__";
+  const fallbackCycle = buildEmptyFunnelCycle(pseudoCycleId);
+
+  const shortlistReasons = buildReasonHistogram();
+  const riskReasons = buildReasonHistogram();
+  const executorReasons = buildReasonHistogram();
+
+  for (const entry of pipelineEntries) {
+    const tsMs = parseTimestampMs(entry?.ts);
+    if (tsMs == null || tsMs < windowStartMs || tsMs > referenceNowMs) continue;
+
+    const matchingCycle = selectedCycleWindows.find((cycle) => intervalContains(tsMs, cycle));
+    if (normalizedCycleId && !matchingCycle) continue;
+
+    const summary = matchingCycle ? cycleSummaries.get(matchingCycle.cycle_id) : fallbackCycle;
+    const data = entry?.data || {};
+
+    if (entry.stage === "scout_universe_filter") {
+      summary.universe_seen += toFunnelCount(data.before, 0);
+      summary.universe_filtered += toFunnelCount(data.after, 0);
+    } else if (entry.stage === "scout_evidence_shortlist") {
+      const packetsBuilt = toFunnelCount(data.packets_built, 0);
+      const shortlistCount = toFunnelCount(data.shortlist_count, 0);
+      const blockedCount = toFunnelCount(data.blocked_count, 0);
+      summary.shortlist_packets += packetsBuilt || shortlistCount + blockedCount;
+      summary.shortlist_built += shortlistCount;
+      summary.shortlist_blocked += blockedCount;
+    } else if (entry.stage === "scout_shortlist_blocked") {
+      addReasons(shortlistReasons, data.reasons);
+      addReasons(shortlistReasons, data.hard_blockers);
+    } else if (entry.stage === "llm_request" && data.agent === "scout") {
+      summary.llm_request_seen = true;
+    } else if (entry.stage === "llm_response" && data.agent === "scout") {
+      summary.llm_response_seen = true;
+    } else if (entry.stage === "scout_candidate_downgraded") {
+      summary.llm_returned += 1;
+    } else if (entry.stage === "scout_candidate_address_repaired") {
+      summary.address_repaired += 1;
+    } else if (entry.stage === "scout") {
+      const candidateCount = normalizeArray(data.candidates).length;
+      summary.llm_returned += candidateCount;
+      summary.risk_input += candidateCount;
+    } else if (entry.stage === "risk_approved") {
+      summary.risk_approved += normalizeArray(data).length;
+    } else if (entry.stage === "risk_rejected") {
+      const rejected = normalizeArray(data);
+      summary.risk_rejected += rejected.length;
+      for (const item of rejected) addReasons(riskReasons, extractRiskReasonCodes(item));
+    }
+  }
+
+  for (const summary of cycleSummaries.values()) {
+    if (summary.shortlist_packets === 0 && summary.universe_filtered > 0) {
+      summary.shortlist_packets = summary.universe_filtered;
+    }
+    if (summary.llm_request_seen) {
+      summary.llm_input = summary.shortlist_built;
+    }
+    if (!summary.risk_input && (summary.risk_approved || summary.risk_rejected)) {
+      summary.risk_input = summary.risk_approved + summary.risk_rejected;
+    }
+  }
+
+  if (!selectedCycleWindows.length && !normalizedCycleId) {
+    if (fallbackCycle.shortlist_packets === 0 && fallbackCycle.universe_filtered > 0) {
+      fallbackCycle.shortlist_packets = fallbackCycle.universe_filtered;
+    }
+    if (fallbackCycle.llm_request_seen) {
+      fallbackCycle.llm_input = fallbackCycle.shortlist_built;
+    }
+    if (!fallbackCycle.risk_input && (fallbackCycle.risk_approved || fallbackCycle.risk_rejected)) {
+      fallbackCycle.risk_input = fallbackCycle.risk_approved + fallbackCycle.risk_rejected;
+    }
+  }
+
+  for (const entry of trainingEntries) {
+    const tsMs = parseTimestampMs(entry?.ts);
+    if (tsMs == null || tsMs < windowStartMs || tsMs > referenceNowMs) continue;
+
+    const cycleKey = String(entry?.cycle_id || "").trim();
+    let summary = null;
+    if (cycleKey && selectedCycleIds.has(cycleKey)) {
+      summary = cycleSummaries.get(cycleKey) || null;
+    } else if (!normalizedCycleId && !selectedCycleWindows.length) {
+      summary = fallbackCycle;
+    } else {
+      continue;
+    }
+
+    if (entry.event_type === "executor_decision") {
+      const payload = entry?.payload || {};
+      const decision = String(payload.decision || payload.review?.executor_decision || "").trim().toLowerCase();
+      const actionType = String(payload?.action?.type || payload?.trade_kind || "").trim().toLowerCase();
+      if (actionType === "buy") {
+        summary.executor_input += 1;
+        if (decision && decision !== "paper_trade" && decision !== "approve_live" && decision !== "reduce_size") {
+          addReasons(executorReasons, extractExecutorReasonCodes(entry));
+        }
+      }
+    } else if (entry.event_type === "trade") {
+      const lifecycle = String(entry?.payload?.trade_lifecycle || "").trim().toLowerCase();
+      const tradeStatus = String(entry?.payload?.trade_status || "").trim().toLowerCase();
+      if (lifecycle === "open" && (tradeStatus === "filled" || !tradeStatus)) {
+        summary.trade_opened += 1;
+      }
+    }
+  }
+
+  const summaries = selectedCycleWindows.length
+    ? [...cycleSummaries.values()]
+    : normalizedCycleId
+      ? []
+      : [fallbackCycle];
+
+  const totals = summaries.reduce((acc, summary) => {
+    acc.universe_seen += summary.universe_seen;
+    acc.universe_filtered += summary.universe_filtered;
+    acc.shortlist_packets += summary.shortlist_packets;
+    acc.shortlist_built += summary.shortlist_built;
+    acc.shortlist_blocked += summary.shortlist_blocked;
+    acc.llm_input += summary.llm_input;
+    acc.llm_returned += summary.llm_returned;
+    acc.address_repaired += summary.address_repaired;
+    acc.risk_input += summary.risk_input;
+    acc.risk_approved += summary.risk_approved;
+    acc.executor_input += summary.executor_input;
+    acc.trade_opened += summary.trade_opened;
+    return acc;
+  }, {
+    universe_seen: 0,
+    universe_filtered: 0,
+    shortlist_packets: 0,
+    shortlist_built: 0,
+    shortlist_blocked: 0,
+    llm_input: 0,
+    llm_returned: 0,
+    address_repaired: 0,
+    risk_input: 0,
+    risk_approved: 0,
+    executor_input: 0,
+    trade_opened: 0
+  });
+
+  return {
+    window: parsedWindow.label,
+    generated_at: new Date(referenceNowMs).toISOString(),
+    transitions: FUNNEL_TRANSITIONS.map(({ from, to }) => {
+      const key = `${from}->${to}`;
+      const counts = {
+        "universe_seen->universe_filtered": [totals.universe_seen, totals.universe_filtered, []],
+        "universe_filtered->shortlist_built": [totals.shortlist_packets, totals.shortlist_built, []],
+        "shortlist_built->shortlist_blocked": [totals.shortlist_packets, totals.shortlist_blocked, reasonMapToTop3(shortlistReasons)],
+        "shortlist_built->llm_input": [totals.shortlist_built, totals.llm_input, []],
+        "llm_input->llm_returned": [totals.llm_input, totals.llm_returned, []],
+        "llm_returned->address_repaired": [totals.llm_returned, totals.address_repaired, []],
+        "llm_returned->risk_input": [totals.llm_returned, totals.risk_input, []],
+        "risk_input->risk_approved": [totals.risk_input, totals.risk_approved, reasonMapToTop3(riskReasons)],
+        "risk_approved->executor_input": [totals.risk_approved, totals.executor_input, []],
+        "executor_input->trade_opened": [totals.executor_input, totals.trade_opened, reasonMapToTop3(executorReasons)]
+      }[key] || [0, 0, []];
+      return {
+        from,
+        to,
+        count_in: counts[0],
+        count_out: counts[1],
+        drop_reasons_top3: counts[2]
+      };
+    }),
+    totals: {
+      trades_opened: totals.trade_opened,
+      cycles_observed: summaries.length
+    },
+    top_block_reasons: {
+      shortlist: reasonMapToTop3(shortlistReasons),
+      risk: reasonMapToTop3(riskReasons),
+      executor: reasonMapToTop3(executorReasons)
+    }
+  };
+}
+
+function normalizeTextKey(value, fallback = "unknown") {
+  const text = String(value ?? "").trim().toLowerCase();
+  return text || fallback;
+}
+
+function uniqueTextList(values = []) {
+  return [...new Set(normalizeArray(values)
+    .map((value) => normalizeTextKey(value, ""))
+    .filter(Boolean))];
+}
+
+function averageNumber(values) {
+  const nums = values.filter((value) => Number.isFinite(value));
+  if (!nums.length) return null;
+  return nums.reduce((sum, value) => sum + value, 0) / nums.length;
+}
+
+function roundNumber(value, digits = 2) {
+  if (!Number.isFinite(value)) return null;
+  const factor = 10 ** digits;
+  return Math.round(value * factor) / factor;
+}
+
+function rootReasonCode(value) {
+  const text = normalizeTextKey(value);
+  return text.includes(":") ? normalizeTextKey(text.split(":")[0], "unknown") : text;
+}
+
+function extractStoryTypesFromEvidenceSummary(summary) {
+  if (!summary || typeof summary !== "object") return [];
+  return uniqueTextList(
+    normalizeArray(summary.highlights).flatMap((item) => {
+      if (!item || typeof item !== "object") return [];
+      return [item.label, item.source_type, item.story_type, item.type];
+    })
+  );
+}
+
+function extractStoryTypesFromTrade(trade = {}) {
+  const direct = uniqueTextList(normalizeArray(trade.story_types));
+  if (direct.length) return direct;
+
+  const evidenceTypes = uniqueTextList(normalizeArray(trade.evidence).flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    return [item.story_type, item.type, item.category, item.label, item.signal];
+  }));
+  if (evidenceTypes.length) return evidenceTypes;
+
+  const summaryTypes = extractStoryTypesFromEvidenceSummary(trade.evidence_summary);
+  if (summaryTypes.length) return summaryTypes;
+
+  const ticketSummaryTypes = extractStoryTypesFromEvidenceSummary(trade.paper_trade_ticket?.evidence_summary);
+  if (ticketSummaryTypes.length) return ticketSummaryTypes;
+
+  const setupType = normalizeTextKey(trade.setup_type || trade.paper_trade_ticket?.setup_type || "", "");
+  return setupType ? [setupType] : ["unknown"];
+}
+
+function numericLogBand(value) {
+  const n = Number(value);
+  if (!(n > 0)) return "unknown";
+  return String(Math.floor(Math.log10(n)));
+}
+
+function bucketKeyFromFields(category, liquidityUsd, marketCapUsd, flowSignal) {
+  return [
+    normalizeTextKey(category),
+    numericLogBand(liquidityUsd),
+    numericLogBand(marketCapUsd),
+    normalizeTextKey(flowSignal)
+  ].join("|");
+}
+
+function bucketKeyFromTradeRow(row = {}) {
+  return bucketKeyFromFields(row.category, row.liquidity_usd, row.market_cap_usd, row.flow_signal);
+}
+
+function proposalFlowSignal(proposal = {}) {
+  return proposal?._dex_flow?.flow_signal
+    || proposal?.flow_signal
+    || proposal?.narrative_data?.flow_direction
+    || proposal?.position?.flow_signal
+    || null;
+}
+
+function buildBucketKeyFromProposal(proposal = {}) {
+  return bucketKeyFromFields(
+    proposal?.token?.category,
+    proposal?.liquidity_data?.liquidity_usd,
+    proposal?.market_data?.market_cap_usd,
+    proposalFlowSignal(proposal)
+  );
+}
+
+function extractRuleCodes(item = {}) {
+  return uniqueTextList([
+    ...normalizeArray(item?.risk?.reason_codes),
+    ...normalizeArray(item?.risk?.blocker_list),
+    ...normalizeArray(item?.risk?.checks_failed),
+    ...normalizeArray(item?.reason_codes),
+    ...normalizeArray(item?.blockers)
+  ]);
+}
+
+async function streamJsonLines(filePath, onEntry) {
+  if (!fs.existsSync(filePath)) return;
+  const input = fs.createReadStream(filePath, { encoding: "utf8" });
+  const rl = readline.createInterface({ input, crlfDelay: Infinity });
+  try {
+    for await (const line of rl) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const entry = JSON.parse(trimmed);
+        await onEntry(entry);
+      } catch {
+      }
+    }
+  } finally {
+    rl.close();
+    input.destroy();
+  }
+}
+
+async function loadAttributionTradeData(trainingEventLog) {
+  let latestTsMs = 0;
+  const openTradesByPosition = new Map();
+  const completedTrades = [];
+
+  await streamJsonLines(trainingEventLog, (entry) => {
+    const tsMs = parseTimestampMs(entry?.ts);
+    if (tsMs != null) latestTsMs = Math.max(latestTsMs, tsMs);
+
+    if (entry?.event_type === "trade") {
+      const trade = entry?.payload?.trade || {};
+      if (normalizeTextKey(trade.side) !== "buy") return;
+      if (normalizeTextKey(trade.trade_lifecycle) !== "open") return;
+      const positionId = String(entry?.position_id || entry?.payload?.position_id || trade.position_id || "").trim();
+      if (!positionId) return;
+
+      openTradesByPosition.set(positionId, {
+        position_id: positionId,
+        source_agent: normalizeTextKey(
+          trade?.paper_trade_ticket?.source_agent
+          || entry?.payload?.source_agent
+          || trade?.source_agent
+        ),
+        story_types: extractStoryTypesFromTrade(trade),
+        opened_at_ms: tsMs
+      });
+      return;
+    }
+
+    if (entry?.event_type !== "outcome") return;
+
+    const payload = entry?.payload || {};
+    const closeTrade = payload.trade || {};
+    const positionBefore = payload.position_before || {};
+    const entryPrice = Number(payload.entry_price ?? positionBefore.avg_entry_price);
+    const quantity = Number(closeTrade.quantity ?? positionBefore.quantity);
+    const fallbackCostUsd = Number.isFinite(entryPrice) && Number.isFinite(quantity) ? entryPrice * quantity : NaN;
+    const costBasisUsd = Number(payload.trade?.cost_portion_usd ?? positionBefore.cost_basis_usd ?? fallbackCostUsd);
+    const pnlUsd = Number(payload.pnl_usd);
+    completedTrades.push({
+      ts_ms: tsMs,
+      position_id: String(entry?.position_id || payload.position_id || closeTrade.position_id || "").trim() || null,
+      category: positionBefore.category || closeTrade.category || "unknown",
+      liquidity_usd: Number(positionBefore.liquidity_usd ?? positionBefore?.last_market_snapshot?.liquidity_data?.liquidity_usd),
+      market_cap_usd: Number(positionBefore?.last_market_snapshot?.market_data?.market_cap_usd),
+      flow_signal: positionBefore.flow_signal || positionBefore?.last_market_snapshot?.flow_data?.flow_signal || "unknown",
+      exit_reason: rootReasonCode(closeTrade.reason),
+      pnl_pct: Number.isFinite(costBasisUsd) && costBasisUsd > 0 && Number.isFinite(pnlUsd)
+        ? (pnlUsd / costBasisUsd) * 100
+        : null
+    });
+  });
+
+  const rows = completedTrades.map((trade) => {
+    const openTrade = trade.position_id ? openTradesByPosition.get(trade.position_id) || null : null;
+    return {
+      ...trade,
+      source_agent: openTrade?.source_agent || "unknown",
+      story_types: openTrade?.story_types?.length ? openTrade.story_types : ["unknown"],
+      bucket_key: bucketKeyFromTradeRow(trade)
+    };
+  });
+
+  return { latestTsMs, rows };
+}
+
+async function loadAttributionRejectionData(pipelineLog) {
+  let latestTsMs = 0;
+  const allRules = new Set();
+  const rejections = [];
+
+  await streamJsonLines(pipelineLog, (entry) => {
+    const tsMs = parseTimestampMs(entry?.ts);
+    if (tsMs != null) latestTsMs = Math.max(latestTsMs, tsMs);
+    if (entry?.stage !== "risk_rejected" && entry?.stage !== "harvest_rejected") return;
+
+    const items = normalizeArray(entry?.data);
+    if (!items.length) return;
+
+    for (const item of items) {
+      const proposal = item?.proposal || {};
+      const ruleCodes = extractRuleCodes(item);
+      for (const rule of ruleCodes) allRules.add(rule);
+      rejections.push({
+        ts_ms: tsMs,
+        bucket_key: buildBucketKeyFromProposal(proposal),
+        rule_codes: ruleCodes
+      });
+    }
+  });
+
+  return { latestTsMs, allRules, rejections };
+}
+
+function buildDistribution(rows, keyName, extractor) {
+  const groups = new Map();
+  for (const row of rows) {
+    for (const key of uniqueTextList(extractor(row))) {
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(row.pnl_pct);
+    }
+  }
+  return [...groups.entries()]
+    .map(([key, pnlValues]) => ({
+      [keyName]: key,
+      completed_trades: pnlValues.length,
+      avg_realized_pnl_pct: roundNumber(averageNumber(pnlValues), 2)
+    }))
+    .sort((a, b) => b.completed_trades - a.completed_trades || String(a[keyName]).localeCompare(String(b[keyName])));
+}
+
+function deriveRuleVerdict({ rejections, matchedOpenedTrades, blockedBucketAvgPct, openedTradeAvgPct }) {
+  if (!rejections || matchedOpenedTrades < ATTRIBUTION_MIN_MATCHED_TRADES) return "inconclusive";
+  if (!Number.isFinite(blockedBucketAvgPct) || !Number.isFinite(openedTradeAvgPct)) return "inconclusive";
+  if (blockedBucketAvgPct <= openedTradeAvgPct - ATTRIBUTION_VERDICT_DELTA_PCT) return "rule_helps";
+  if (blockedBucketAvgPct > 0 && blockedBucketAvgPct >= openedTradeAvgPct + ATTRIBUTION_VERDICT_DELTA_PCT) return "rule_might_hurt";
+  return "inconclusive";
+}
+
+export async function buildAttributionReport({
+  window = "7d",
+  pipelineLog = PIPELINE_LOG,
+  trainingEventLog = TRAINING_EVENT_LOG,
+  nowMs = null
+} = {}) {
+  const parsedWindow = parseFunnelWindow(window || "7d");
+  const [tradeData, rejectionData] = await Promise.all([
+    loadAttributionTradeData(trainingEventLog),
+    loadAttributionRejectionData(pipelineLog)
+  ]);
+  const referenceNowMs = Number.isFinite(nowMs)
+    ? Math.max(nowMs, tradeData.latestTsMs, rejectionData.latestTsMs)
+    : Math.max(Date.now(), tradeData.latestTsMs, rejectionData.latestTsMs);
+  const windowStartMs = referenceNowMs - parsedWindow.duration_ms;
+  const completedTrades = tradeData.rows.filter((row) => row.ts_ms != null && row.ts_ms >= windowStartMs && row.ts_ms <= referenceNowMs);
+  const rejectionsInWindow = rejectionData.rejections.filter((row) => row.ts_ms != null && row.ts_ms >= windowStartMs && row.ts_ms <= referenceNowMs);
+
+  const bucketStats = new Map();
+  for (const trade of completedTrades) {
+    if (!Number.isFinite(trade.pnl_pct)) continue;
+    const existing = bucketStats.get(trade.bucket_key) || { pnlValues: [] };
+    existing.pnlValues.push(trade.pnl_pct);
+    bucketStats.set(trade.bucket_key, existing);
+  }
+
+  const overallOpenedAvgPct = averageNumber(
+    completedTrades.map((trade) => trade.pnl_pct).filter((value) => Number.isFinite(value))
+  );
+  const ruleStats = new Map([...rejectionData.allRules].map((rule) => [rule, {
+    rule,
+    rejections: 0,
+    bucket_keys: new Set()
+  }]));
+
+  for (const rejection of rejectionsInWindow) {
+    for (const rule of rejection.rule_codes) {
+      if (!ruleStats.has(rule)) {
+        ruleStats.set(rule, { rule, rejections: 0, bucket_keys: new Set() });
+      }
+      const stat = ruleStats.get(rule);
+      stat.rejections += 1;
+      stat.bucket_keys.add(rejection.bucket_key);
+    }
+  }
+
+  const byRule = [...ruleStats.values()]
+    .map((stat) => {
+      const matchedPnlValues = [...stat.bucket_keys].flatMap((bucketKey) => bucketStats.get(bucketKey)?.pnlValues || []);
+      const avgRealizedPnlPct = averageNumber(matchedPnlValues);
+      return {
+        rule: stat.rule,
+        rejections: stat.rejections,
+        matched_opened_trades: matchedPnlValues.length,
+        avg_realized_pnl_pct: roundNumber(avgRealizedPnlPct, 2),
+        verdict: deriveRuleVerdict({
+          rejections: stat.rejections,
+          matchedOpenedTrades: matchedPnlValues.length,
+          blockedBucketAvgPct: avgRealizedPnlPct,
+          openedTradeAvgPct: overallOpenedAvgPct
+        })
+      };
+    })
+    .sort((a, b) => b.rejections - a.rejections || b.matched_opened_trades - a.matched_opened_trades || a.rule.localeCompare(b.rule));
+
+  return {
+    window: parsedWindow.label,
+    by_rule: byRule,
+    by_signal_source: buildDistribution(completedTrades, "signal_source", (row) => [row.source_agent]),
+    by_story_type: buildDistribution(completedTrades, "story_type", (row) => row.story_types || ["unknown"]),
+    by_exit_reason: buildDistribution(completedTrades, "exit_reason", (row) => [row.exit_reason])
+  };
+}
+
 function clearLocalStateFiles() {
   fs.writeFileSync(PORTFOLIO_FILE, `${JSON.stringify(DEFAULT_PORTFOLIO_STATE, null, 2)}\n`, "utf8");
   writeEmptyFile(PIPELINE_LOG);
@@ -1668,6 +2389,39 @@ async function handleRequest(req, res) {
     return;
   }
 
+  if (url.pathname === "/funnel" && req.method === "GET") {
+    try {
+      const report = buildFunnelRollup({
+        window: url.searchParams.get("window") || "24h",
+        cycleId: url.searchParams.get("cycle_id") || null
+      });
+      sendJson(res, 200, report);
+    } catch (err) {
+      if (err?.statusCode === 400 && err?.details) {
+        sendJson(res, 400, err.details);
+      } else {
+        throw err;
+      }
+    }
+    return;
+  }
+
+  if (url.pathname === "/attribution" && req.method === "GET") {
+    try {
+      const report = await buildAttributionReport({
+        window: url.searchParams.get("window") || "7d"
+      });
+      sendJson(res, 200, report);
+    } catch (err) {
+      if (err?.statusCode === 400 && err?.details) {
+        sendJson(res, 400, err.details);
+      } else {
+        throw err;
+      }
+    }
+    return;
+  }
+
   if (url.pathname === "/api/pipeline/status") {
     sendJson(res, 200, getPipelineStatus());
     return;
@@ -2093,34 +2847,35 @@ function wsHandleUpgrade(req, socket) {
   wsPushCycles(socket); // send current state immediately on connect
 }
 
-// Watch log dir so we catch both file creation and appends
-let wsBroadcastTimer = null;
-fs.watch(LOG_DIR, { persistent: false }, (_, filename) => {
-  if (filename !== "pipeline.jsonl") return;
-  clearTimeout(wsBroadcastTimer);
-  wsBroadcastTimer = setTimeout(() => {
-    const cycles = groupPipelineIntoCycles(readJsonLines(PIPELINE_LOG, 600));
-    wsBroadcast({ type: "cycles", cycles: cycles.slice(0, 25) });
-  }, 400);
-});
-
-// ── HTTP server ───────────────────────────────────────────────────────────────
-const server = http.createServer((req, res) => {
-  handleRequest(req, res).catch((err) => {
-    res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
-    res.end(JSON.stringify({ ok: false, error: err.message }));
+if (IS_MAIN_MODULE) {
+  // Watch log dir so we catch both file creation and appends
+  let wsBroadcastTimer = null;
+  fs.watch(LOG_DIR, { persistent: false }, (_, filename) => {
+    if (filename !== "pipeline.jsonl") return;
+    clearTimeout(wsBroadcastTimer);
+    wsBroadcastTimer = setTimeout(() => {
+      const cycles = groupPipelineIntoCycles(readJsonLines(PIPELINE_LOG, 600));
+      wsBroadcast({ type: "cycles", cycles: cycles.slice(0, 25) });
+    }, 400);
   });
-});
 
-server.on("upgrade", wsHandleUpgrade);
+  // ── HTTP server ─────────────────────────────────────────────────────────────
+  const server = http.createServer((req, res) => {
+    handleRequest(req, res).catch((err) => {
+      res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ ok: false, error: err.message }));
+    });
+  });
 
-// Reattach to any pipeline that survived a previous server restart
-recoverPipelineIfRunning();
-writeDashboardHeartbeat();
-const dashboardHeartbeatTimer = setInterval(writeDashboardHeartbeat, 30000);
-dashboardHeartbeatTimer.unref?.();
+  server.on("upgrade", wsHandleUpgrade);
 
-server.listen(PORT, HOST, () => {
+  recoverPipelineIfRunning();
   writeDashboardHeartbeat();
-  console.log(`Dashboard server running at http://${HOST}:${PORT}`);
-});
+  const dashboardHeartbeatTimer = setInterval(writeDashboardHeartbeat, 30000);
+  dashboardHeartbeatTimer.unref?.();
+
+  server.listen(PORT, HOST, () => {
+    writeDashboardHeartbeat();
+    console.log(`Dashboard server running at http://${HOST}:${PORT}`);
+  });
+}

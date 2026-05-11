@@ -11,6 +11,7 @@ const scout = buildScoutEvidenceDiagnostics({
     { prompt_chars: 1200, prompt_tokens: 300, completion_tokens: 80, total_tokens: 380, duration_ms: 900 },
     { prompt_chars: 800, prompt_tokens: 220, completion_tokens: 70, total_tokens: 290, duration_ms: 700 }
   ],
+  address_repairs_in_cycle: 2,
   candidates: [
     { evidence: ["THESIS conviction 78", "current_price 1.25 volume_24h 450000", "flow_signal accumulation"] },
     { evidence: ["watchlist support", "liquidity_usd 250000"] },
@@ -33,6 +34,7 @@ assert.equal(scout.completion_tokens, 150);
 assert.equal(scout.total_tokens, 670);
 assert.equal(scout.llm_duration_ms, 1600);
 assert.equal(scout.candidates_returned, 3);
+assert.equal(scout.address_repairs_in_cycle, 2);
 assert.equal(scout.candidates_with_full_evidence, 1);
 assert.equal(scout.candidates_with_thin_evidence, 2);
 assert.deepEqual(scout.evidence_count_distribution, { 0: 1, 2: 1, 3: 1 });
@@ -86,6 +88,7 @@ const event = buildEvidenceDiagnosticsEvent({
 
 assert.equal(event.cycle_id, "cycle-123");
 assert.equal(event.scout.total_tokens, 670);
+assert.equal(event.scout.address_repairs_in_cycle, 2);
 assert.equal(event.harvest.exit_candidates_with_thin_evidence, 1);
 
 console.log(JSON.stringify({

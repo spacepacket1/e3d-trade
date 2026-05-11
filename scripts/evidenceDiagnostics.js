@@ -134,6 +134,7 @@ export function buildScoutEvidenceDiagnostics(input = {}) {
     total_tokens: llm.total_tokens,
     llm_duration_ms: llm.duration_ms,
     candidates_returned: candidates.returned,
+    address_repairs_in_cycle: toNum(input.address_repairs_in_cycle, 0),
     candidates_with_full_evidence: candidates.with_full_evidence,
     candidates_with_thin_evidence: candidates.with_thin_evidence,
     evidence_count_distribution: candidates.evidence_count_distribution,
@@ -179,6 +180,7 @@ export function buildEvidenceDiagnosticsEvent(input = {}) {
       total_tokens: scout.total_tokens,
       llm_duration_ms: scout.llm_duration_ms,
       candidates_returned: scout.candidates_returned,
+      address_repairs_in_cycle: scout.address_repairs_in_cycle,
       candidates_with_thin_evidence: scout.candidates_with_thin_evidence
     } : null,
     harvest: harvest ? {

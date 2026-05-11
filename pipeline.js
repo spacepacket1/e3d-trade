@@ -90,7 +90,10 @@ const SETTINGS_DEFAULTS = {
   category_cap_pct: 0.30,              // 30% max category exposure
   reject_fraud_risk_gte: 35,
   target_partial_pct: 0.25,
-  age_decay_per_day: 0.75              // score penalty per day held
+  age_decay_per_day: 0.75,             // score penalty per day held
+  recent_performance_window_hours: 24,
+  scout_max_candidates: 6,
+  fee_bps_per_side: 12.5
 };
 
 function nowIso() {
@@ -521,6 +524,49 @@ function summarizeScoutCandidateReason(token, heldIndex) {
   };
 }
 
+function buildScoutUniverseFilterReasons(token, storyTokenAddresses) {
+  const reasons = [];
+  const address = cleanAddress(token?.address || token?.contract_address || "");
+  const storyCount1h = toNum(token?.story_count_1h, 0);
+  if (!address) reasons.push("missing_contract_address");
+  if (!(storyCount1h > 0)) reasons.push("story_count_1h_zero");
+  if (!(address && storyTokenAddresses.has(address))) reasons.push("not_confirmed_by_story_api");
+  return reasons;
+}
+
+function buildScoutE3dCandidateFilterDecision(candidate, nonTradeablePattern) {
+  const address = cleanAddress(candidate?.entity_address || candidate?.token_address || candidate?.address || candidate?.contract_address || "");
+  const symbol = String(candidate?.entity_symbol || candidate?.symbol || "").trim();
+  const reasons = [];
+  if (!address) reasons.push("missing_contract_address");
+  if (/^0+$/.test(address)) reasons.push("zero_address");
+  if (address === "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee") reasons.push("native_placeholder_address");
+  if (nonTradeablePattern.test(symbol)) reasons.push("non_tradeable_symbol");
+  if (/[\s#]/.test(symbol)) reasons.push("nft_style_symbol");
+  return {
+    keep: reasons.length === 0,
+    symbol: symbol || null,
+    contract_address: address || null,
+    reasons
+  };
+}
+
+function buildScoutWatchlistFilterDecision(item, nonTradeablePattern) {
+  const address = cleanAddress(item?.address || "");
+  const label = String(item?.label || "").trim();
+  const reasons = [];
+  if (item?.type !== "token") reasons.push("non_token_watchlist_item");
+  if (!address) reasons.push("missing_contract_address");
+  if (/^0+$/.test(address)) reasons.push("zero_address");
+  if (nonTradeablePattern.test(label)) reasons.push("non_tradeable_label");
+  return {
+    keep: reasons.length === 0,
+    symbol: label || null,
+    contract_address: address || null,
+    reasons
+  };
+}
+
 function buildScoutCandidateDebug(portfolio, scoutIntel) {
   const heldIndex = buildHeldTokenIndex(portfolio);
   const tokens = mergeUniqueTokens(
@@ -737,6 +783,12 @@ function recordTradeEvent(trade, portfolio, context = {}, details = {}) {
     trade_id: trade?.trade_id || null,
     position_id: trade?.position_id || null,
     candidate_id: trade?.candidate_id || null,
+    quoted_price: trade?.quoted_price ?? null,
+    fill_price: trade?.fill_price ?? null,
+    slippage_bps_applied: trade?.slippage_bps_applied ?? null,
+    fee_bps_applied: trade?.fee_bps_applied ?? null,
+    fee_usd: trade?.fee_usd ?? null,
+    slippage_usd: trade?.slippage_usd ?? null,
     trade: trade || null,
     ...details
   });
@@ -752,7 +804,7 @@ function recordOutcomeEvent(trade, positionBefore, portfolio, context = {}) {
     candidate_id: trade?.candidate_id || null,
     outcome_label: pnlUsd >= 0 ? "profit" : "loss",
     pnl_usd: pnlUsd,
-    exit_price: trade?.price ?? null,
+    exit_price: trade?.fill_price ?? trade?.price ?? null,
     entry_price: positionBefore?.avg_entry_price ?? null,
     holding_days: positionBefore?.opened_at && trade?.ts ? Math.max(0, (new Date(trade.ts).getTime() - new Date(positionBefore.opened_at).getTime()) / 86400000) : null,
     position_before: positionBefore || null,
@@ -781,6 +833,12 @@ function optionalNum(v) {
   if (v == null || v === "") return null;
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
+}
+
+function optionalMs(value) {
+  if (!value) return null;
+  const ms = new Date(value).getTime();
+  return Number.isFinite(ms) ? ms : null;
 }
 
 function saneStopPrice(rawStop, entryPrice) {
@@ -1186,8 +1244,10 @@ function classifyExitReasonForPolicy(reason) {
   return root || "unknown";
 }
 
-function computeRecentClosedTradeMetrics(portfolio, windowMs = 24 * 60 * 60 * 1000) {
-  const cutoff = Date.now() - windowMs;
+function computeRecentClosedTradeMetrics(portfolio, windowMs = null) {
+  const settings = portfolio?.settings || SETTINGS_DEFAULTS;
+  const resolvedWindowMs = windowMs ?? Math.max(1, toNum(settings.recent_performance_window_hours, 24)) * 60 * 60 * 1000;
+  const cutoff = Date.now() - resolvedWindowMs;
   const closed = (Array.isArray(portfolio?.closed_trades) ? portfolio.closed_trades : [])
     .filter((trade) => trade?.side === "sell")
     .filter((trade) => Number.isFinite(toNum(trade?.pnl_usd, NaN)))
@@ -1202,7 +1262,8 @@ function computeRecentClosedTradeMetrics(portfolio, windowMs = 24 * 60 * 60 * 10
   const realizedPnl = grossProfit + grossLoss;
 
   return {
-    source: "portfolio_rolling_24h",
+    source: "portfolio_recent_window",
+    window_hours: resolvedWindowMs / (60 * 60 * 1000),
     closed_trade_count: closed.length,
     win_rate: closed.length ? (wins.length / closed.length) * 100 : 0,
     realized_pnl_usd: realizedPnl,
@@ -1211,6 +1272,15 @@ function computeRecentClosedTradeMetrics(portfolio, windowMs = 24 * 60 * 60 * 10
     profit_factor: grossLoss < 0 ? grossProfit / Math.abs(grossLoss) : (grossProfit > 0 ? null : 0),
     stop_loss_count: closed.filter((trade) => classifyExitReasonForPolicy(trade.reason) === "stop_loss").length
   };
+}
+
+function computeRecentPerformanceThrottleMultiplier(profitFactor) {
+  const normalizedProfitFactor = toNum(profitFactor, 1);
+  let multiplier = 1;
+  if (normalizedProfitFactor < 0.2) multiplier = 0.3;
+  else if (normalizedProfitFactor < 0.4) multiplier = 0.5;
+  else if (normalizedProfitFactor < 0.7) multiplier = 0.7;
+  return Math.max(0.3, Math.min(1, multiplier));
 }
 
 function buildRegimeSentinelPolicy(portfolio, quantContext) {
@@ -1228,13 +1298,22 @@ function buildRegimeSentinelPolicy(portfolio, quantContext) {
   let allowRotations = Boolean(base.allow_rotations);
   let maxBuys = toNum(base.max_buys_per_cycle, settings.max_buys_per_cycle);
   let maxRotations = toNum(base.max_rotations_per_cycle, settings.max_rotations_per_cycle);
+  const equity = equityUsd(portfolio);
+  const hasSufficientSample = toNum(perf24.closed_trade_count, 0) >= 10;
+  const hasMaterialLoss = toNum(perf24.realized_pnl_usd, 0) <= (-0.005 * equity);
 
-  if (toNum(perf24.profit_factor, 1) < 0.7 && toNum(perf24.realized_pnl_usd, 0) < 0) {
-    allowBuys = Boolean(base.allow_buys);
-    maxBuys = allowBuys ? Math.min(Math.max(1, maxBuys), 1) : 0;
-    allocationMultiplier = allowBuys ? Math.min(allocationMultiplier, 0.2) : 0;
-    reasonCodes.push("negative_recent_profit_factor");
-    reasonCodes.push("new_buys_throttled_by_recent_losses");
+  if (toNum(perf24.profit_factor, 1) < 0.7) {
+    if (!hasSufficientSample) {
+      reasonCodes.push("throttle_skipped_low_sample");
+    } else if (!hasMaterialLoss) {
+      reasonCodes.push("throttle_skipped_immaterial_loss");
+    } else {
+      allowBuys = Boolean(base.allow_buys);
+      maxBuys = allowBuys ? Math.max(1, maxBuys - 1) : 0;
+      allocationMultiplier = allowBuys ? Math.min(allocationMultiplier, computeRecentPerformanceThrottleMultiplier(perf24.profit_factor)) : 0;
+      reasonCodes.push("negative_recent_profit_factor");
+      reasonCodes.push("new_buys_throttled_by_recent_losses");
+    }
   }
   if (toNum(perf24.stop_loss_count, 0) >= 2) {
     allowBuys = false;
@@ -1273,6 +1352,7 @@ function buildRegimeSentinelPolicy(portfolio, quantContext) {
       profit_factor: perf24.profit_factor ?? null,
       stop_loss_count: perf24.stop_loss_count ?? null,
       closed_trade_count: perf24.closed_trade_count ?? null,
+      window_hours: perf24.window_hours ?? null,
       source: perf24.source || "unknown"
     },
     review_stats: {
@@ -1366,9 +1446,9 @@ function buildArbitrageSignals(portfolio) {
 
 function isInCooldown(portfolio, symbol) {
   if (!portfolio || !symbol) return false;
-  const until = portfolio.cooldowns?.[symbol];
-  if (!until) return false;
-  return new Date(until).getTime() > Date.now();
+  const entry = normalizeCooldownEntry(portfolio.cooldowns?.[symbol]);
+  if (!entry?.until) return false;
+  return new Date(entry.until).getTime() > Date.now();
 }
 
 function categoryExposurePct(portfolio, category) {
@@ -2380,7 +2460,7 @@ function loadPortfolio() {
   loaded.positions = loaded.positions || {};
   loaded.closed_trades = loaded.closed_trades || [];
   loaded.action_history = loaded.action_history || [];
-  loaded.cooldowns = loaded.cooldowns || {};
+  loaded.cooldowns = normalizePortfolioCooldowns(loaded.cooldowns || {});
   loaded.stats = loaded.stats || {
     realized_pnl_usd: 0,
     unrealized_pnl_usd: 0,
@@ -2627,6 +2707,403 @@ function callLLMDirect(systemPrompt, userMessage, { maxRetries = 1, agent = "unk
   throw lastErr;
 }
 
+// ─── Tool-calling infrastructure ──────────────────────────────────────────────
+// Enabled via LLM_TOOL_USE=1 env var. Agents call e3d.ai APIs themselves
+// instead of receiving pre-fetched data in the prompt.
+const TOOL_USE_ENABLED = ["1", "true", "yes"].includes(String(process.env.LLM_TOOL_USE || "").trim().toLowerCase());
+// Keep KV cache manageable on 25GB RAM: truncate large API responses before
+// they enter the conversation history. 6000 chars ≈ 1500 tokens per result.
+const MAX_TOOL_RESULT_CHARS = 6000;
+// Hard ceiling on tool-call rounds per LLM session to prevent runaway loops.
+const MAX_TOOL_ROUNDS = 15;
+
+function truncateToolResult(data) {
+  const str = typeof data === "string" ? data : JSON.stringify(data ?? null);
+  if (str.length <= MAX_TOOL_RESULT_CHARS) return str;
+  return str.slice(0, MAX_TOOL_RESULT_CHARS) + `...[truncated, ${str.length - MAX_TOOL_RESULT_CHARS} more chars]`;
+}
+
+const E3D_AGENT_TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "e3d_get_candidates",
+      description: "Fetch E3D pre-computed buy candidates — highest-quality signals, already multi-story correlated. Always call this first when scouting.",
+      parameters: {
+        type: "object",
+        properties: {
+          limit: { type: "integer", description: "Max results (default 20, max 50)" },
+          scope: { type: "string", enum: ["all", "new"], description: "all=all candidates, new=only unseen" }
+        },
+        required: []
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "e3d_get_stories",
+      description: "Fetch on-chain signal stories. PRE-PUMP (buy alpha): STAGING, CLUSTER, FUNNEL, ACCUMULATION, SMART_MONEY, SMART_MONEY_LEADER, STEALTH_ACCUMULATION, THESIS, BREAKOUT_CONFIRMED. POST-PUMP (skip as entry): MOVER, SURGE. DISQUALIFIERS: WASH_TRADE, LIQUIDITY_DRAIN, TREASURY_DISTRIBUTION, SECURITY_RISK.",
+      parameters: {
+        type: "object",
+        properties: {
+          type: { type: "string", description: "Story type filter (e.g. THESIS, ACCUMULATION, SMART_MONEY, STAGING). Omit for all types." },
+          chain: { type: "string", enum: ["ETH", "all"], description: "Chain filter (default ETH)" },
+          limit: { type: "integer", description: "Max results (default 50, max 200)" }
+        },
+        required: []
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "e3d_get_token_universe",
+      description: "Fetch the full tracked token universe with price, volume, liquidity, and market cap. Use to verify quality gates: price_usd > 0, liquidity_usd > 100000, market_cap_usd > 2000000, volume_24h_usd > 10000.",
+      parameters: {
+        type: "object",
+        properties: {
+          limit: { type: "integer", description: "Max tokens (default 50)" },
+          search: { type: "string", description: "Filter by symbol or contract address" }
+        },
+        required: []
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "e3d_get_trending",
+      description: "Fetch tokens sorted by recent price change. Gainers spot momentum, losers spot capitulation.",
+      parameters: {
+        type: "object",
+        properties: {
+          direction: { type: "string", enum: ["gainers", "losers"], description: "Sort direction (required)" },
+          timeframe: { type: "string", enum: ["30m", "24h"], description: "Price change timeframe (default 30m)" },
+          limit: { type: "integer", description: "Max results (default 20)" }
+        },
+        required: ["direction"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "e3d_get_token_info",
+      description: "Get detailed price and market data for a specific token by contract address.",
+      parameters: {
+        type: "object",
+        properties: {
+          address: { type: "string", description: "Contract address (0x...)" }
+        },
+        required: ["address"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "e3d_get_transactions",
+      description: "Fetch recent on-chain transactions for a token or wallet — reveals whale moves, wash trading, accumulation patterns.",
+      parameters: {
+        type: "object",
+        properties: {
+          address: { type: "string", description: "Contract or wallet address to look up" },
+          limit: { type: "integer", description: "Max results (default 25)" }
+        },
+        required: ["address"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "e3d_get_address_meta",
+      description: "Look up identity metadata for a contract address — name, symbol, type, description, links.",
+      parameters: {
+        type: "object",
+        properties: {
+          address: { type: "string", description: "Contract address to look up" }
+        },
+        required: ["address"]
+      }
+    }
+  }
+];
+
+function executeE3DTool(name, rawArgs) {
+  const args = rawArgs && typeof rawArgs === "object" ? rawArgs : {};
+  try {
+    if (name === "e3d_get_candidates") {
+      const limit = Math.min(Number(args.limit) || 20, 50);
+      const query = { limit };
+      if (args.scope) query.scope = String(args.scope);
+      return truncateToolResult(fetchJson("/candidates", query) ?? { candidates: [], message: "none currently" });
+    }
+    if (name === "e3d_get_stories") {
+      const limit = Math.min(Number(args.limit) || 50, 200);
+      const query = { limit, chain: String(args.chain || "ETH") };
+      if (args.type) query.type = String(args.type);
+      return truncateToolResult(fetchJson("/stories", query) ?? []);
+    }
+    if (name === "e3d_get_token_universe") {
+      const limit = Math.min(Number(args.limit) || 50, 100);
+      const query = { dataSource: E3D_TOKENS_DATA_SOURCE, limit, offset: 0 };
+      if (args.search) query.search = String(args.search);
+      return truncateToolResult(fetchJson("/fetchTokensDB", query) ?? []);
+    }
+    if (name === "e3d_get_trending") {
+      const limit = Math.min(Number(args.limit) || 20, 50);
+      const sortBy = args.timeframe === "24h" ? "change_24h_pct" : "change_30m_pct";
+      const sortDir = args.direction === "losers" ? "asc" : "desc";
+      return truncateToolResult(fetchJson("/fetchTokenPricesWithHistoryAllRanges", { dataSource: E3D_TOKENS_DATA_SOURCE, sortBy, sortDir, limit }) ?? []);
+    }
+    if (name === "e3d_get_token_info") {
+      const address = cleanAddress(String(args.address || ""));
+      if (!address) return JSON.stringify({ error: "address required" });
+      return truncateToolResult(fetchJson(`/token-info/${encodeURIComponent(address)}`) ?? { error: "not found" });
+    }
+    if (name === "e3d_get_transactions") {
+      const address = cleanAddress(String(args.address || ""));
+      if (!address) return JSON.stringify({ error: "address required" });
+      const limit = Math.min(Number(args.limit) || 25, 50);
+      return truncateToolResult(fetchJson("/fetchTransactionsDB", { dataSource: E3D_TRANSACTIONS_DATA_SOURCE, search: address, limit }) ?? []);
+    }
+    if (name === "e3d_get_address_meta") {
+      const address = cleanAddress(String(args.address || ""));
+      if (!address) return JSON.stringify({ error: "address required" });
+      return truncateToolResult(fetchJson("/addressMeta", { address }) ?? { error: "not found" });
+    }
+    return JSON.stringify({ error: `unknown tool: ${name}` });
+  } catch (err) {
+    return JSON.stringify({ error: String(err?.message || err) });
+  }
+}
+
+// Multi-round tool-calling loop. Sends request to LLM, executes any tool_calls,
+// appends results to the conversation, and repeats until the model emits a final
+// text response or MAX_TOOL_ROUNDS is hit.
+// ─── Cognitive state ──────────────────────────────────────────────────────────
+// Max candidates to surface in the cognitive state snapshot.
+const COGNITIVE_STATE_MAX_CANDIDATES = 10;
+// Max rounds when the agent is doing targeted drill-down (cognitive state mode).
+// 3 drill-down tool calls + 1 final answer = 4 rounds total.
+const DRILL_DOWN_MAX_ROUNDS = 4;
+// Symbols that are never trading candidates — filtered out before the LLM sees them.
+const NONTRADEABLE_RE = /^(USDC?|USDT|DAI|USDS|BUSD|TUSD|FRAX|LUSD|SUSD|GUSD|PYUSD|FDUSD|USDE|SUSDE|USDY|USDP|HUSD|MUSD|CRVUSD|GHO|XAUt|PAXG|CACHE|XAUT|WETH|WBTC|cbBTC|rETH|stETH|wstETH|cbETH|ankrETH|BETH|sETH2|ETH2x|STETH|ETH|TBTC|E3D)$/i;
+
+// buildCognitiveState — the Node.js perception layer.
+// Makes 3 targeted API calls, fuses the results, and returns a compact ranked
+// candidate list. This is the "E3D visual cortex" — Qwen acts as the strategist
+// on top of it, with optional drill-down tool calls for deeper investigation.
+function buildCognitiveState(portfolio) {
+  const heldAddresses = new Set(
+    Object.values(portfolio?.positions || {}).map(p => cleanAddress(p?.contract_address || "")).filter(Boolean)
+  );
+  const startMs = nowMs();
+
+  // Three focused API calls — candidates, stories, and tokens sorted by signal activity
+  const e3dCandidates  = endpointArray(fetchJson("/candidates", { limit: 20 }));
+  const allStories     = endpointArray(fetchJson("/stories", { limit: 100, chain: "ETH" }));
+  const activeTokens   = endpointArray(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
+    dataSource: E3D_TOKENS_DATA_SOURCE, sortBy: "storyCount", sortDir: "desc",
+    trendInterval: "1H", limit: 100
+  }));
+
+  // Classify story types
+  const disqualifierTypes = new Set(["WASH_TRADE", "LOOP", "LIQUIDITY_DRAIN", "SPREAD_WIDENING",
+    "EXCHANGE_FLOW", "SECURITY_RISK", "RUG_LIQUIDITY_PULL", "TREASURY_DISTRIBUTION"]);
+  const buySignalTypes = new Set(["STAGING", "CLUSTER", "FUNNEL", "NEW_WALLETS", "ACCUMULATION",
+    "SMART_MONEY", "SMART_MONEY_LEADER", "STEALTH_ACCUMULATION", "THESIS",
+    "BREAKOUT_CONFIRMED", "FLOW", "HOTLINKS", "DISCOVERY", "WHALE"]);
+
+  // Build disqualified address set and story signal map in one pass
+  const disqualifiedAddresses = new Set([...heldAddresses]);
+  const storySignals = new Map(); // address → { types, conviction, summaries }
+
+  for (const s of allStories) {
+    const type = String(s?.story_type || s?.type || "").toUpperCase();
+    const addr = cleanAddress(s?.meta?.token_address || s?.primary_token || s?.address || "");
+    if (!type || !addr) continue;
+
+    if (disqualifierTypes.has(type)) {
+      if (type === "EXCHANGE_FLOW" && s?.meta?.direction !== "deposits") continue;
+      disqualifiedAddresses.add(addr);
+      continue;
+    }
+    if (!buySignalTypes.has(type)) continue;
+
+    if (!storySignals.has(addr)) storySignals.set(addr, { types: new Set(), conviction: 0, summaries: [] });
+    const sig = storySignals.get(addr);
+    sig.types.add(type);
+    sig.conviction = Math.max(sig.conviction, Number(s?.meta?.conviction_score || s?.conviction || 0));
+    const blurb = compactText(s?.title || s?.subtitle || "", 80);
+    if (blurb && sig.summaries.length < 2) sig.summaries.push(`${type}: ${blurb}`);
+  }
+
+  // Build market data lookup from active tokens
+  const marketByAddr = new Map();
+  for (const t of activeTokens) {
+    const addr = cleanAddress(t?.address || t?.contract_address || "");
+    if (!addr) continue;
+    marketByAddr.set(addr, {
+      symbol: String(t.symbol || "").toUpperCase(),
+      price_usd:       t.priceUSD ?? t.price_usd ?? null,
+      change_30m_pct:  t.changes?.["30M"]?.percent ?? t.change_30m_pct ?? null,
+      change_24h_pct:  t.changes?.["24H"]?.percent ?? t.change_24h_pct ?? null,
+      volume_24h_usd:  t.volume24hUSD ?? t.volume_24h_usd ?? null,
+      liquidity_usd:   t.effectiveLiquidityUSD || t.liquidityUSD || t.liquidity_usd || null,
+      market_cap_usd:  t.marketCapUSD ?? t.market_cap_usd ?? null
+    });
+  }
+
+  // Build candidate pool — E3D candidates first, then story signals
+  const pool = new Map(); // address → entry
+
+  for (const c of e3dCandidates) {
+    const addr = cleanAddress(c?.entity_address || c?.token_address || c?.address || c?.contract_address || "");
+    const sym  = String(c?.symbol || c?.token?.symbol || "").toUpperCase();
+    if (!addr || disqualifiedAddresses.has(addr) || heldAddresses.has(addr)) continue;
+    if (NONTRADEABLE_RE.test(sym)) continue;
+    const market = marketByAddr.get(addr) || {};
+    const storySig = storySignals.get(addr);
+    pool.set(addr, {
+      symbol:       sym || market.symbol || "",
+      address:      addr,
+      source:       "e3d_candidate",
+      signal_types: ["E3D_CANDIDATE", ...(storySig ? [...storySig.types] : [])],
+      conviction:   Math.max(Number(c?.conviction_score || c?.score || 65), storySig?.conviction || 0),
+      why_now:      compactText(c?.why_now || c?.rationale || c?.description || "", 120),
+      market,
+      drill_down:   ["token_info", "transactions"]
+    });
+  }
+
+  for (const [addr, sig] of storySignals.entries()) {
+    if (disqualifiedAddresses.has(addr) || heldAddresses.has(addr) || pool.has(addr)) continue;
+    const market = marketByAddr.get(addr) || {};
+    const sym = market.symbol || "";
+    if (NONTRADEABLE_RE.test(sym)) continue;
+    // Skip tokens that clearly fail a soft quality check (price known but zero, or tiny liquidity)
+    if ((market.price_usd ?? -1) === 0) continue;
+    if (toNum(market.liquidity_usd, -1) > 0 && toNum(market.liquidity_usd, 0) < 50000) continue;
+
+    const isMulti = sig.types.size >= 2;
+    pool.set(addr, {
+      symbol:       sym,
+      address:      addr,
+      source:       isMulti ? "multi_signal" : "single_signal",
+      signal_types: [...sig.types],
+      conviction:   sig.conviction,
+      why_now:      sig.summaries.join("; ") || [...sig.types].join(", "),
+      market,
+      drill_down:   toNum(market.liquidity_usd, 0) === 0 ? ["token_info"] : []
+    });
+  }
+
+  // Rank and cap
+  const sourceWeight = { e3d_candidate: 100, multi_signal: 50, single_signal: 10 };
+  const ranked = [...pool.values()]
+    .map(c => ({ ...c, _score: (sourceWeight[c.source] || 0) + c.conviction + (c.signal_types.length * 5) }))
+    .sort((a, b) => b._score - a._score)
+    .slice(0, COGNITIVE_STATE_MAX_CANDIDATES)
+    .map(({ _score, ...c }, i) => ({ rank: i + 1, ...c }));
+
+  log("cognitive_state_built", {
+    api_calls: 3, e3d_candidates: e3dCandidates.length, story_signals: storySignals.size,
+    disqualified: disqualifiedAddresses.size, output_candidates: ranked.length,
+    duration_ms: nowMs() - startMs
+  });
+
+  return { generated_at: nowIso(), candidates: ranked, meta: { e3d_candidates: e3dCandidates.length, story_signals: storySignals.size, api_calls: 3 } };
+}
+
+function callLLMWithTools(systemPrompt, userMessage, tools, toolExecutor, { agent = "unknown", maxRounds = MAX_TOOL_ROUNDS } = {}) {
+  const reqId = crypto.randomUUID();
+  const startMs = nowMs();
+  const messages = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: userMessage }
+  ];
+
+  log("llm_request", {
+    req_id: reqId, agent, model: LLM_MODEL, mode: "tool_calling",
+    tools: tools.map(t => t.function.name),
+    prompt_chars: systemPrompt.length + userMessage.length,
+    system_chars: systemPrompt.length, user_chars: userMessage.length
+  });
+
+  let totalPromptTokens = 0;
+  let totalCompletionTokens = 0;
+
+  for (let round = 0; round < maxRounds; round++) {
+    const bodyObj = { model: LLM_MODEL, messages, tools, tool_choice: "auto", max_tokens: 6000, temperature: 0 };
+    const roundId = `${reqId}-r${round}`;
+    const tmpFile = `/tmp/llm-req-${roundId}.json`;
+
+    const adapterPath = agent === "scout" ? SCOUT_ADAPTER_PATH : agent === "harvest" ? HARVEST_ADAPTER_PATH : null;
+    const curlArgs = ["-s", "-X", "POST", `${LLM_BASE_URL}/v1/chat/completions`,
+      "-H", "Content-Type: application/json", "-H", `X-Request-Id: ${roundId}`];
+    if (adapterPath) curlArgs.push("-H", `X-Adapter-Path: ${adapterPath}`);
+
+    let stdout;
+    try {
+      fs.writeFileSync(tmpFile, JSON.stringify(bodyObj));
+      stdout = execFileSync("curl", [...curlArgs, "--max-time", "1200", "-d", `@${tmpFile}`],
+        { encoding: "utf8", maxBuffer: 10 * 1024 * 1024, timeout: 1220000 });
+    } finally {
+      try { fs.unlinkSync(tmpFile); } catch (_) {}
+    }
+
+    let parsed;
+    try { parsed = JSON.parse(stdout); } catch (_) {
+      throw new Error(`LLM_JSON_PARSE_FAILED\n${stdout.slice(0, 500)}`);
+    }
+    if (parsed?.error) throw new Error(`LLM_SERVER_ERROR: ${JSON.stringify(parsed.error)}`);
+
+    totalPromptTokens += parsed?.usage?.prompt_tokens ?? 0;
+    totalCompletionTokens += parsed?.usage?.completion_tokens ?? 0;
+
+    const choice = parsed?.choices?.[0];
+    const finishReason = choice?.finish_reason;
+    const assistantMsg = choice?.message;
+
+    if (finishReason === "tool_calls" && Array.isArray(assistantMsg?.tool_calls)) {
+      messages.push({ role: "assistant", content: assistantMsg.content ?? null, tool_calls: assistantMsg.tool_calls });
+      for (const tc of assistantMsg.tool_calls) {
+        const toolName = tc?.function?.name;
+        let toolArgs = {};
+        try { toolArgs = JSON.parse(tc?.function?.arguments || "{}"); } catch (_) {}
+        log("llm_tool_call", { req_id: reqId, agent, round, tool: toolName, args: toolArgs });
+        const result = toolExecutor(toolName, toolArgs);
+        log("llm_tool_result", { req_id: reqId, agent, round, tool: toolName, chars: String(result).length });
+        messages.push({ role: "tool", tool_call_id: tc.id, content: String(result) });
+      }
+      continue;
+    }
+
+    // Final response — extract text content
+    let text = assistantMsg?.content;
+    if (Array.isArray(text)) text = text.map(c => c?.text ?? "").join("");
+    if (typeof text !== "string" || !text.trim()) {
+      throw new Error(`LLM_EMPTY_RESPONSE\n${stdout.slice(0, 500)}`);
+    }
+
+    const durationMs = nowMs() - startMs;
+    const meta = {
+      req_id: reqId, agent, mode: "tool_calling", duration_ms: durationMs,
+      tool_rounds: round + 1, output_chars: text.trim().length,
+      prompt_tokens: totalPromptTokens, completion_tokens: totalCompletionTokens,
+      total_tokens: totalPromptTokens + totalCompletionTokens, finish_reason: finishReason
+    };
+    log("llm_response", meta);
+    setLastLLMMeta(agent, meta);
+    return text.trim();
+  }
+
+  throw new Error(`LLM_MAX_TOOL_ROUNDS: exceeded ${maxRounds} rounds without final response`);
+}
+
 let _scoutCycleIndex = 0;
 
 function fetchScoutData() {
@@ -2793,15 +3270,30 @@ function fetchScoutData() {
   }
 
   // Filter universe to tokens with price-API story activity OR confirmed by the stories feed.
-  const tokenUniverseWithStories = tokenUniverse.filter(t =>
-    t.address && ((t.story_count_1h || 0) > 0 || storyTokenAddresses.has(t.address))
-  );
+  const tokenUniverseWithStories = [];
+  const tokenUniverseFilteredOut = [];
+  for (const token of tokenUniverse) {
+    const include = token.address && ((token.story_count_1h || 0) > 0 || storyTokenAddresses.has(token.address));
+    if (include) {
+      tokenUniverseWithStories.push(token);
+    } else {
+      tokenUniverseFilteredOut.push(token);
+    }
+  }
   log("scout_universe_filter", {
     before: tokenUniverse.length,
     after: tokenUniverseWithStories.length,
     by_story_count: tokenUniverse.filter(t => t.address && (t.story_count_1h || 0) > 0).length,
     by_story_api: tokenUniverseWithStories.filter(t => (t.story_count_1h || 0) === 0).length,
   });
+  for (const token of tokenUniverseFilteredOut.slice(0, 100)) {
+    log("scout_universe_filtered_token", {
+      symbol: token?.symbol || null,
+      contract_address: cleanAddress(token?.address || token?.contract_address || "") || null,
+      story_count_1h: toNum(token?.story_count_1h, 0),
+      reasons: buildScoutUniverseFilterReasons(token, storyTokenAddresses)
+    });
+  }
   // Replace the working universe with the filtered set.
   tokenUniverse.length = 0;
   tokenUniverseWithStories.forEach(t => tokenUniverse.push(t));
@@ -2818,14 +3310,19 @@ function fetchScoutData() {
   // These are tokens where multiple story types have converged — much stronger signal
   // than any single story type alone. Joined with thesis data when one exists.
   const e3dCandidatesRaw = endpointArray(fetchJson("/candidates", { status: "new,promoted", limit: 100 }));
-  const e3dCandidates = e3dCandidatesRaw.filter(c => {
-    const addr = cleanAddress(c?.entity_address || c?.token_address || c?.address || c?.contract_address || "");
-    if (!addr || /^0+$/.test(addr) || addr === "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee") return false;
-    const sym = String(c?.entity_symbol || c?.symbol || "");
-    if (nonTradeablePattern.test(sym)) return false;
-    if (/[\s#]/.test(sym)) return false; // NFT-style names (e.g. "BURN GHOST BOUNTY BOX #273")
-    return true;
-  });
+  const e3dCandidates = [];
+  for (const candidate of e3dCandidatesRaw) {
+    const decision = buildScoutE3dCandidateFilterDecision(candidate, nonTradeablePattern);
+    if (decision.keep) {
+      e3dCandidates.push(candidate);
+    } else {
+      log("scout_e3d_candidate_filtered", {
+        symbol: decision.symbol,
+        contract_address: decision.contract_address,
+        reasons: decision.reasons
+      });
+    }
+  }
   log("scout_e3d_candidates", { count: e3dCandidates.length, filtered_out: e3dCandidatesRaw.length - e3dCandidates.length });
 
   // Fetch structured investment theses — direction, conviction, price targets, invalidation.
@@ -2837,13 +3334,19 @@ function fetchScoutData() {
   // Filtered to type=token only; non-tradeable symbols excluded using the same pattern
   // as the token universe filter so stablecoins/wrapped assets don't leak through.
   const watchlistRaw = endpointArray(fetchJson("/watchlist"));
-  const e3dWatchlist = watchlistRaw.filter(item => {
-    if (item?.type !== "token") return false;
-    const addr = cleanAddress(item?.address || "");
-    if (!addr) return false;
-    if (/^0+$/.test(addr)) return false; // burn address (0x0000...0000) is not a real token
-    return !nonTradeablePattern.test(item?.label || "");
-  });
+  const e3dWatchlist = [];
+  for (const item of watchlistRaw) {
+    const decision = buildScoutWatchlistFilterDecision(item, nonTradeablePattern);
+    if (decision.keep) {
+      e3dWatchlist.push(item);
+    } else {
+      log("scout_watchlist_filtered", {
+        symbol: decision.symbol,
+        contract_address: decision.contract_address,
+        reasons: decision.reasons
+      });
+    }
+  }
   log("scout_watchlist", { total: watchlistRaw.length, filtered: e3dWatchlist.length });
 
   // Enrich universe with thesis tokens not already present. Theses cover tokens that have
@@ -3542,6 +4045,26 @@ function extractScoutEvidenceRefs(proposal) {
   return normalized;
 }
 
+function resolveScoutMaxCandidates(settings = SETTINGS_DEFAULTS) {
+  return Math.max(1, Math.trunc(toNum(settings?.scout_max_candidates, SETTINGS_DEFAULTS.scout_max_candidates)));
+}
+
+function resolveScoutEvidenceRefMinimum(entry = {}) {
+  const packetSummary = entry?.packet_summary && typeof entry.packet_summary === "object" ? entry.packet_summary : {};
+  const scoutInput = entry?.scout_input && typeof entry.scout_input === "object" ? entry.scout_input : {};
+  const flow = scoutInput?.flow && typeof scoutInput.flow === "object" ? scoutInput.flow : {};
+  const liquidityData = scoutInput?.liquidity_data && typeof scoutInput.liquidity_data === "object" ? scoutInput.liquidity_data : {};
+  const marketData = scoutInput?.market_data && typeof scoutInput.market_data === "object" ? scoutInput.market_data : {};
+
+  const isHighConfidenceFlowOnly =
+    packetSummary.flow_only === true
+    && String(flow?.flow_signal || "").trim().toLowerCase() === "strong_accumulation"
+    && toNum(liquidityData?.liquidity_usd, 0) >= 500000
+    && toNum(marketData?.market_cap_usd, 0) >= 5000000;
+
+  return isHighConfidenceFlowOnly ? 2 : 3;
+}
+
 function buildScoutEvidenceShortlist(data, portfolio, options = {}) {
   const createdAt = options.createdAt || nowIso();
   const heldAddresses = options.heldAddresses || new Set();
@@ -3827,7 +4350,127 @@ function parseScoutJSON(rawText) {
   }
 }
 
+function runScoutWithTools(portfolio, portfolioIntelligence = null) {
+  const createdAt = nowIso();
+  const expiresAt = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString();
+
+  const heldAddresses = new Set(
+    Object.values(portfolio?.positions || {}).map(p => cleanAddress(p?.contract_address || "")).filter(Boolean)
+  );
+  const heldSymbols = new Set(
+    Object.values(portfolio?.positions || {}).map(p => String(p?.symbol || "").trim().toLowerCase()).filter(Boolean)
+  );
+  const scoutMaxCandidates = resolveScoutMaxCandidates(portfolio?.settings || SETTINGS_DEFAULTS);
+  const macroContext = _cycleQuantContext?.macro;
+
+  // ── Step 1: Node.js perception layer builds compact cognitive state ──
+  // 3 targeted API calls → ranked candidates with evidence.
+  // Qwen sees only what matters, not a firehose of raw data.
+  const cognitiveState = buildCognitiveState(portfolio);
+  const stateJson = JSON.stringify(cognitiveState, null, 0);
+
+  // ── Step 2: Qwen reasons on the state, optionally drills down ──
+  const systemPrompt = [
+    "You are Scout, an elite crypto trading research agent for a quantitative hedge fund.",
+    "You have been given a pre-computed cognitive state: the top-ranked candidates with their signals and market data.",
+    "Return STRICT JSON only — one object, no markdown, no commentary.",
+    "",
+    "DECISION FLOW:",
+    "1. Review the cognitive_state candidates in order of rank.",
+    "2. For any candidate where drill_down is non-empty AND you need more evidence to decide, call the appropriate tool (max 3 tool calls total).",
+    "   - e3d_get_token_info(address): get current price, liquidity, volume for a specific token",
+    "   - e3d_get_transactions(address): check for whale moves or unusual activity",
+    "   - e3d_get_stories(type=...): fetch a specific story type not yet in the state",
+    "3. Once satisfied, return your final candidate list. Do NOT call tools if the state already contains enough evidence.",
+    "",
+    "SIGNAL PRIORITY:",
+    "1. source=e3d_candidate — highest conviction, already multi-signal correlated",
+    "2. source=multi_signal — 2+ independent signals on same token",
+    "3. THESIS conviction >= 65 — structured investment thesis",
+    "4. source=single_signal — only if signal is strong (SMART_MONEY, ACCUMULATION) and market data is clean",
+    `5. FLOW-ONLY (last resort): buy_sell_ratio_1h >= 3.5, liquidity > 150k, vol > 75k, mcap > 5M. Max ${SCOUT_FLOW_ONLY_PER_CYCLE_LIMIT}.`,
+    "",
+    "QUALITY GATE — required for ALL proposals: price_usd > 0, liquidity_usd > 100000, market_cap_usd > 2000000, volume_24h_usd > 10000.",
+    "SKIP: stablecoins, wrapped assets, change_7d_pct > 300% (already pumped), MOVER/SURGE alone.",
+    `SKIP ALREADY HELD: symbols=${JSON.stringify([...heldSymbols])}, addresses=${JSON.stringify([...heldAddresses])}`,
+    macroContext ? `MACRO: regime=${macroContext.regime} new_positions_ok=${macroContext.new_positions_ok} tighten_stops=${macroContext.tighten_stops}` : "",
+    macroContext?.new_positions_ok === false ? "MACRO GATE: only TIER 1 setups with conviction >= 80." : "",
+    "",
+    `Return up to ${scoutMaxCandidates} candidates. Prefer 0 over weak candidates.`,
+    `Output shape: {scan_timestamp, candidates[], holdings_updates:[], stories_checked[]}`,
+    `Each candidate: {source_agent:"scout", created_at:"${createdAt}", expires_at:"${expiresAt}", token:{symbol,name,chain:"ethereum",contract_address,category}, setup_type, action:"buy", confidence:integer(0-100), conviction_score:integer(0-100), opportunity_score:integer(0-100), why_now, evidence:["string"], risks:[], entry_zone:{low,high}, invalidation_price, targets:{target_1,target_2,target_3}, market_data:{current_price,change_24h_pct,change_30m_pct,price_source:"e3d",volume_24h_usd,market_cap_usd}, liquidity_data:{liquidity_usd,liquidity_source:"e3d"}, execution_data:{estimated_slippage_bps,quote_source:"e3d"}, portfolio_data:{current_token_exposure_pct:0,current_category_exposure_pct:0,current_total_exposure_pct:0}}`,
+    `evidence[] must contain 2-5 strings describing WHY this candidate qualifies (signal type, conviction, price action).`,
+    `stories_checked[]: list story types you examined — {type, found:bool, tokens:[]}. May be empty.`
+  ].filter(Boolean).join("\n");
+
+  const userMessage = [
+    `Scout task — ${createdAt}`,
+    `Portfolio: cash=$${portfolio?.cash_usd ?? 100000}, held=${Object.keys(portfolio?.positions || {}).length} positions`,
+    `Max candidates: ${scoutMaxCandidates}`,
+    ``,
+    `COGNITIVE STATE (${cognitiveState.candidates.length} pre-ranked candidates, ${cognitiveState.meta.api_calls} API calls made):`,
+    stateJson
+  ].join("\n");
+
+  const scoutLlmBatches = [];
+  let rawText;
+  try {
+    rawText = callLLMWithTools(systemPrompt, userMessage, E3D_AGENT_TOOLS, executeE3DTool,
+      { agent: "scout", maxRounds: DRILL_DOWN_MAX_ROUNDS });
+    const meta = getLastLLMMeta("scout") || {};
+    scoutLlmBatches.push({
+      prompt_chars: systemPrompt.length + userMessage.length,
+      prompt_tokens: meta.prompt_tokens, completion_tokens: meta.completion_tokens,
+      total_tokens: meta.total_tokens, duration_ms: meta.duration_ms, tool_rounds: meta.tool_rounds
+    });
+  } catch (err) {
+    const meta = getLastLLMMeta("scout") || {};
+    scoutLlmBatches.push({
+      prompt_chars: systemPrompt.length + userMessage.length,
+      prompt_tokens: meta.prompt_tokens, completion_tokens: meta.completion_tokens,
+      total_tokens: meta.total_tokens, duration_ms: meta.duration_ms
+    });
+    throw err;
+  }
+
+  const batchResult = parseScoutJSON(rawText);
+  const rawCandidates = Array.isArray(batchResult?.candidates) ? batchResult.candidates : [];
+  const unhelded = filterScoutCandidatesAgainstPortfolio(rawCandidates, portfolio);
+
+  const qualifiedCandidates = unhelded.filter(c => {
+    const addr = cleanAddress(c?.token?.contract_address || "");
+    if (!addr) { log("scout_tool_candidate_dropped", { reason: "no_address", symbol: c?.token?.symbol }); return false; }
+    const liq   = toNum(c?.liquidity_data?.liquidity_usd, 0);
+    const mcap  = toNum(c?.market_data?.market_cap_usd, 0);
+    const vol   = toNum(c?.market_data?.volume_24h_usd, 0);
+    const price = toNum(c?.market_data?.current_price, 0);
+    if (price <= 0 || liq < 100000 || mcap < 2000000 || vol < 10000) {
+      log("scout_tool_candidate_dropped", { reason: "quality_gate_failed", symbol: c?.token?.symbol, addr, liq, mcap, vol, price });
+      return false;
+    }
+    if (heldAddresses.has(addr)) { log("scout_tool_candidate_dropped", { reason: "already_held", addr }); return false; }
+    return true;
+  });
+
+  log("scout_tool_candidates", { raw: rawCandidates.length, after_held: unhelded.length, qualified: qualifiedCandidates.length });
+
+  return {
+    scan_timestamp: createdAt,
+    candidates: qualifiedCandidates,
+    holdings_updates: Array.isArray(batchResult?.holdings_updates) ? batchResult.holdings_updates : [],
+    stories_checked: Array.isArray(batchResult?.stories_checked) ? batchResult.stories_checked : [],
+    evidence_diagnostics: buildScoutEvidenceDiagnostics({
+      input_candidate_count: cognitiveState.candidates.length,
+      llm_batches: scoutLlmBatches,
+      candidates: qualifiedCandidates,
+      stories_checked: [],
+      coverage: null
+    })
+  };
+}
+
 function runScoutDirect(portfolio, portfolioIntelligence = null) {
+  if (TOOL_USE_ENABLED) return runScoutWithTools(portfolio, portfolioIntelligence);
   const createdAt = nowIso();
   const expiresAt = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString();
   const dossier = portfolioIntelligence || buildPortfolioIntelligenceDossier(portfolio);
@@ -3840,6 +4483,7 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
     Object.values(portfolio?.positions || {})
       .map((p) => String(p?.symbol || "").trim().toLowerCase()).filter(Boolean)
   );
+  const scoutMaxCandidates = resolveScoutMaxCandidates(portfolio?.settings || SETTINGS_DEFAULTS);
 
   // Pre-fetch all E3D data
   const data = fetchScoutData();
@@ -4050,7 +4694,7 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
       "Return STRICT JSON only: one object, no markdown, no commentary.",
       "Use only supplied evidence packets, tokens, contract addresses, evidence_packet_id values, and evidence_id values.",
       "Do not invent evidence. Do not cite evidence from a different packet. Do not propose a token that is not in the packets.",
-      "Return up to 3 buy candidates. Prefer 0 candidates over a weak candidate.",
+      `Return up to ${scoutMaxCandidates} buy candidates. Prefer 0 candidates over a weak candidate.`,
       `Output shape: {scan_timestamp, candidates[], holdings_updates[], stories_checked[]}`,
       `Each candidate: {source_agent:"scout"|"user_watchlist", created_at:"${createdAt}", expires_at:"${expiresAt}", evidence_packet_id, token:{symbol,name,chain:"ethereum",contract_address,category}, setup_type, action:"buy", confidence:integer(0-100), conviction_score:integer(0-100), opportunity_score:integer(0-100), why_now, evidence:["evi_..."], risks[], entry_zone:{low,high}, invalidation_price, targets:{target_1,target_2,target_3}, market_data:{current_price,change_24h_pct,change_30m_pct,price_source,volume_24h_usd,market_cap_usd}, liquidity_data:{liquidity_usd,liquidity_source}, execution_data:{estimated_slippage_bps,quote_source}, portfolio_data:{current_token_exposure_pct:0,current_category_exposure_pct:0,current_total_exposure_pct:0}}`,
       "evidence[] must contain 3 to 5 evidence_id strings copied exactly from that candidate packet.",
@@ -4091,29 +4735,77 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
 
       const batchResult = parseScoutJSON(batchRaw);
       const shortlistMap = new Map(shortlistBuild.shortlist.map((entry) => [entry.address, entry]));
+      const shortlistBySymbol = new Map();
+      for (const entry of shortlistBuild.shortlist) {
+        const sym = String(entry.symbol || "").trim().toLowerCase();
+        if (!sym) continue;
+        if (!shortlistBySymbol.has(sym)) shortlistBySymbol.set(sym, []);
+        shortlistBySymbol.get(sym).push(entry);
+      }
       const validatedCandidates = [];
       const seenCandidateAddresses = new Set();
+      let addressRepairsInCycle = 0;
       for (const proposal of (Array.isArray(batchResult?.candidates) ? batchResult.candidates : [])) {
-        const addr = cleanAddress(proposal?.token?.contract_address || "");
-        if (!addr || seenCandidateAddresses.has(addr)) continue;
-        const shortlistEntry = shortlistMap.get(addr);
+        const proposalAddr = cleanAddress(proposal?.token?.contract_address || "");
+        const proposalSymbol = String(proposal?.token?.symbol || "").trim().toLowerCase();
+        if (!proposalAddr) continue;
+
+        let shortlistEntry = shortlistMap.get(proposalAddr) || null;
+        let resolutionMethod = shortlistEntry ? "exact" : null;
+
+        // LLM sometimes truncates/extends contract addresses. If the proposal addr
+        // is a unique prefix (or extension) of a canonical shortlist addr, repair.
+        if (!shortlistEntry && proposalAddr.length >= 12 && proposalAddr.length !== 42) {
+          const prefixMatches = shortlistBuild.shortlist.filter((entry) =>
+            entry.address.startsWith(proposalAddr) || proposalAddr.startsWith(entry.address)
+          );
+          if (prefixMatches.length === 1) {
+            shortlistEntry = prefixMatches[0];
+            resolutionMethod = "address_prefix";
+          }
+        }
+
+        // Last resort: unambiguous symbol match.
+        if (!shortlistEntry && proposalSymbol) {
+          const symMatches = shortlistBySymbol.get(proposalSymbol) || [];
+          if (symMatches.length === 1) {
+            shortlistEntry = symMatches[0];
+            resolutionMethod = "symbol";
+          }
+        }
+
         if (!shortlistEntry) {
           log("scout_candidate_downgraded", {
             reason: "candidate_not_in_evidence_shortlist",
-            contract_address: addr,
+            contract_address: proposalAddr,
             symbol: proposal?.token?.symbol || null
           });
           continue;
         }
+
+        const addr = shortlistEntry.address;
+        if (seenCandidateAddresses.has(addr)) continue;
+
+        if (resolutionMethod !== "exact") {
+          addressRepairsInCycle += 1;
+          log("scout_candidate_address_repaired", {
+            method: resolutionMethod,
+            proposal_address: proposalAddr,
+            canonical_address: addr,
+            symbol: shortlistEntry.symbol
+          });
+        }
         const validEvidenceIds = new Set(shortlistEntry.packet_summary.evidence_ids);
         const validRefs = extractScoutEvidenceRefs(proposal).filter((ref) => validEvidenceIds.has(ref));
-        if (validRefs.length < 3) {
+        const minEvidenceRefs = resolveScoutEvidenceRefMinimum(shortlistEntry);
+        if (validRefs.length < minEvidenceRefs) {
           log("scout_candidate_downgraded", {
             reason: "too_few_valid_evidence_refs",
             contract_address: addr,
             symbol: shortlistEntry.symbol,
             evidence_packet_id: shortlistEntry.packet.evidence_packet_id,
-            valid_ref_count: validRefs.length
+            valid_ref_count: validRefs.length,
+            min_required_refs: minEvidenceRefs
           });
           continue;
         }
@@ -4167,7 +4859,7 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
       validatedCandidates.sort((a, b) => (b.conviction_score ?? 0) - (a.conviction_score ?? 0));
       const result = {
         scan_timestamp: new Date().toISOString(),
-        candidates: validatedCandidates.slice(0, 3),
+        candidates: validatedCandidates.slice(0, scoutMaxCandidates),
         holdings_updates: Array.isArray(batchResult?.holdings_updates) ? batchResult.holdings_updates : [],
         stories_checked: Array.isArray(batchResult?.stories_checked) ? batchResult.stories_checked : []
       };
@@ -4268,6 +4960,7 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
       result.evidence_diagnostics = buildScoutEvidenceDiagnostics({
         input_candidate_count: shortlistBuild.entries.length,
         llm_batches: scoutLlmBatches,
+        address_repairs_in_cycle: addressRepairsInCycle,
         candidates: result.candidates,
         stories_checked: result.stories_checked,
         coverage: null
@@ -4318,7 +5011,7 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
     "TIER 1 (full size, highest conviction): E3D candidate or thesis (conviction >= 65) + flow_signal=accumulation or strong_accumulation + funding=neutral or squeeze_potential.",
     "TIER 2 (standard size): Story signal (ACCUMULATION/SMART_MONEY/SMART_MONEY_LEADER/THESIS/BREAKOUT_CONFIRMED) with in_token_universe=true + liquidity_usd > 200000 + volume_24h_usd > 50000.",
     "TIER 3 (small size, max 1 per cycle): Signal-backed setup (story or thesis) with good conviction but below TIER 2 liquidity/volume thresholds. NEVER use TIER 3 for pure flow-only entries.",
-    "FLOW-ONLY ENTRY (only when E3D AGENT CANDIDATES shows 'none currently' AND E3D THESES shows 'none currently' AND zero buy-signal stories have in_token_universe=true): require ALL of — buy_sell_ratio_1h >= 3.5, liquidity_usd > 150000, volume_24h_usd > 75000, market_cap_usd > 5000000. Maximum 1 candidate. If any threshold is not met, return 0 candidates — do NOT force an entry.",
+    `FLOW-ONLY ENTRY (only when E3D AGENT CANDIDATES shows 'none currently' AND E3D THESES shows 'none currently' AND zero buy-signal stories have in_token_universe=true): require ALL of — buy_sell_ratio_1h >= 3.5, liquidity_usd > 150000, volume_24h_usd > 75000, market_cap_usd > 5000000. Maximum ${SCOUT_FLOW_ONLY_PER_CYCLE_LIMIT} candidate${SCOUT_FLOW_ONLY_PER_CYCLE_LIMIT === 1 ? "" : "s"}. If any threshold is not met, return 0 candidates — do NOT force an entry.`,
     "SKIP: flow_signal=distribution or strong_distribution. funding_signal=overcrowded_long. market_cap_usd < 2000000 (cannot size or exit safely). price_usd = 0 or volume_24h_usd = 0.",
     "MACRO GATE: If new_positions_ok=false, only propose TIER 1 setups with conviction >= 80.",
     "",
@@ -4327,7 +5020,7 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
     "2. NEVER propose stablecoins, gold tokens, or wrapped/base assets (already filtered from TOKEN UNIVERSE).",
     "3. Stories show ON-CHAIN SIGNALS. A story's subject may be a wallet, LP, or contract — only use as a candidate if in_token_universe=true AND quality gate is met.",
     "4. THESIS EXCEPTION: If a thesis has direction=LONG and conviction >= 65, propose it even when in_token_universe=false, provided the thesis includes a price. Quality gate still applies to whatever market data is available.",
-    "5. Return up to 3 candidates. 1 strong candidate is better than 3 weak ones. Returning 0 candidates is correct when nothing genuinely meets the bar — the pipeline will survive a skipped cycle; a bad entry will not.",
+    `5. Return up to ${scoutMaxCandidates} candidates. 1 strong candidate is better than ${scoutMaxCandidates} weak ones. Returning 0 candidates is correct when nothing genuinely meets the bar — the pipeline will survive a skipped cycle; a bad entry will not.`,
     "6. Exclude addresses in DISQUALIFIERS and already-held: " + `symbols=${JSON.stringify([...heldSymbols])} addresses=${JSON.stringify([...heldAddresses])}`,
     "",
     `Output shape: {scan_timestamp, candidates[], holdings_updates[], stories_checked[]}`,
@@ -4573,7 +5266,7 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
       const qualifiedFlow = accum.filter(t => (t.buy_sell_ratio_1h||0) >= 3.5 && (t.liquidity_usd||0) > 150000 && (t.volume_24h_usd||0) > 75000 && (t.market_cap_usd||0) > 5000000);
       return `Flow coverage: ${withFlow.length}/${data.tokenUniverse.length} tokens have DexScreener data. Accumulation signals: ${accum.length} tokens. Distribution signals: ${distrib.length} tokens.` +
         (accum.length ? `\nAccumulation tokens (buy_sell_ratio_1h): ${accum.slice(0, 8).map(t => `${t.symbol}(${t.flow_signal},ratio=${t.buy_sell_ratio_1h},liq=$${(t.liquidity_usd||0).toFixed(0)},mcap=$${((t.market_cap_usd||0)/1e6).toFixed(1)}M,vol24=$${((t.volume_24h_usd||0)/1e3).toFixed(0)}k)`).join(", ")}` : "") +
-        `\nFLOW-ONLY eligible (ratio>=3.5, liq>$150k, vol24>$75k, mcap>$5M): ${qualifiedFlow.length} tokens${qualifiedFlow.length ? " — " + qualifiedFlow.map(t => t.symbol).join(", ") : ""}. Use ONLY when E3D candidates AND theses are both empty. Max 1 pick.`;
+        `\nFLOW-ONLY eligible (ratio>=3.5, liq>$150k, vol24>$75k, mcap>$5M): ${qualifiedFlow.length} tokens${qualifiedFlow.length ? " — " + qualifiedFlow.map(t => t.symbol).join(", ") : ""}. Use ONLY when E3D candidates AND theses are both empty. Max ${SCOUT_FLOW_ONLY_PER_CYCLE_LIMIT} pick${SCOUT_FLOW_ONLY_PER_CYCLE_LIMIT === 1 ? "" : "s"}.`;
     })(),
     JSON.stringify(data.tokenUniverse.slice(0, 100)),
   ];
@@ -4661,12 +5354,12 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
     }
   }
 
-  // Best candidates across all batches, capped at 3
+  // Best candidates across all batches, capped by settings.scout_max_candidates
   allScoutCandidates.sort((a, b) => (b.conviction_score ?? 0) - (a.conviction_score ?? 0));
 
   let result = {
     scan_timestamp: new Date().toISOString(),
-    candidates: allScoutCandidates.slice(0, 3),
+    candidates: allScoutCandidates.slice(0, scoutMaxCandidates),
     holdings_updates: [],
     stories_checked: mergedStoriesChecked || [],
   };
@@ -4846,6 +5539,7 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
   result.evidence_diagnostics = buildScoutEvidenceDiagnostics({
     input_candidate_count: data.e3dCandidates.length,
     llm_batches: scoutLlmBatches,
+    address_repairs_in_cycle: 0,
     candidates: result.candidates,
     stories_checked: result.stories_checked,
     coverage: null
@@ -4855,6 +5549,7 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
 }
 
 function runHarvestDirect(portfolio, portfolioIntelligence = null) {
+  if (TOOL_USE_ENABLED) return runHarvestWithTools(portfolio, portfolioIntelligence);
   const createdAt = nowIso();
   const expiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString();
   const reviewContext = buildHarvestEvidenceReviewContext(portfolio, portfolioIntelligence, { createdAt });
@@ -4997,6 +5692,168 @@ function runHarvestDirect(portfolio, portfolioIntelligence = null) {
       throw new Error(`HARVEST_REPLY_NOT_JSON\n${rawText.slice(0, 500)}`);
     }
   }
+}
+
+function runHarvestWithTools(portfolio, portfolioIntelligence = null) {
+  const createdAt = nowIso();
+  const expiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString();
+
+  const positions = Object.values(portfolio?.positions || {});
+  if (positions.length === 0) {
+    const emptyResult = {
+      scan_timestamp: createdAt,
+      portfolio_summary: { market_regime: "unknown", cash_usd: portfolio.cash_usd || 0, equity_usd: portfolio.equity_usd || 0, position_count: 0, tracked_positions: 0, average_thesis_strength: 0, average_thesis_freshness: 0, average_narrative_decay: 0, average_opportunity_score: 0 },
+      position_reviews: [], exit_candidates: [], stories_checked: []
+    };
+    emptyResult.evidence_diagnostics = buildHarvestEvidenceDiagnostics({ input_candidate_count: 0, llm_batches: [], positions_reviewed: 0, position_reviews: [], exit_candidates: [], stories_checked: [], coverage: null });
+    return emptyResult;
+  }
+
+  const positionList = positions.map(p => ({
+    symbol: p.symbol, contract_address: p.contract_address, category: p.category,
+    quantity: p.quantity, avg_entry_price: p.avg_entry_price,
+    current_price: p.current_price, market_value_usd: p.market_value_usd,
+    cost_basis_usd: p.cost_basis_usd,
+    unrealized_pnl_usd: toNum(p.market_value_usd, 0) - toNum(p.cost_basis_usd, 0),
+    unrealized_pnl_pct: toNum(p.cost_basis_usd, 0) > 0
+      ? (((toNum(p.market_value_usd, 0) - toNum(p.cost_basis_usd, 0)) / toNum(p.cost_basis_usd, 0)) * 100)
+      : 0,
+    opened_at: p.opened_at
+  }));
+
+  const macroContext = _cycleQuantContext?.macro;
+  const macroLine = macroContext
+    ? `MACRO: regime=${macroContext.regime} tighten_stops=${macroContext.tighten_stops} new_positions_ok=${macroContext.new_positions_ok}`
+    : "";
+  const policyLine = _cycleRegimePolicy
+    ? `REGIME POLICY: allow_harvest_exits=${_cycleRegimePolicy.allow_harvest_exits} reason_codes=${(_cycleRegimePolicy.reason_codes || []).join(",")}`
+    : "";
+
+  const systemPrompt = [
+    "You are Harvest, a crypto portfolio exit-scan agent for a quantitative hedge fund.",
+    "Use the provided tools to research each held position, then return STRICT JSON only — one object, no markdown, no commentary.",
+    "",
+    "RESEARCH STRATEGY:",
+    "1. Call e3d_get_stories to find any stories about your held tokens (check by contract_address).",
+    "2. Call e3d_get_token_info(address) for positions with large unrealized P&L or high risk.",
+    "3. Call e3d_get_transactions(address) to check for whale exits or unusual activity on any concerning position.",
+    "You do NOT need to call tools for every position. Prioritize positions with: large loss (pnl_pct < -8%), large gain (pnl_pct > 25%), or high category risk.",
+    "You MUST classify ALL held positions — never skip one.",
+    "",
+    "EXIT SIGNALS (lean toward trim or exit):",
+    "- TREASURY_DISTRIBUTION story: team wallet moving to exchange — immediate sell pressure.",
+    "- SECURITY_RISK with is_honeypot=true: cannot be sold — emergency exit at any price.",
+    "- MOVER/SURGE story on a declining position: pump is over, now in dump phase.",
+    "- flow_signal=strong_distribution: bearish order flow.",
+    "- unrealized_pnl_pct < -8% with thesis failing or no supporting story.",
+    "- change_7d_pct > 200% AND position is now declining: entered a late pump, exit.",
+    "",
+    "HOLD SIGNALS:",
+    "- STAGING, CLUSTER, ACCUMULATION, SMART_MONEY, FUNNEL: fresh accumulation, thesis intact.",
+    "- SMART_MONEY_LEADER with late_crowding=false: strong hold signal.",
+    "- flow_signal=accumulation or strong_accumulation: bullish order flow.",
+    "- unrealized_pnl_pct > 25%: consider partial profit-taking (action=trim) unless Tier 1 conviction.",
+    "",
+    "MASS EXIT RULE: Do not propose trim/exit for more than half the portfolio in one cycle unless you have direct exit-risk story evidence (LIQUIDITY_DRAIN, RUG_LIQUIDITY_PULL, TREASURY_DISTRIBUTION, SECURITY_RISK).",
+    "EVIDENCE RULE: Every trim/exit MUST have at least 2 reasons in evidence[]. If you cannot find 2 reasons, use action=monitor instead.",
+    macroLine, policyLine,
+    "",
+    `Output shape: {scan_timestamp, portfolio_summary, position_reviews[], exit_candidates[], stories_checked[]}`,
+    `Each position_review: {source_agent:"harvest", created_at:"${createdAt}", expires_at:"${expiresAt}", token:{symbol,name,chain:"ethereum",contract_address,category}, position:{quantity,avg_entry_price,current_price,market_value_usd,cost_basis_usd,unrealized_pnl_usd,unrealized_pnl_pct}, action:"hold"|"monitor"|"trim"|"exit", thesis_state, thesis_summary, what_changed, why_now, confidence:integer(0-100), conviction_score:integer(0-100), opportunity_score:integer(0-100), review_priority, summary, evidence:["string"], risks:[], what_would_change_my_mind:[], next_best_alternative, current_regime, market_data:{current_price,change_24h_pct,price_source}, liquidity_data:{liquidity_usd,liquidity_source}, narrative_data:{story_strength,thesis_health,flow_direction}, portfolio_data:{current_token_exposure_pct,current_category_exposure_pct,current_total_exposure_pct,portfolio_timestamp,portfolio_source:"system"}}`,
+    `Each exit_candidate: same as position_review plus {setup_type, edge_source, suggested_exit_fraction, target_exit_price, decision_price, exit_priority}. evidence[] must contain 2-4 reason strings.`,
+    `portfolio_summary: {market_regime, cash_usd, equity_usd, position_count, tracked_positions, average_thesis_strength, average_thesis_freshness, average_narrative_decay, average_opportunity_score}`,
+    `stories_checked[] may be [].`
+  ].filter(Boolean).join("\n");
+
+  const userMessage = [
+    `Harvest task — ${createdAt}`,
+    `Held positions (${positions.length}):`,
+    JSON.stringify(positionList),
+    `Cash: $${toNum(portfolio.cash_usd, 0).toFixed(2)}`,
+    `Use your tools to research each position, then return your hold/exit decisions for all ${positions.length} positions.`
+  ].join("\n");
+
+  const harvestLlmBatches = [];
+  let rawText;
+  try {
+    rawText = callLLMWithTools(systemPrompt, userMessage, E3D_AGENT_TOOLS, executeE3DTool, { agent: "harvest" });
+    const meta = getLastLLMMeta("harvest") || {};
+    harvestLlmBatches.push({
+      prompt_chars: systemPrompt.length + userMessage.length,
+      prompt_tokens: meta.prompt_tokens, completion_tokens: meta.completion_tokens,
+      total_tokens: meta.total_tokens, duration_ms: meta.duration_ms, tool_rounds: meta.tool_rounds
+    });
+  } catch (err) {
+    const meta = getLastLLMMeta("harvest") || {};
+    harvestLlmBatches.push({
+      prompt_chars: systemPrompt.length + userMessage.length,
+      prompt_tokens: meta.prompt_tokens, completion_tokens: meta.completion_tokens,
+      total_tokens: meta.total_tokens, duration_ms: meta.duration_ms
+    });
+    throw err;
+  }
+
+  // Parse JSON — same repair approach as the standard harvest path
+  let jsonStr = rawText.trim();
+  const fenceMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fenceMatch) jsonStr = fenceMatch[1].trim();
+  const firstBrace = jsonStr.indexOf("{");
+  if (firstBrace !== -1) {
+    let depth = 0, end = -1;
+    for (let i = firstBrace; i < jsonStr.length; i++) {
+      if (jsonStr[i] === "{") depth++;
+      else if (jsonStr[i] === "}") { depth--; if (depth === 0) { end = i; break; } }
+    }
+    jsonStr = end !== -1 ? jsonStr.slice(firstBrace, end + 1) : jsonStr.slice(firstBrace);
+  }
+
+  let parsed = {};
+  try { parsed = JSON.parse(jsonStr); } catch (_) {
+    try { parsed = JSON.parse(repairTruncatedJson(jsonStr)); } catch (_2) {}
+  }
+
+  const positionReviews = Array.isArray(parsed?.position_reviews) ? parsed.position_reviews : [];
+  const exitCandidates = Array.isArray(parsed?.exit_candidates) ? parsed.exit_candidates : [];
+
+  // Enforce evidence rule: downgrade trim/exit with fewer than 2 evidence strings
+  const normalizedReviews = positionReviews.map(r => {
+    const action = String(r?.action || "monitor").toLowerCase();
+    if (["trim", "exit"].includes(action)) {
+      const evCount = Array.isArray(r.evidence) ? r.evidence.filter(e => typeof e === "string" && e.trim()).length : 0;
+      if (evCount < 2) {
+        log("harvest_tool_candidate_downgraded", { reason: "too_few_evidence_strings", symbol: r?.token?.symbol, ev_count: evCount });
+        return { ...r, action: "monitor" };
+      }
+    }
+    return r;
+  });
+
+  const result = {
+    scan_timestamp: createdAt,
+    portfolio_summary: parsed?.portfolio_summary ?? {
+      market_regime: macroContext?.regime || "unknown",
+      cash_usd: toNum(portfolio.cash_usd, 0), equity_usd: toNum(portfolio.equity_usd, 0),
+      position_count: positions.length, tracked_positions: positions.length,
+      average_thesis_strength: 0, average_thesis_freshness: 0,
+      average_narrative_decay: 0, average_opportunity_score: 0
+    },
+    position_reviews: normalizedReviews,
+    exit_candidates: exitCandidates.filter(ec => {
+      const rev = normalizedReviews.find(r => cleanAddress(r?.token?.contract_address || "") === cleanAddress(ec?.token?.contract_address || ""));
+      return !rev || ["trim", "exit"].includes(String(rev.action || "").toLowerCase());
+    }),
+    stories_checked: Array.isArray(parsed?.stories_checked) ? parsed.stories_checked : []
+  };
+  result.evidence_diagnostics = buildHarvestEvidenceDiagnostics({
+    input_candidate_count: positions.length,
+    llm_batches: harvestLlmBatches,
+    positions_reviewed: normalizedReviews.length,
+    position_reviews: normalizedReviews,
+    exit_candidates: result.exit_candidates,
+    stories_checked: [],
+    coverage: null
+  });
+  return result;
 }
 
 function buildScoutPrompt(portfolio, portfolioIntelligence = null) {
@@ -5152,18 +6009,91 @@ Required response shape:
   return taskPrompt.trim();
 }
 
-function setCooldown(portfolio, symbol) {
-  const hours = portfolio.settings.cooldown_hours_after_exit;
+function normalizeCooldownExitReason(exitReason) {
+  const text = String(exitReason || "").trim().toLowerCase();
+  const root = text.split(":")[0];
+  if (!root) return "unknown";
+  if (/^target(?:_\d+)?$/.test(root)) return "target_hit";
+  if (root === "target_hit" || root === "partial_target") return root;
+  if (root.startsWith("rotation_out")) return "rotation_out";
+  if (root.includes("take_profit")) return "harvest_take_profit";
+  if (root === "time_stop" || root === "thesis_decay") return root;
+  if (root === "stop_loss") return root;
+  if (root.startsWith("fraud_risk")) return root;
+  if (root === "liquidity_drain" || root === "wash_trade" || root === "momentum_breakdown") return root;
+  return root;
+}
+
+function resolveCooldownHoursForExitReason(exitReason, defaultHours = SETTINGS_DEFAULTS.cooldown_hours_after_exit) {
+  const reason = normalizeCooldownExitReason(exitReason);
+  if (
+    reason === "stop_loss"
+    || reason === "liquidity_drain"
+    || reason === "wash_trade"
+    || reason === "momentum_breakdown"
+    || reason.startsWith("fraud_risk")
+  ) {
+    return defaultHours;
+  }
+  if (
+    reason === "target_hit"
+    || reason === "partial_target"
+    || reason === "rotation_out"
+    || reason === "harvest_take_profit"
+  ) {
+    return defaultHours / 4;
+  }
+  return defaultHours / 2;
+}
+
+function normalizeCooldownEntry(entry) {
+  if (typeof entry === "string") {
+    return {
+      until: entry,
+      reason: "legacy"
+    };
+  }
+  if (!entry || typeof entry !== "object") return null;
+  const until = typeof entry.until === "string" ? entry.until : "";
+  if (!until) return null;
+  return {
+    until,
+    reason: typeof entry.reason === "string" && entry.reason.trim() ? entry.reason.trim() : "legacy"
+  };
+}
+
+function normalizePortfolioCooldowns(cooldowns) {
+  const normalized = {};
+  for (const [symbol, entry] of Object.entries(cooldowns || {})) {
+    const normalizedEntry = normalizeCooldownEntry(entry);
+    if (normalizedEntry) normalized[symbol] = normalizedEntry;
+  }
+  return normalized;
+}
+
+function setCooldown(portfolio, symbol, exitReason) {
+  portfolio.cooldowns = normalizePortfolioCooldowns(portfolio.cooldowns || {});
+  const hours = resolveCooldownHoursForExitReason(exitReason, portfolio.settings.cooldown_hours_after_exit);
   const until = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
-  portfolio.cooldowns[symbol] = until;
+  portfolio.cooldowns[symbol] = {
+    until,
+    reason: normalizeCooldownExitReason(exitReason)
+  };
 }
 
 function pruneCooldowns(portfolio) {
   const now = nowMs();
-  for (const [symbol, until] of Object.entries(portfolio.cooldowns || {})) {
-    if (new Date(until).getTime() <= now) {
+  for (const [symbol, entry] of Object.entries(portfolio.cooldowns || {})) {
+    const normalizedEntry = normalizeCooldownEntry(entry);
+    if (!normalizedEntry) {
       delete portfolio.cooldowns[symbol];
+      continue;
     }
+    if (new Date(normalizedEntry.until).getTime() <= now) {
+      delete portfolio.cooldowns[symbol];
+      continue;
+    }
+    portfolio.cooldowns[symbol] = normalizedEntry;
   }
 }
 
@@ -5483,7 +6413,9 @@ function buildPositionSizingDecision(action, portfolio, tradeKind = "buy") {
 
   const regimeMultiplier = policy.regime === "risk_on" ? 1.05 : policy.regime === "risk_off" ? 0.4 : 0.85;
   const liquidityMultiplier = liquidity <= 0 ? 0.75 : liquidity < 100000 ? 0.65 : 1;
-  const performanceMultiplier = policy.reason_codes?.includes("high_win_rate_negative_expectancy") || policy.reason_codes?.includes("negative_recent_profit_factor") ? 0.65 : 1;
+  const performanceMultiplier = policy.reason_codes?.includes("negative_recent_profit_factor")
+    ? computeRecentPerformanceThrottleMultiplier(policy?.recent_performance?.profit_factor)
+    : 1;
   const drawdownMultiplier = drawdown > 0.05 ? 0.7 : drawdown > 0.03 ? 0.85 : 1;
   const totalMultiplier = Math.min(1, regimeMultiplier * liquidityMultiplier * performanceMultiplier * drawdownMultiplier);
 
@@ -5585,32 +6517,48 @@ function buildPaperTradeTicket(candidate, allocationUsd, review, reason) {
 
 function buildPaperFillExecution(trade) {
   const side = String(trade?.side || "").toLowerCase() === "sell" ? "sell" : "buy";
-  const price = toNum(trade?.price, 0);
+  const settings = trade?.settings || SETTINGS_DEFAULTS;
+  const quotedPrice = toNum(trade?.quoted_price, toNum(trade?.price, 0));
+  const defaultSlippageBps = side === "sell" ? 75 : 50;
+  const slippageBps = Math.max(0, toNum(
+    trade?.slippage_bps_applied,
+    toNum(trade?.execution_data?.estimated_slippage_bps, defaultSlippageBps)
+  ));
+  const feeBps = Math.max(0, toNum(trade?.fee_bps_applied, toNum(settings?.fee_bps_per_side, SETTINGS_DEFAULTS.fee_bps_per_side)));
+  const fillPrice = quotedPrice > 0
+    ? quotedPrice * (side === "sell" ? (1 - slippageBps / 10000) : (1 + slippageBps / 10000))
+    : 0;
   const requestedNotional = side === "sell"
-    ? toNum(trade?.proceeds_usd, toNum(trade?.quantity, 0) * price)
-    : toNum(trade?.cost_usd, toNum(trade?.paper_trade_ticket?.allocation_usd, toNum(trade?.quantity, 0) * price));
-  const quantity = toNum(trade?.quantity, price > 0 ? requestedNotional / price : 0);
+    ? toNum(trade?.gross_proceeds_usd, toNum(trade?.proceeds_usd, toNum(trade?.quantity, 0) * quotedPrice))
+    : toNum(trade?.cost_usd, toNum(trade?.paper_trade_ticket?.allocation_usd, toNum(trade?.quantity, 0) * quotedPrice));
+  const requestedQuantity = toNum(trade?.quantity, quotedPrice > 0 ? requestedNotional / quotedPrice : 0);
+  const quantity = side === "sell"
+    ? requestedQuantity
+    : toNum(trade?.quantity, fillPrice > 0 ? requestedNotional / fillPrice : 0);
+  const filledNotionalUsd = side === "sell" ? quantity * fillPrice : requestedNotional;
+  const feeUsd = filledNotionalUsd * feeBps / 10000;
+  const slippageUsd = Math.abs(quantity * (fillPrice - quotedPrice));
 
   const execution = {
     model_version: PAPER_FILL_MODEL_VERSION,
     decision: "filled",
     rejection_reason: null,
     side,
-    arrival_price: price,
-    decision_price: price,
-    quote_price: price,
-    simulated_fill_price: price,
-    fill_price: price,
+    arrival_price: quotedPrice,
+    decision_price: quotedPrice,
+    quote_price: quotedPrice,
+    simulated_fill_price: fillPrice,
+    fill_price: fillPrice,
     requested_notional_usd: requestedNotional,
-    requested_quantity: quantity,
-    filled_notional_usd: requestedNotional,
+    requested_quantity: requestedQuantity,
+    filled_notional_usd: filledNotionalUsd,
     quantity,
     fill_ratio: 1,
     rejection_ratio: 0,
-    fee_bps: 0,
-    slippage_bps: 0,
-    fee_usd: 0,
-    slippage_usd: 0,
+    fee_bps: feeBps,
+    slippage_bps: slippageBps,
+    fee_usd: feeUsd,
+    slippage_usd: slippageUsd,
     time_to_fill_ms: 0
   };
   const executionControl = buildLiquidityExecutionControls(trade, execution, {
@@ -5815,7 +6763,16 @@ function executeSell(portfolio, action) {
   const qty = pos.quantity * fraction;
   if (!(qty > 0)) return null;
 
-  const proceeds = qty * pos.current_price;
+  const execution = buildPaperFillExecution({
+    side: "sell",
+    price: pos.current_price,
+    quoted_price: pos.current_price,
+    quantity: qty,
+    execution_data: action?.execution_data || pos?.last_market_snapshot?.execution_data || null,
+    settings: portfolio?.settings || SETTINGS_DEFAULTS
+  });
+  const grossProceeds = toNum(execution?.filled_notional_usd, qty * pos.current_price);
+  const proceeds = Math.max(0, grossProceeds - toNum(execution?.fee_usd, 0));
   const costPortion = pos.cost_basis_usd * fraction;
   const pnl = proceeds - costPortion;
 
@@ -5834,7 +6791,15 @@ function executeSell(portfolio, action) {
     reason: action.reason,
     quantity: qty,
     price: pos.current_price,
+    quoted_price: toNum(execution?.quote_price, pos.current_price),
+    fill_price: toNum(execution?.fill_price, pos.current_price),
+    slippage_bps_applied: toNum(execution?.slippage_bps, 0),
+    fee_bps_applied: toNum(execution?.fee_bps, 0),
+    fee_usd: toNum(execution?.fee_usd, 0),
+    slippage_usd: toNum(execution?.slippage_usd, 0),
     proceeds_usd: proceeds,
+    gross_proceeds_usd: grossProceeds,
+    net_proceeds_usd: proceeds,
     cost_portion_usd: costPortion,
     pnl_usd: pnl,
     fraction,
@@ -5863,7 +6828,7 @@ function executeSell(portfolio, action) {
       trade_kind: "sell"
     });
   }
-  attachPaperOrderLifecycle(trade);
+  attachPaperOrderLifecycle(trade, { execution });
 
   portfolio.closed_trades.push(trade);
   portfolio.action_history.push(trade);
@@ -5877,7 +6842,7 @@ function executeSell(portfolio, action) {
   if (pos.quantity <= 1e-12 || pos.market_value_usd < 1) {
     recordOutcomeEvent(trade, positionBefore, portfolio, getTrainingContext());
     delete portfolio.positions[pos.symbol];
-    setCooldown(portfolio, action.symbol);
+    setCooldown(portfolio, action.symbol, trade.reason || action.reason);
   }
 
   return trade;
@@ -6028,7 +6993,22 @@ function openPosition(portfolio, candidate, allocationUsd, reason = "buy", optio
   const price = toNum(candidate?.market_data?.current_price, 0);
   if (!(price > 0)) return null;
   if (allocationUsd < portfolio.settings.min_trade_usd) return null;
-  if (portfolio.cash_usd < allocationUsd) return null;
+
+  const execution = buildPaperFillExecution({
+    side: "buy",
+    price,
+    quoted_price: price,
+    cost_usd: allocationUsd,
+    paper_trade_ticket: options.paperTradeTicket || null,
+    execution_data: candidate?.execution_data || null,
+    settings: portfolio?.settings || SETTINGS_DEFAULTS
+  });
+  const quantity = toNum(execution?.quantity, 0);
+  const grossCostUsd = toNum(execution?.filled_notional_usd, allocationUsd);
+  const feeUsd = toNum(execution?.fee_usd, 0);
+  const totalCashDebitUsd = grossCostUsd + feeUsd;
+  if (!(quantity > 0) || !(grossCostUsd > 0)) return null;
+  if (portfolio.cash_usd < totalCashDebitUsd) return null;
 
   const symbol = candidate.token.symbol;
   const strategyVersion = options.strategyVersion || candidate?.strategy_version || PAPER_ORDER_STRATEGY_VERSION;
@@ -6039,16 +7019,15 @@ function openPosition(portfolio, candidate, allocationUsd, reason = "buy", optio
   if (!portfolio.positions[symbol] && Object.keys(portfolio.positions).length >= portfolio.settings.max_open_positions) {
     return null;
   }
-  const quantity = allocationUsd / price;
   const context = getTrainingContext();
   const training = ensureCandidateTrainingMetadata(candidate, context);
   const tokenRiskScan = options.tokenRiskScan || options.paperTradeTicket?.token_risk_scan || candidate?.token_risk_scan || null;
 
-  portfolio.cash_usd -= allocationUsd;
+  portfolio.cash_usd -= totalCashDebitUsd;
 
   const existing = portfolio.positions[symbol];
   if (existing) {
-    const totalCost = existing.cost_basis_usd + allocationUsd;
+    const totalCost = existing.cost_basis_usd + totalCashDebitUsd;
     const totalQty = existing.quantity + quantity;
 
     existing.quantity = totalQty;
@@ -6069,16 +7048,21 @@ function openPosition(portfolio, candidate, allocationUsd, reason = "buy", optio
       existing.token_risk_scan_ref = buildTokenRiskScanRef(tokenRiskScan, context);
       existing.token_risk_scan = deepClone(tokenRiskScan);
     }
+    existing.last_market_snapshot = {
+      market_data: deepClone(candidate.market_data || {}),
+      liquidity_data: deepClone(candidate.liquidity_data || {}),
+      execution_data: deepClone(candidate.execution_data || {})
+    };
   } else {
     portfolio.positions[symbol] = {
       symbol,
       contract_address: candidate.token.contract_address,
       category: candidate.token.category || "unknown",
       quantity,
-      avg_entry_price: price,
-      cost_basis_usd: allocationUsd,
+      avg_entry_price: totalCashDebitUsd / quantity,
+      cost_basis_usd: totalCashDebitUsd,
       current_price: price,
-      market_value_usd: allocationUsd,
+      market_value_usd: quantity * price,
       stop_price: stopPrice,
       targets: deepClone(targets),
       partials_taken: {
@@ -6114,7 +7098,15 @@ function openPosition(portfolio, candidate, allocationUsd, reason = "buy", optio
     reason,
     quantity,
     price,
-    cost_usd: allocationUsd,
+    quoted_price: toNum(execution?.quote_price, price),
+    fill_price: toNum(execution?.fill_price, price),
+    slippage_bps_applied: toNum(execution?.slippage_bps, 0),
+    fee_bps_applied: toNum(execution?.fee_bps, 0),
+    fee_usd: feeUsd,
+    slippage_usd: toNum(execution?.slippage_usd, 0),
+    cost_usd: grossCostUsd,
+    gross_notional_usd: grossCostUsd,
+    cash_debit_usd: totalCashDebitUsd,
     score: candidate._score ?? computePositionScoreLike(candidate),
     trade_lifecycle: "open",
     strategy_version: strategyVersion,
@@ -6135,7 +7127,7 @@ function openPosition(portfolio, candidate, allocationUsd, reason = "buy", optio
   if (options.riskDecision) {
     attachRiskDecisionMetadata(trade, options.riskDecision, context);
   }
-  attachPaperOrderLifecycle(trade);
+  attachPaperOrderLifecycle(trade, { execution });
 
   portfolio.action_history.push(trade);
   recordTradeEvent(trade, portfolio, context, {
@@ -6275,6 +7267,33 @@ function summarizeManagerSummary(report) {
   return `Clean cycle with no critical issues detected.${evidenceTail}`;
 }
 
+function buildFrequentAddressRepairWarning(scoutEvidenceDiagnostics = null) {
+  const diagnostics = scoutEvidenceDiagnostics && typeof scoutEvidenceDiagnostics === "object"
+    ? scoutEvidenceDiagnostics
+    : {};
+  const addressRepairs = toNum(diagnostics.address_repairs_in_cycle, 0);
+  const candidatesReturned = toNum(diagnostics.candidates_returned, 0);
+  if (!(candidatesReturned > 0)) return null;
+
+  const repairRate = addressRepairs / candidatesReturned;
+  if (!(repairRate > 0.3)) return null;
+
+  return {
+    code: "frequent_address_repairs",
+    severity: "warning",
+    window: "24h",
+    address_repairs_in_cycle: addressRepairs,
+    candidates_returned: candidatesReturned,
+    address_repair_rate: Number(repairRate.toFixed(4)),
+    message: `Address repairs hit ${Math.round(repairRate * 100)}% of Scout candidates this cycle.`
+  };
+}
+
+function buildPipelineWarningsForCycle({ scoutEvidenceDiagnostics = null } = {}) {
+  const frequentAddressRepairWarning = buildFrequentAddressRepairWarning(scoutEvidenceDiagnostics);
+  return frequentAddressRepairWarning ? [frequentAddressRepairWarning] : [];
+}
+
 function clipManagerText(value, limit = 180) {
   const text = String(value ?? "").trim();
   if (!text) return null;
@@ -6376,6 +7395,13 @@ function buildManagerReport(cycleState, portfolio) {
     .filter((entry) => entry?.stage === "harvest_candidate_downgraded")
     .map((entry) => entry?.data || {})
     .filter((entry) => entry && typeof entry === "object");
+  const pipelineWarningEntries = [
+    ...(Array.isArray(cycleState.pipeline_warnings) ? cycleState.pipeline_warnings : []),
+    ...pipelineLogEntries
+      .filter((entry) => entry?.stage === "pipeline_warning")
+      .map((entry) => entry?.data || {})
+      .filter((entry) => entry && typeof entry === "object")
+  ];
 
   const scoutFlags = [];
   const scoutCandidates = Array.isArray(scout.candidates) ? scout.candidates : [];
@@ -6643,6 +7669,19 @@ function buildManagerReport(cycleState, portfolio) {
     if (Number.isFinite(fearGreed) && fearGreed <= 25 && cycleState.market_regime !== "risk_off") {
       pushManagerFlag(pipelineFlags, "info", "pipeline", "PIPELINE_REGIME_MISMATCH", "Fear and greed was extreme fear, but the market regime did not shift to risk_off.");
     }
+  }
+  const frequentAddressRepairWarning = pipelineWarningEntries.find((entry) => entry?.code === "frequent_address_repairs");
+  if (frequentAddressRepairWarning) {
+    const repairRatePct = Math.round(toNum(frequentAddressRepairWarning.address_repair_rate, 0) * 100);
+    const repairs = toNum(frequentAddressRepairWarning.address_repairs_in_cycle, 0);
+    const returned = toNum(frequentAddressRepairWarning.candidates_returned, 0);
+    pushManagerFlag(
+      pipelineFlags,
+      "warning",
+      "pipeline",
+      "FREQUENT_ADDRESS_REPAIRS",
+      `Scout address repairs were frequent this cycle (${repairs}/${returned}, ${repairRatePct}%).`
+    );
   }
 
   const scoutScore = scoreFromFlags(scoutFlags);
@@ -7224,6 +8263,9 @@ async function runCycle(runContext = {}) {
     const cycleTrainingEvents = readJsonLines(TRAINING_EVENT_LOG, 1000).filter((record) => record.cycle_id === trainingContext.cycle_id);
     const scoutCoverageLog = buildAgentCoverageLog("scout", scoutPayload);
     const harvestCoverageLog = buildAgentCoverageLog("harvest", harvestPayload);
+    const pipelineWarnings = buildPipelineWarningsForCycle({
+      scoutEvidenceDiagnostics: scoutPayload.evidence_diagnostics
+    });
     const scoutEvidenceDiagnostics = buildScoutEvidenceDiagnostics({
       ...(scoutPayload.evidence_diagnostics || {}),
       coverage: scoutCoverageLog,
@@ -7244,6 +8286,10 @@ async function runCycle(runContext = {}) {
       harvest: harvestEvidenceDiagnostics
     });
     log("evidence_diagnostics", evidenceDiagnosticsEvent);
+    for (const warning of pipelineWarnings) {
+      log("pipeline_warning", warning);
+      recordAuxiliaryEvent("pipeline_warning", "pipeline", portfolio, warning);
+    }
     const cyclePipelineLogEntries = [
       { stage: "quant_context", data: { macro_regime: _cycleQuantContext?.macro?.regime, new_positions_ok: _cycleQuantContext?.macro?.new_positions_ok, tighten_stops: _cycleQuantContext?.macro?.tighten_stops } },
       { stage: "scout", data: scoutPayload },
@@ -7263,7 +8309,8 @@ async function runCycle(runContext = {}) {
       { stage: "executor_buy", data: buyReviews },
       { stage: "buy_trades", data: buyTrades },
       { stage: "stats", data: stats },
-      { stage: "evidence_diagnostics", data: evidenceDiagnosticsEvent }
+      { stage: "evidence_diagnostics", data: evidenceDiagnosticsEvent },
+      ...pipelineWarnings.map((warning) => ({ stage: "pipeline_warning", data: warning }))
     ];
     const managerReport = runManagerDirect({
       ...trainingContext,
@@ -7277,6 +8324,7 @@ async function runCycle(runContext = {}) {
       harvest_coverage: harvestCoverageLog,
       harvest_llm_meta: getLastLLMMeta("harvest"),
       harvest_evidence_diagnostics: harvestEvidenceDiagnostics,
+      pipeline_warnings: pipelineWarnings,
       risk_decisions: cycleTrainingEvents.filter((record) => record.event_type === "risk_decision"),
       executor_decisions: cycleTrainingEvents.filter((record) => record.event_type === "executor_decision"),
       cycle_actions: {
@@ -7409,8 +8457,30 @@ async function main() {
   });
 }
 
-main().catch((err) => {
-  log("error", { message: err.message });
-  console.error("\n🔥 Pipeline error:\n", err.message);
-  process.exit(1);
-});
+const isDirectRun = process.argv[1] && path.resolve(process.argv[1]) === __filename;
+
+if (isDirectRun) {
+  main().catch((err) => {
+    log("error", { message: err.message });
+    console.error("\n🔥 Pipeline error:\n", err.message);
+    process.exit(1);
+  });
+}
+
+export {
+  SETTINGS_DEFAULTS,
+  computeRecentClosedTradeMetrics,
+  computeRecentPerformanceThrottleMultiplier,
+  buildRegimeSentinelPolicy,
+  buildPositionSizingDecision,
+  buildPaperFillExecution,
+  buildFrequentAddressRepairWarning,
+  buildPipelineWarningsForCycle,
+  executeSell,
+  resolveScoutEvidenceRefMinimum,
+  resolveScoutMaxCandidates,
+  normalizePortfolioCooldowns,
+  openPosition,
+  resolveCooldownHoursForExitReason,
+  setCooldown
+};

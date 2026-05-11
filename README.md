@@ -44,8 +44,14 @@ E3D.ai API            External Quant Sources
               CYCLE START
               (macro context fetched)
                     │
+          buildCognitiveState()          ← Node.js perception layer
+          3 targeted API calls:              (candidates + stories + active tokens)
+          rank + fuse + disqualify           compact ranked candidate list
+                    │
                  SCOUT
-              (token universe + story signals → 0–3 candidates)
+          reads cognitive state              Qwen acts as strategist
+          optionally drills down (≤3 calls)  on pre-ranked intelligence
+          → 0–3 buy candidates
                     │
             UPDATE HOLDINGS
               (price refresh, holdings sync)
@@ -54,7 +60,8 @@ E3D.ai API            External Quant Sources
               (stop-loss, fraud breach, target hits)
                     │
                  HARVEST
-              (held positions → hold / monitor / trim / exit)
+          reads held positions + tool calls   targeted drill-down per position
+          → hold / monitor / trim / exit
                     │
                   RISK
               (hard-limit validation, quant gates)
@@ -72,7 +79,7 @@ E3D.ai API            External Quant Sources
               (post-cycle evaluation, grade, flags, report)
 ```
 
-The pipeline runs on a configurable interval (default: every few minutes). Each cycle is identified by a UUID and logged append-only to `pipeline.jsonl` and optionally to ClickHouse for training data retention.
+The pipeline runs on a configurable interval (default: every 5 minutes). Each cycle is identified by a UUID and logged append-only to `pipeline.jsonl` and optionally to ClickHouse for training data retention.
 
 ---
 
@@ -120,7 +127,9 @@ In addition to the story-filtered universe, Scout receives two higher-signal fee
 
 ### 4.1 Scout
 
-**Role:** Discovery. Scout identifies 0–3 buy candidates per cycle from the assembled token universe and story signals.
+**Role:** Discovery. Scout identifies 0–3 buy candidates per cycle from the pre-ranked cognitive state, with optional targeted drill-down into the E3D API for additional evidence.
+
+**Operating mode:** Scout runs in hybrid perception mode (see §7). Node.js pre-fetches a compact cognitive state (3 API calls) containing the top 10 pre-ranked candidates. Scout reasons on this state and may make up to 3 targeted tool calls for deeper evidence before returning its final answer. Total LLM rounds: 1 (no drill-down needed) to 4 (3 drill-down calls + final answer).
 
 **Signal priority (hardcoded in prompt):**
 
@@ -379,7 +388,100 @@ The four sources combine into a single `regime` label injected into all prompts:
 
 ---
 
-## 7. Training Pipeline
+## 7. Hybrid Agent Perception Architecture
+
+### 7.1 Design Rationale
+
+The original pipeline pre-fetched all available E3D data (token universe, all story types, candidates, trending tokens) and dumped it into a single large LLM prompt — often 30,000–80,000 characters. This worked but had two problems: the model received a firehose of data it couldn't prioritise, and every cycle burned the same API budget regardless of what was actually useful.
+
+A pure "agentic tool-calling" approach (LLM decides what to fetch, calling APIs across 4–10 sequential rounds) solved the first problem but created new ones: the conversation history grows with each round (every previous result must be replayed in full), RAM usage scales with context length, and a 14B model doing 5–10 inference passes per cycle is slow.
+
+The hybrid architecture resolves both:
+
+- **Node.js is fast at HTTP.** Three targeted API calls take ~2 seconds.
+- **Qwen is good at reasoning.** It should reason on curated intelligence, not decide what to fetch.
+- **Live perception is preserved.** Agents can still call E3D APIs directly for targeted drill-down when the pre-ranked state isn't sufficient.
+
+### 7.2 The Three Modes
+
+| Mode | When | LLM Rounds | Description |
+|---|---|---|---|
+| **Cognitive state** (default) | Every cycle | 1 | Node fetches compact state, Qwen reasons and answers in one pass |
+| **Drill-down** (hybrid) | When state lacks detail | 2–4 | Qwen calls 1–3 targeted tools on specific candidates, then answers |
+| **Full recursive** | Research / deep investigation | Up to 15 | Qwen drives all fetching across many rounds — for slow analysis, not live trading |
+
+The active mode is set by `LLM_TOOL_USE` environment variable. Drill-down is the default when tool use is enabled.
+
+### 7.3 `buildCognitiveState()` — The Perception Layer
+
+`buildCognitiveState()` is the Node.js function that acts as the system's "visual cortex" — it converts raw E3D API data into structured intelligence before Qwen ever sees it.
+
+**Three API calls:**
+1. `/candidates` — E3D pre-computed multi-signal candidates (highest priority)
+2. `/stories?limit=100&chain=ETH` — all story types in one call, categorised locally
+3. `/fetchTokenPricesWithHistoryAllRanges?sortBy=storyCount` — tokens ranked by 1-hour signal activity
+
+**Processing:**
+- Build disqualified address set from WASH_TRADE, LIQUIDITY_DRAIN, TREASURY_DISTRIBUTION, and other exit-risk stories
+- Build a signal map: `address → { signal_types, conviction, summaries }`
+- Fuse E3D candidates + story signals + market data into a unified candidate pool
+- Rank by: `source_weight + conviction + signal_count × 5` (E3D candidates score 100, multi-signal 50, single-signal 10)
+- Apply soft quality filters, deduplicate, return top 10
+
+**Output (compact, ~2,000–3,000 chars):**
+```json
+{
+  "generated_at": "ISO8601",
+  "candidates": [
+    {
+      "rank": 1,
+      "symbol": "TOKEN",
+      "address": "0x...",
+      "source": "e3d_candidate",
+      "signal_types": ["E3D_CANDIDATE", "ACCUMULATION"],
+      "conviction": 78,
+      "why_now": "Smart money accumulation, conviction 78",
+      "market": { "price_usd": 0.0042, "liquidity_usd": 320000, "volume_24h_usd": 850000, "market_cap_usd": 4200000 },
+      "drill_down": ["token_info", "transactions"]
+    }
+  ],
+  "meta": { "e3d_candidates": 3, "story_signals": 12, "api_calls": 3 }
+}
+```
+
+The `drill_down` field tells Scout which tools would add value for that specific candidate — it doesn't have to guess.
+
+### 7.4 Agent Tool Definitions
+
+When `LLM_TOOL_USE=1`, agents have access to seven tools for targeted drill-down:
+
+| Tool | Endpoint | Use case |
+|---|---|---|
+| `e3d_get_candidates` | `/candidates` | Get E3D pre-computed candidates |
+| `e3d_get_stories` | `/stories` | Fetch a specific story type |
+| `e3d_get_token_universe` | `/fetchTokensDB` | Verify quality gates for a token |
+| `e3d_get_trending` | `/fetchTokenPricesWithHistoryAllRanges` | Spot momentum or capitulation |
+| `e3d_get_token_info` | `/token-info/:address` | Deep-dive price/market data for one token |
+| `e3d_get_transactions` | `/fetchTransactionsDB` | Check whale moves or unusual activity |
+| `e3d_get_address_meta` | `/addressMeta` | Look up token identity/metadata |
+
+All tool calls are authenticated using the stored E3D API key — the LLM never sees or handles credentials. Tool results are truncated to 6,000 characters before entering the conversation to keep KV cache usage manageable on constrained hardware.
+
+### 7.5 RAM Budget
+
+Running Qwen2.5-14B-Instruct-4bit via MLX on a Mac Mini with 25GB RAM:
+
+- Model weights: ~8GB
+- KV cache (typical cycle, ~8K tokens): ~1.5GB
+- OS + Node.js + other processes: ~4GB
+- **Total typical: ~13.5GB** — well within budget
+
+Worst case (15 tool rounds × 6,000 char results ≈ 30K tokens): ~8 + 6 + 4 = ~18GB. Still safe. The 6,000-char truncation limit and `MAX_TOOL_ROUNDS = 15` cap are the primary RAM safety mechanisms.
+
+---
+
+## 8. Training Pipeline
+
 
 The system includes a continuous learning infrastructure designed to internalize trading rules into fine-tuned LoRA adapters, reducing prompt length and improving decision consistency.
 
@@ -461,6 +563,13 @@ After each cycle, the Manager Agent produces a graded report with:
 
 ## 10. Current Status
 
-The system is running in paper mode with a portfolio of $100,000 initial capital. All five agents are operational. The token universe is story-filtered and sorted by 1-hour story count. The Manager Agent grades each cycle. The training pipeline infrastructure is specified and ready; automated retraining begins once sufficient labeled cycle outcomes accumulate (estimated 4–6 weeks of runtime).
+The system is running in paper mode with a portfolio of $100,000 initial capital. All five agents are operational. The hybrid perception architecture (`LLM_TOOL_USE=1`) is active — Scout and Harvest use `buildCognitiveState()` as their primary data layer, with targeted E3D API drill-down available per cycle. The Manager Agent grades each cycle. The training pipeline infrastructure is specified and ready; automated retraining begins once sufficient labeled cycle outcomes accumulate (estimated 4–6 weeks of runtime).
 
-Live trading requires: adapter training completion, a multi-cycle paper mode validation period showing consistent positive P&L, and an explicit configuration change to enable execution.
+**Recent architectural changes (May 2026):**
+- Replaced bulk data pre-fetching with `buildCognitiveState()` — 3 targeted API calls producing a compact ranked candidate list
+- Implemented OpenAI-compatible tool calling for both Scout and Harvest agents
+- Hybrid mode: Node.js handles perception bandwidth, Qwen handles strategy; agents can drill down on specific candidates with up to 3 targeted API calls per cycle
+- All tool results truncated to 6,000 chars before entering the conversation — keeps KV cache and RAM usage predictable on 25GB hardware
+- Stale Colima disk lock recovery: removed `/Users/mini/.colima/_lima/_disks/colima/in_use_by` symlink after VM crash
+
+**Live trading requires:** adapter training completion, a multi-cycle paper mode validation period showing consistent positive P&L, and an explicit configuration change to enable execution.
