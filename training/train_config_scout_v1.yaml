@@ -1,0 +1,17 @@
+model: mlx-community/Qwen2.5-14B-Instruct-4bit
+train: true
+data: ./data/scout
+adapter_path: ./adapters_scout_v1
+fine_tune_type: lora
+batch_size: 1
+num_epochs: 3
+learning_rate: 5e-6
+save_every: 200
+steps_per_report: 10
+steps_per_eval: 100
+max_seq_length: 2048
+grad_checkpoint: true
+lora_parameters:
+  rank: 8
+  dropout: 0.0
+  scale: 20.0
