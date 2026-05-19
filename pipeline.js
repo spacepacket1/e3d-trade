@@ -3001,7 +3001,14 @@ function executeE3DTool(name, rawArgs) {
         log("tool_blocked_nontradeable", { tool: name, address });
         return JSON.stringify({ error: "non-tradeable address, skip", address });
       }
-      return truncateToolResult(fetchJson(`/token-info/${encodeURIComponent(address)}`) ?? { error: "not found" });
+      const tokenInfo = fetchJson(`/token-info/${encodeURIComponent(address)}`);
+      if (tokenInfo) return truncateToolResult(tokenInfo);
+      // /token-info returned 500 — fall back to the cached universe snapshot
+      const fromUniverse = _activeTokensCache.find(
+        t => cleanAddress(t?.address || t?.contract_address || "") === address
+      );
+      if (fromUniverse) return truncateToolResult(fromUniverse);
+      return JSON.stringify({ error: "token not found in E3D database — skip this candidate" });
     }
     if (name === "e3d_get_transactions") {
       const address = cleanAddress(String(args.address || ""));
@@ -3034,6 +3041,7 @@ function executeE3DTool(name, rawArgs) {
 // ─── Cognitive state ──────────────────────────────────────────────────────────
 // Max candidates to surface in the cognitive state snapshot.
 const COGNITIVE_STATE_MAX_CANDIDATES = 10;
+let _activeTokensCache = []; // shared with tool handler for /token-info fallback
 // Max rounds when the agent is doing targeted drill-down (cognitive state mode).
 // 3 drill-down tool calls + 1 final answer = 4 rounds total.
 const DRILL_DOWN_MAX_ROUNDS = 4;
@@ -3137,8 +3145,9 @@ function buildCognitiveState(portfolio) {
   const allStories     = endpointArray(fetchJson("/stories", { limit: 100, chain: "ETH" }));
   const activeTokens   = endpointArray(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
     dataSource: E3D_TOKENS_DATA_SOURCE, sortBy: "storyCount", sortDir: "desc",
-    trendInterval: "1H", limit: 100
+    trendInterval: "1H", limit: 200
   }));
+  _activeTokensCache = activeTokens; // share with tool handler for /token-info fallback
 
   // Classify story types
   const disqualifierTypes = new Set(["WASH_TRADE", "LOOP", "LIQUIDITY_DRAIN", "SPREAD_WIDENING",
@@ -3199,9 +3208,13 @@ function buildCognitiveState(portfolio) {
 
   for (const c of e3dCandidates) {
     const addr = cleanAddress(c?.entity_address || c?.token_address || c?.address || c?.contract_address || "");
-    const sym  = String(c?.symbol || c?.token?.symbol || "").toUpperCase();
+    // entity_symbol is the correct field on the /candidates response
+    const sym  = String(c?.entity_symbol || c?.symbol || c?.token?.symbol || "").toUpperCase();
     if (!addr || disqualifiedAddresses.has(addr) || heldAddresses.has(addr)) continue;
     if (NONTRADEABLE_RE.test(sym)) continue;
+    // Drop candidates with zero opportunity score AND zero price — these are empty
+    // placeholder records with no usable market data (REFLEXIVE_CROWDING junk).
+    if (!Number(c?.opportunity_score) && !Number(c?.price_at_creation)) continue;
     const market = marketByAddr.get(addr) || {};
     const storySig = storySignals.get(addr);
     pool.set(addr, {
@@ -3222,6 +3235,10 @@ function buildCognitiveState(portfolio) {
     const market = marketByAddr.get(addr) || {};
     const sym = market.symbol || "";
     if (NONTRADEABLE_RE.test(sym)) continue;
+    // Require the token to appear in the E3D universe snapshot. Tokens absent from the
+    // universe are micro-caps or wallet addresses: they'll fail /token-info (500) and
+    // can't pass the quality gate (liq>$100k, mcap>$2M) anyway.
+    if (!marketByAddr.has(addr)) continue;
     // Skip tokens that clearly fail a soft quality check (price known but zero, or tiny liquidity)
     if ((market.price_usd ?? -1) === 0) continue;
     if (toNum(market.liquidity_usd, -1) > 0 && toNum(market.liquidity_usd, 0) < 50000) continue;
@@ -4615,6 +4632,21 @@ function runScoutWithTools(portfolio, portfolioIntelligence = null) {
   // Qwen sees only what matters, not a firehose of raw data.
   const cognitiveState = buildCognitiveState(portfolio);
   const stateJson = JSON.stringify(cognitiveState, null, 0);
+
+  // Short-circuit: no candidates in either the E3D feed or story signals means
+  // the LLM has nothing to evaluate. Skip the inference call (saves ~2 min/cycle).
+  if (cognitiveState.candidates.length === 0) {
+    log("scout_tool_candidates", { raw: 0, after_held: 0, qualified: 0 });
+    log("scout", {
+      scan_timestamp: cognitiveState.generated_at, candidates: [], holdings_updates: [],
+      stories_checked: [], evidence_diagnostics: {
+        agent: "scout", input_candidate_count: 0, llm_batch_count: 0,
+        prompt_chars: 0, total_tokens: null, llm_duration_ms: 0,
+        candidates_returned: 0, candidates_qualified: 0
+      }
+    });
+    return [];
+  }
 
   // ── Step 2: Qwen reasons on the state, optionally drills down ──
   const systemPrompt = [
