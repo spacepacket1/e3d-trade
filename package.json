@@ -16,6 +16,7 @@
     "reviews:trades": "node scripts/tradeReviewer.js",
     "retraining:readiness": "node scripts/retrainingReadiness.js",
     "setup": "bash ./install.sh",
+    "uninstall": "bash ./uninstall.sh",
     "package:macos": "bash ./scripts/macos/make-pkg.sh",
     "db:up": "sh -lc 'if command -v docker-compose >/dev/null 2>&1; then docker-compose up -d mongo clickhouse; else docker compose up -d mongo clickhouse; fi'",
     "db:down": "sh -lc 'if command -v docker-compose >/dev/null 2>&1; then docker-compose down; else docker compose down; fi'",

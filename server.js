@@ -87,6 +87,7 @@ const DEFAULT_PORTFOLIO_STATE = {
   }
 };
 let pipelineProcess = null;
+let _pipelineRestartTimer = null;
 let pipelineState = {
   running: false,
   pid: null,
@@ -1825,6 +1826,8 @@ function operatorContextFromBody(body = {}, fallbackReason = null) {
 }
 
 function stopPipelineProcess(signal = "SIGTERM") {
+  clearTimeout(_pipelineRestartTimer);
+  _pipelineRestartTimer = null;
   const pid = pipelineProcess?.pid ?? pipelineState.pid ?? null;
   if (!pid || !isProcessAlive(pid)) {
     pipelineProcess = null;
@@ -1914,6 +1917,7 @@ function startPipelineProcess(intervalSeconds = 300) {
     if (wasCurrent) pipelineProcess = null;
     clearPidFile();
 
+    const wasUserRequested = !!pipelineState.stop_requested_at;
     setPipelineState({
       running: false,
       pid: null,
@@ -1922,6 +1926,12 @@ function startPipelineProcess(intervalSeconds = 300) {
       signal,
       last_error: code && code !== 0 ? `Pipeline exited with code ${code}` : null
     });
+
+    if (wasCurrent && !wasUserRequested) {
+      const restartDelay = 30_000;
+      console.log(`[server] Pipeline exited unexpectedly (code=${code}, signal=${signal}), restarting in ${restartDelay / 1000}s`);
+      _pipelineRestartTimer = setTimeout(() => startPipelineProcess(safeIntervalSeconds), restartDelay);
+    }
   });
 
   child.on("error", (err) => {
