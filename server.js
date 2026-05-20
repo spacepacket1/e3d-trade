@@ -2482,6 +2482,19 @@ async function handleRequest(req, res) {
     return;
   }
 
+  if (url.pathname === "/api/e3d/decision-layer/summary") {
+    const E3D_API_BASE = process.env.E3D_API_BASE_URL || "https://e3d.ai/api";
+    const [actionsRes, outcomesRes] = await Promise.allSettled([
+      e3dRequest(`${E3D_API_BASE}/actions/summary`, { method: "GET", headers: { Accept: "application/json" } }).then(r => r.ok ? r.json() : null).catch(() => null),
+      e3dRequest(`${E3D_API_BASE}/outcomes/summary`, { method: "GET", headers: { Accept: "application/json" } }).then(r => r.ok ? r.json() : null).catch(() => null),
+    ]);
+    sendJson(res, 200, {
+      actions:  actionsRes.status === "fulfilled"  ? actionsRes.value  : null,
+      outcomes: outcomesRes.status === "fulfilled" ? outcomesRes.value : null,
+    });
+    return;
+  }
+
   if (url.pathname === "/api/pipeline/start" && req.method === "POST") {
     const body = await readRequestJson();
     const intervalSeconds = body.interval_seconds ?? body.intervalSeconds ?? 300;

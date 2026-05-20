@@ -36,6 +36,21 @@ function fetchTokenPrice(address) {
   }
 }
 
+function fetchE3dActionOutcome(actionId) {
+  if (!actionId) return null;
+  try {
+    const url = `${E3D_API_BASE_URL}/actions/${encodeURIComponent(actionId)}/outcome`;
+    const curlArgs = ["-s", "--max-time", "15", url];
+    if (E3D_API_KEY) curlArgs.push("-H", `x-api-key: ${E3D_API_KEY}`);
+    const stdout = execFileSync("curl", curlArgs, { encoding: "utf8", timeout: 20000 });
+    const parsed = JSON.parse(stdout);
+    if (parsed?.error) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
 function pctChange(from, to) {
   if (!from || from === 0 || to == null) return null;
   return Math.round(((to - from) / from) * 10000) / 100;
@@ -97,6 +112,19 @@ async function main() {
       outcomes.outcome_label = bestPct > 5 ? "win" : bestPct < -5 ? "loss" : "neutral";
     } else {
       outcomes.outcome_label = "pending";
+    }
+
+    // Correlate with E3D Decision Layer outcome if an action_id was stored on the candidate.
+    const actionId = entry?.scout?.candidates?.[0]?.e3d_action_id || null;
+    if (actionId && !outcomes.e3d_outcome_fetched) {
+      const e3dOutcome = fetchE3dActionOutcome(actionId);
+      if (e3dOutcome) {
+        outcomes.e3d_thesis_confirmed    = e3dOutcome.thesis_confirmed ?? null;
+        outcomes.e3d_confirmation_score  = e3dOutcome.confirmation_score ?? null;
+        outcomes.e3d_outcome_score       = e3dOutcome.outcome_score ?? null;
+        outcomes.e3d_price_return        = e3dOutcome.price_return ?? null;
+        outcomes.e3d_outcome_fetched     = true;
+      }
     }
 
     entry.outcomes = outcomes;

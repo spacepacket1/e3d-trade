@@ -1885,6 +1885,48 @@ function LedgerView() {
   );
 }
 
+function DecisionLayerPanel({ data, error }) {
+  const actions  = data?.actions  || null;
+  const outcomes = data?.outcomes || null;
+  const byType   = actions?.by_type && typeof actions.by_type === "object" ? actions.by_type : {};
+  const typeKeys = Object.keys(byType).sort();
+  return React.createElement(
+    "div",
+    { className: "card panel" },
+    React.createElement(
+      "div",
+      { className: "panel-head" },
+      React.createElement("h2", null, "Decision Layer"),
+      React.createElement("span", { className: "panel-note" }, actions ? "Live" : "No data yet")
+    ),
+    error ? React.createElement("div", { className: "card error" }, `Decision Layer error: ${error}`) : null,
+    !data && !error ? React.createElement("div", { className: "empty-state" }, "No Decision Layer data. Pipeline must be running with E3D API connected.") : null,
+    data ? React.createElement(
+      React.Fragment,
+      null,
+      React.createElement(
+        "div",
+        { className: "performance-grid" },
+        React.createElement("div", { className: "performance-stat" },
+          React.createElement("span", null, "Open Actions"),
+          React.createElement("strong", null, String(actions?.open_total ?? "—")),
+          React.createElement("small", null, typeKeys.length ? typeKeys.map(k => `${k.replace(/_signal$/, "")}: ${byType[k]}`).join("  ") : "no breakdown")
+        ),
+        React.createElement("div", { className: "performance-stat" },
+          React.createElement("span", null, "30d Confirmation Rate"),
+          React.createElement("strong", null, actions?.confirmation_rate_30d != null ? `${(actions.confirmation_rate_30d * 100).toFixed(1)}%` : "—"),
+          React.createElement("small", null, outcomes?.confirmation_rate_by_type ? "by-type data available" : "outcomes summary")
+        ),
+        React.createElement("div", { className: "performance-stat" },
+          React.createElement("span", null, "30d Mean Q_O"),
+          React.createElement("strong", null, actions?.mean_outcome_score_30d != null ? `+${actions.mean_outcome_score_30d.toFixed(2)}` : "—"),
+          React.createElement("small", null, `Evaluated: ${actions?.evaluated_30d ?? "—"}`)
+        )
+      )
+    ) : null
+  );
+}
+
 function App() {
   const [summary, setSummary] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -1922,6 +1964,20 @@ function App() {
   const [professionalError, setProfessionalError] = useState(null);
   const [auditStatus, setAuditStatus] = useState(null);
   const [auditError, setAuditError] = useState(null);
+  const [decisionLayerSummary, setDecisionLayerSummary] = useState(null);
+  const [decisionLayerError, setDecisionLayerError] = useState(null);
+
+  async function loadDecisionLayerSummary() {
+    try {
+      setDecisionLayerError(null);
+      const res = await fetch("/api/e3d/decision-layer/summary");
+      const data = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(data?.error || data?.message || `HTTP ${res.status}`);
+      setDecisionLayerSummary(data);
+    } catch (err) {
+      setDecisionLayerError(err.message);
+    }
+  }
 
   async function loadAuthStatus() {
     try {
@@ -2178,12 +2234,14 @@ function App() {
     loadOperations();
     loadProfessional();
     loadAuditStatus();
+    loadDecisionLayerSummary();
     const id = setInterval(() => {
       loadPerformance();
       loadReadiness();
       loadOperations();
       loadProfessional();
       loadAuditStatus();
+      loadDecisionLayerSummary();
     }, 30000);
     return () => clearInterval(id);
   }, []);
@@ -2522,6 +2580,7 @@ function App() {
     React.createElement(ProfessionalDashboardPanel, { professional, error: professionalError }),
     performancePanel,
     operationsPanel,
+    React.createElement(DecisionLayerPanel, { data: decisionLayerSummary, error: decisionLayerError }),
     portfolioPanel
   );
 

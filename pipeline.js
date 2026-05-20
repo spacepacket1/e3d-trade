@@ -64,6 +64,11 @@ let _e3dRequestCount = 0;
 let _e3dLastRequestAt = 0;
 const E3D_DOSSIER_CACHE = new Map();
 const E3D_API_DEBUG = process.env.E3D_API_DEBUG === "1" || process.env.E3D_DEBUG === "1";
+const E3D_ACTIONS_MIN_CONFIDENCE     = Number(process.env.E3D_ACTIONS_MIN_CONFIDENCE || 0.40);
+const E3D_ACTIONS_MAX_RISK           = Number(process.env.E3D_ACTIONS_MAX_RISK || 0.65);
+const E3D_ACTIONS_ENRICH_LIMIT       = Number(process.env.E3D_ACTIONS_ENRICH_LIMIT || 12);
+const E3D_AVOID_RISK_FAST_PATH_FLOOR = Number(process.env.E3D_AVOID_RISK_FAST_PATH_FLOOR || 0.65);
+let _cycleE3dActions = [];
 let ACTIVE_TRAINING_CONTEXT = null;
 const LAST_LLM_META = new Map();
 let DATABASE_SCHEMA_READY = false;
@@ -356,6 +361,8 @@ function buildScoutIntelUrls(portfolioIntelligence) {
       urls.push(`${E3D_API_BASE_URL}/fetchTransactionsDB?dataSource=${E3D_TRANSACTIONS_DATA_SOURCE}&search=${encodeURIComponent(symbol)}&limit=25`);
     }
   }
+
+  urls.push(`${E3D_API_BASE_URL}/actions?status=open&actionType=accumulate_signal,paper_buy,watch&sort=action_score_desc&limit=30&maxRisk=${E3D_ACTIONS_MAX_RISK}&minConfidence=${E3D_ACTIONS_MIN_CONFIDENCE}`);
 
   return Array.from(new Set(urls));
 }
@@ -733,7 +740,9 @@ function buildRunLedgerRecord({ trainingContext, cycleStartTs, cycleEndTs, scout
       market_cap_usd: c?.market_data?.market_cap_usd ?? null,
       change_30m_pct: c?.market_data?.change_30m_pct ?? null,
       change_24h_pct: c?.market_data?.change_24h_pct ?? null
-    }
+    },
+    e3d_action_id:   c?.e3d_action_id   ?? null,
+    e3d_action_type: c?.e3d_action_type ?? null,
   }));
 
   // Count harvest actions
@@ -1938,7 +1947,7 @@ function daysSince(value) {
 function endpointArray(payload) {
   if (Array.isArray(payload)) return payload;
   if (!payload || typeof payload !== "object") return [];
-  for (const key of ["candidates", "stories", "items", "data", "results", "theses", "opportunities", "wallets", "rows", "transactions", "txs"] ) {
+  for (const key of ["candidates", "stories", "actions", "items", "data", "results", "theses", "opportunities", "wallets", "rows", "transactions", "txs"] ) {
     if (Array.isArray(payload[key])) return payload[key];
   }
   return [];
@@ -3075,6 +3084,18 @@ function computeCandidateScorecard(candidate, storySig) {
     else if (conviction > 0) thesis_signal_score = 30;
   }
 
+  // If this candidate matches a Decision Layer action, use Q_A (action_score) directly.
+  // action_score is normalized 0–1; multiply by 100 to match the score scale.
+  if (_cycleE3dActions.length > 0) {
+    const cAddr = cleanAddress(candidate?.address || candidate?.entity_address || candidate?.token_address || "");
+    if (cAddr) {
+      const matchingAction = _cycleE3dActions.find(a => cleanAddress(a.token_address || "") === cAddr);
+      if (matchingAction && Number.isFinite(matchingAction.action_score)) {
+        thesis_signal_score = Math.round(matchingAction.action_score * 100);
+      }
+    }
+  }
+
   // liquidity_score — hard fail if < 100k
   const liq = Number(candidate.market?.liquidity_usd || 0);
   let liquidity_score = 0;
@@ -3594,6 +3615,35 @@ function fetchScoutData() {
   const e3dTheses = endpointArray(fetchJson("/theses", { status: "active", limit: 25 }));
   log("scout_e3d_theses", { count: e3dTheses.length });
 
+  // Fetch Decision Layer actions — pre-computed Q_A scores for accumulate/watch tokens.
+  const e3dActionsRaw = endpointArray(fetchJson("/actions", {
+    status: "open",
+    actionType: "accumulate_signal,paper_buy,watch",
+    sort: "action_score_desc",
+    limit: 30,
+    maxRisk: E3D_ACTIONS_MAX_RISK,
+    minConfidence: E3D_ACTIONS_MIN_CONFIDENCE
+  }));
+  const e3dActions = e3dActionsRaw.filter(a => a?.token_address);
+  log("scout_e3d_actions", { count: e3dActions.length });
+
+  // Build avoid address set from high-risk structural actions.
+  const e3dAvoidActionsRaw = endpointArray(fetchJson("/actions", {
+    status: "open",
+    actionType: "avoid,confirm_risk",
+    minRisk: 0.50,
+    limit: 50
+  }));
+  const avoidAddresses = new Set(
+    e3dAvoidActionsRaw.map(a => cleanAddress(a.token_address || "")).filter(Boolean)
+  );
+  log("scout_avoid_set", { count: avoidAddresses.size });
+
+  _cycleE3dActions = e3dActions;
+  const e3dActionsByAddr = new Map(
+    e3dActions.map(a => [cleanAddress(a.token_address || ""), a]).filter(([k]) => k)
+  );
+
   // Fetch the authenticated user's watchlist — tokens they are personally monitoring.
   // Filtered to type=token only; non-tradeable symbols excluded using the same pattern
   // as the token universe filter so stablecoins/wrapped assets don't leak through.
@@ -3636,6 +3686,59 @@ function fetchScoutData() {
   }
   log("scout_thesis_enrichment", { checked: Math.min(e3dTheses.length, 8), added: thesisEnrichAdded });
 
+  // Enrich universe with Decision Layer action tokens not already present.
+  let actionEnrichAdded = 0;
+  for (const action of e3dActions.slice(0, E3D_ACTIONS_ENRICH_LIMIT)) {
+    const addr = cleanAddress(action.token_address || "");
+    if (!addr || seen.has(addr)) continue;
+    try {
+      const rows = endpointArray(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
+        dataSource: 1, search: addr, limit: 1
+      }));
+      const row = rows.find(r => cleanAddress(r.address || r.contract_address || "") === addr) || rows[0];
+      if (!row) continue;
+      const enriched = mapToken(row);
+      if (enriched.address && (enriched.price_usd ?? 0) > 0 && !seen.has(enriched.address) &&
+          !nonTradeablePattern.test(enriched.symbol || "")) {
+        seen.add(enriched.address);
+        enriched._e3d_action = {
+          action_id:          action.action_id,
+          action_type:        action.action_type,
+          action_score:       action.action_score,
+          confidence:         action.confidence,
+          risk_score:         action.risk_score,
+          expected_direction: action.expected_direction,
+          expected_horizon:   action.expected_horizon,
+          trigger_reason:     action.trigger_reason,
+          n_supporting:       action.n_supporting,
+        };
+        tokenUniverse.push(enriched);
+        actionEnrichAdded++;
+      }
+    } catch (_) {}
+  }
+  log("scout_action_enrichment", { checked: Math.min(e3dActions.length, E3D_ACTIONS_ENRICH_LIMIT), added: actionEnrichAdded });
+
+  // Attach _e3d_action to tokens already in the universe that match an action address.
+  for (const token of tokenUniverse) {
+    if (!token._e3d_action && token.address) {
+      const a = e3dActionsByAddr.get(token.address);
+      if (a) {
+        token._e3d_action = {
+          action_id:          a.action_id,
+          action_type:        a.action_type,
+          action_score:       a.action_score,
+          confidence:         a.confidence,
+          risk_score:         a.risk_score,
+          expected_direction: a.expected_direction,
+          expected_horizon:   a.expected_horizon,
+          trigger_reason:     a.trigger_reason,
+          n_supporting:       a.n_supporting,
+        };
+      }
+    }
+  }
+
   // CoinGecko enrichment — batch price lookup for thesis tokens + top flow accumulation tokens,
   // then detailed lookup for any thesis token that passes the quality gate.
   const cgDetailMap = new Map(); // address -> full CoinGecko detail
@@ -3676,7 +3779,18 @@ function fetchScoutData() {
     }
   }
 
-  return { stories, thesisSignalStories, tokenUniverse, disqualifierTypes, buySignalTypes, lateSignalTypes, secondaryTypes, sortLabel: "storyCount:1H desc", e3dCandidates, e3dTheses, cgDetailMap, e3dWatchlist };
+  // Suppress tokens with active avoid/confirm_risk Decision Layer actions before the LLM sees them.
+  if (avoidAddresses.size > 0) {
+    for (let i = tokenUniverse.length - 1; i >= 0; i--) {
+      const t = tokenUniverse[i];
+      if (t.address && avoidAddresses.has(t.address)) {
+        log("scout_token_suppressed_avoid_action", { address: t.address, symbol: t.symbol });
+        tokenUniverse.splice(i, 1);
+      }
+    }
+  }
+
+  return { stories, thesisSignalStories, tokenUniverse, disqualifierTypes, buySignalTypes, lateSignalTypes, secondaryTypes, sortLabel: "storyCount:1H desc", e3dCandidates, e3dTheses, cgDetailMap, e3dWatchlist, e3dActions, avoidAddresses };
 }
 
 const SCOUT_EVIDENCE_PACKET_SAFE_PROMPT_CHARS = 42000;
@@ -4370,11 +4484,18 @@ function buildScoutEvidenceShortlist(data, portfolio, options = {}) {
     if (addr) watchlistByAddr.set(addr, watchlist);
   }
 
+  const actionByAddr = new Map();
+  for (const action of (data?.e3dActions || [])) {
+    const addr = cleanAddress(action?.token_address || "");
+    if (addr) actionByAddr.set(addr, action);
+  }
+
   const candidateAddresses = new Set([
     ...tokenByAddr.keys(),
     ...candidateByAddr.keys(),
     ...thesisByAddr.keys(),
     ...watchlistByAddr.keys(),
+    ...actionByAddr.keys(),
     ...storyMap.keys()
   ]);
 
@@ -4382,12 +4503,14 @@ function buildScoutEvidenceShortlist(data, portfolio, options = {}) {
   const packetErrors = [];
   for (const addr of candidateAddresses) {
     if (!addr || disqualifiedAddresses.has(addr) || heldAddresses.has(addr)) continue;
+    if (data?.avoidAddresses?.has(addr)) continue;
 
     try {
       const tokenRow = tokenByAddr.get(addr) || null;
       const candidate = candidateByAddr.get(addr) || null;
       const thesis = thesisByAddr.get(addr) || null;
       const watchlist = watchlistByAddr.get(addr) || null;
+      const action = actionByAddr.get(addr) || null;
       const stories = storyMap.get(addr) || [];
       const cg = data?.cgDetailMap?.get(addr) || null;
 
@@ -4447,6 +4570,25 @@ function buildScoutEvidenceShortlist(data, portfolio, options = {}) {
       }
       evidence.push(...stories);
 
+      // Include Decision Layer action as structured evidence when present.
+      if (action) {
+        evidence.push({
+          source_type: "decision_layer",
+          source_ref: action.action_id || addr,
+          label: "e3d_decision_layer_action",
+          direction: action.expected_direction === "bearish" ? "risk" : "bullish",
+          strength: Math.max(40, Math.min(95, Math.round((action.action_score ?? 0.5) * 100))),
+          summary: [
+            "E3D Decision Layer",
+            action.action_type ? `type=${action.action_type}` : null,
+            action.action_score != null ? `Q_A=${action.action_score.toFixed(3)}` : null,
+            action.confidence != null ? `conf=${action.confidence.toFixed(2)}` : null,
+            action.expected_direction ? `dir=${action.expected_direction}` : null,
+            String(action.trigger_reason || "").slice(0, 70) || null
+          ].filter(Boolean).join(", ").slice(0, 160)
+        });
+      }
+
       const sourceAgentHint = watchlist && !candidate && !thesis ? "user_watchlist" : "scout";
       const scoutInput = {
         created_at: createdAt,
@@ -4474,6 +4616,17 @@ function buildScoutEvidenceShortlist(data, portfolio, options = {}) {
           watchlist_id: watchlist?.id || watchlist?.watchlist_id || addr,
           label: watchlist?.label || symbol,
           added_at: watchlist?.added_at || null
+        } : null,
+        action: action ? {
+          action_id:          action.action_id,
+          action_type:        action.action_type,
+          action_score:       action.action_score,
+          confidence:         action.confidence,
+          risk_score:         action.risk_score,
+          expected_direction: action.expected_direction,
+          expected_horizon:   action.expected_horizon,
+          trigger_reason:     action.trigger_reason,
+          n_supporting:       action.n_supporting,
         } : null
       };
 
@@ -4502,6 +4655,7 @@ function buildScoutEvidenceShortlist(data, portfolio, options = {}) {
         packet,
         ranking,
         source_agent_hint: sourceAgentHint,
+        e3d_action_ref: action ? { action_id: action.action_id, action_type: action.action_type } : null,
         packet_summary: {
           evidence_packet_id: packet.evidence_packet_id,
           symbol,
@@ -5137,6 +5291,10 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
             ? proposal.portfolio_data
             : { current_token_exposure_pct: 0, current_category_exposure_pct: 0, current_total_exposure_pct: 0 }
         };
+        if (shortlistEntry.e3d_action_ref?.action_id) {
+          mergedCandidate.e3d_action_id   = shortlistEntry.e3d_action_ref.action_id;
+          mergedCandidate.e3d_action_type = shortlistEntry.e3d_action_ref.action_type;
+        }
         seenCandidateAddresses.add(addr);
         validatedCandidates.push(mergedCandidate);
       }
@@ -5833,6 +5991,122 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
   return result;
 }
 
+function fetchPositionExitSignal(tokenAddress) {
+  if (!tokenAddress) return null;
+  try {
+    const result = fetchJson("/actions", {
+      tokenAddress: cleanAddress(tokenAddress),
+      status: "open",
+      limit: 5
+    });
+    const actions = endpointArray(result);
+    const priority = ["avoid", "confirm_risk", "reduce_exposure_signal"];
+    for (const type of priority) {
+      const match = actions.find(a => a.action_type === type);
+      if (match) return match;
+    }
+  } catch (_) {}
+  return null;
+}
+
+function buildFastPathExitDecision(entry, signal, createdAt, expiresAt) {
+  const reason = `Decision Layer fast-path exit: ${signal.action_type} (risk_score=${signal.risk_score.toFixed(2)})`;
+  return {
+    source_agent: "harvest_fast_path",
+    created_at: createdAt,
+    expires_at: expiresAt,
+    evidence_packet_id: entry.packet?.evidence_packet_id || null,
+    token: entry.harvest_input?.token || { symbol: entry.symbol, contract_address: entry.address },
+    position: entry.harvest_input?.position || {},
+    action: "exit",
+    fast_path: true,
+    thesis_state: "invalid",
+    thesis_summary: `Decision Layer ${signal.action_type}: ${(signal.trigger_reason || "").slice(0, 160)}`,
+    what_changed: `E3D Decision Layer issued ${signal.action_type} with risk_score=${signal.risk_score.toFixed(2)}`,
+    why_now: reason,
+    confidence: 90,
+    conviction_score: 10,
+    opportunity_score: 5,
+    review_priority: 5,
+    summary: reason,
+    evidence: [],
+    risks: [`${signal.action_type} (risk_score=${signal.risk_score.toFixed(2)}): ${(signal.trigger_reason || "").slice(0, 100)}`],
+    what_would_change_my_mind: ["Wait for Decision Layer action to expire or close"],
+    next_best_alternative: "Exit position, await Decision Layer signal to clear",
+    current_regime: "decision_layer_exit",
+    market_data: entry.harvest_input?.market_data || {},
+    liquidity_data: entry.harvest_input?.liquidity_data || {},
+    narrative_data: { story_strength: 0, thesis_health: 0, flow_direction: "bearish" },
+    portfolio_data: { current_token_exposure_pct: 0, current_category_exposure_pct: 0, current_total_exposure_pct: 0, portfolio_timestamp: createdAt, portfolio_source: "system" },
+    decision_layer_action_id:   signal.action_id,
+    decision_layer_action_type: signal.action_type,
+    decision_layer_risk_score:  signal.risk_score,
+    decision_layer_trigger:     signal.trigger_reason,
+  };
+}
+
+function applyHarvestFastPathExits(result, reviewContext, exitSignals, createdAt, expiresAt) {
+  if (!exitSignals.size) return result;
+  for (const entry of reviewContext.entries) {
+    const signal = exitSignals.get(entry.address);
+    if (!signal) continue;
+    if (
+      (signal.action_type === "avoid" || signal.action_type === "confirm_risk") &&
+      signal.risk_score > E3D_AVOID_RISK_FAST_PATH_FLOOR
+    ) {
+      log("harvest_fast_path_exit", {
+        address: entry.address,
+        symbol: entry.symbol,
+        action_type: signal.action_type,
+        action_id: signal.action_id,
+        risk_score: signal.risk_score
+      });
+      const fastPathDecision = buildFastPathExitDecision(entry, signal, createdAt, expiresAt);
+      const reviewIdx = result.position_reviews.findIndex(r =>
+        cleanAddress(r.token?.contract_address || "") === entry.address
+      );
+      if (reviewIdx >= 0) {
+        result.position_reviews[reviewIdx] = {
+          ...result.position_reviews[reviewIdx],
+          action: "exit",
+          fast_path: true,
+          why_now: fastPathDecision.why_now,
+          thesis_state: "invalid",
+          decision_layer_action_id:   signal.action_id,
+          decision_layer_action_type: signal.action_type,
+          decision_layer_risk_score:  signal.risk_score,
+        };
+      } else {
+        result.position_reviews.push(fastPathDecision);
+      }
+      const alreadyExit = result.exit_candidates.some(c =>
+        cleanAddress(c.token?.contract_address || "") === entry.address
+      );
+      if (!alreadyExit) {
+        result.exit_candidates.push({
+          ...fastPathDecision,
+          setup_type: "decision_layer_fast_path",
+          edge_source: "e3d_decision_layer",
+          suggested_exit_fraction: 1.0,
+          target_exit_price: entry.harvest_input?.position?.current_price ?? 0,
+          decision_price:    entry.harvest_input?.position?.current_price ?? 0,
+          exit_priority: 5
+        });
+      }
+      recordOperatorAction({
+        action_type: "harvest_fast_path_exit",
+        actor: "harvest",
+        role: "operator",
+        reason: fastPathDecision.why_now,
+        resource: "position",
+        new_state: { action: "exit", fast_path: true, decision_layer_action_id: signal.action_id },
+        metadata: { address: entry.address, symbol: entry.symbol }
+      });
+    }
+  }
+  return result;
+}
+
 function runHarvestDirect(portfolio, portfolioIntelligence = null) {
   if (TOOL_USE_ENABLED) return runHarvestWithTools(portfolio, portfolioIntelligence);
   const createdAt = nowIso();
@@ -5871,6 +6145,30 @@ function runHarvestDirect(portfolio, portfolioIntelligence = null) {
     });
     return emptyResult;
   }
+  // Pre-fetch Decision Layer exit signals for all held positions and inject into packet summaries.
+  const _positionExitSignals = new Map();
+  for (const entry of reviewContext.entries) {
+    const exitSignal = fetchPositionExitSignal(entry.address);
+    if (exitSignal) {
+      _positionExitSignals.set(entry.address, exitSignal);
+      log("harvest_decision_layer_exit_signal", {
+        address: entry.address,
+        symbol: entry.symbol,
+        action_type: exitSignal.action_type,
+        risk_score: exitSignal.risk_score,
+        action_score: exitSignal.action_score,
+        trigger_reason: exitSignal.trigger_reason
+      });
+      entry.packet_summary.decision_layer_signal = {
+        action_type:    exitSignal.action_type,
+        risk_score:     exitSignal.risk_score,
+        confidence:     exitSignal.confidence,
+        trigger_reason: exitSignal.trigger_reason,
+        action_id:      exitSignal.action_id,
+      };
+    }
+  }
+
   const entryByAddress = new Map(reviewContext.entries.map((entry) => [entry.address, entry]));
   const harvestPackets = reviewContext.entries.map((entry, index) => ({
     rank: index + 1,
@@ -5902,6 +6200,7 @@ function runHarvestDirect(portfolio, portfolioIntelligence = null) {
     "- regime=extreme_fear: only exit confirmed deteriorating positions; avoid panic-selling healthy ones",
     "- unrealized_pnl_pct > 25%: consider partial profit-taking unless Tier 1 conviction",
     "- unrealized_pnl_pct < -8%: flag for stop review; exit if thesis invalid and no recovery signal",
+    "- decision_layer_signal (if present in packet): high-weight structural signal from the E3D OTA pipeline. avoid or confirm_risk with risk_score > 0.65 is a strong exit indicator; reduce_exposure_signal means trim exposure.",
     "",
     `Output shape: {scan_timestamp, portfolio_summary, position_reviews[], exit_candidates[], stories_checked[]}`,
     `Each position_review: {source_agent:"harvest", created_at:"${createdAt}", expires_at:"${expiresAt}", evidence_packet_id, token:{symbol,name,chain:"ethereum",contract_address,category}, position:{quantity,avg_entry_price,current_price,market_value_usd,cost_basis_usd,unrealized_pnl_usd,unrealized_pnl_pct}, action:"hold"|"monitor"|"trim"|"exit", thesis_state, thesis_summary, what_changed, why_now, confidence:integer(0-100), conviction_score:integer(0-100), opportunity_score:integer(0-100), review_priority, summary, evidence:["evi_..."], risks[], what_would_change_my_mind[], next_best_alternative, current_regime, market_data:{current_price,change_24h_pct,price_source}, liquidity_data:{liquidity_usd,liquidity_source}, narrative_data:{story_strength,thesis_health,flow_direction}, portfolio_data:{current_token_exposure_pct,current_category_exposure_pct,current_total_exposure_pct,portfolio_timestamp,portfolio_source:"system"}}`,
@@ -5966,13 +6265,19 @@ function runHarvestDirect(portfolio, portfolioIntelligence = null) {
 
   try {
     const parsed = JSON.parse(jsonStr);
-    return finalizeHarvestLLMResult(parsed, portfolio, reviewContext, dossier, createdAt, expiresAt, harvestLlmBatches);
+    return applyHarvestFastPathExits(
+      finalizeHarvestLLMResult(parsed, portfolio, reviewContext, dossier, createdAt, expiresAt, harvestLlmBatches),
+      reviewContext, _positionExitSignals, createdAt, expiresAt
+    );
   } catch (parseErr) {
     // LLM may have hit max_tokens mid-response — try to repair truncated JSON
     try {
       const repaired = JSON.parse(repairTruncatedJson(jsonStr));
       log("harvest_json_repaired", { raw_length: rawText.length });
-      return finalizeHarvestLLMResult(repaired, portfolio, reviewContext, dossier, createdAt, expiresAt, harvestLlmBatches);
+      return applyHarvestFastPathExits(
+        finalizeHarvestLLMResult(repaired, portfolio, reviewContext, dossier, createdAt, expiresAt, harvestLlmBatches),
+        reviewContext, _positionExitSignals, createdAt, expiresAt
+      );
     } catch (_) {
       throw new Error(`HARVEST_REPLY_NOT_JSON\n${rawText.slice(0, 500)}`);
     }
