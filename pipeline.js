@@ -723,6 +723,7 @@ function buildRunLedgerRecord({ trainingContext, cycleStartTs, cycleEndTs, scout
   const harvestMeta = getLastLLMMeta("harvest") || {};
 
   const scoutCandidates = (scoutPayload?.candidates || []).map(c => ({
+    candidate_id: c?.training_candidate_id ?? null,
     symbol: c?.token?.symbol || "",
     address: cleanAddress(c?.token?.contract_address || ""),
     source: c?.source || "unknown",
@@ -744,6 +745,19 @@ function buildRunLedgerRecord({ trainingContext, cycleStartTs, cycleEndTs, scout
     e3d_action_id:   c?.e3d_action_id   ?? null,
     e3d_action_type: c?.e3d_action_type ?? null,
   }));
+
+  const rejectedCandidates = (rejected || [])
+    .map(r => ({
+      candidate_id: r?.proposal?.training_candidate_id || r?.proposal?.candidate_id || r?.proposal?.token?.contract_address || r?.proposal?.token?.symbol || null,
+      symbol: r?.proposal?.token?.symbol || "",
+      address: cleanAddress(r?.proposal?.token?.contract_address || ""),
+      market_at_signal: {
+        price_usd: r?.proposal?.market_data?.current_price ?? null
+      },
+      reject_reason: r?.risk?.reason_summary || "",
+      reason_codes: Array.isArray(r?.risk?.reason_codes) ? r.risk.reason_codes : []
+    }))
+    .filter(r => r.candidate_id && r.address && r.market_at_signal.price_usd > 0);
 
   // Count harvest actions
   const harvestActionCounts = { hold: 0, monitor: 0, trim: 0, exit: 0 };
@@ -802,7 +816,8 @@ function buildRunLedgerRecord({ trainingContext, cycleStartTs, cycleEndTs, scout
     risk: {
       approved: (approved?.length || 0),
       rejected: (rejected?.length || 0),
-      rejection_reasons: (rejected || []).map(r => r?.reason || r?.reject_reason || "").filter(Boolean)
+      rejection_reasons: (rejected || []).map(r => r?.reason || r?.reject_reason || "").filter(Boolean),
+      rejected_candidates: rejectedCandidates
     },
 
     execution: {
@@ -935,15 +950,30 @@ function recordTradeEvent(trade, portfolio, context = {}, details = {}) {
 
 function recordOutcomeEvent(trade, positionBefore, portfolio, context = {}) {
   const pnlUsd = toNum(trade?.pnl_usd, 0);
+  const exitPrice = trade?.fill_price ?? trade?.price ?? null;
+  const entryPrice = positionBefore?.avg_entry_price ?? null;
+  const returnPct = (exitPrice != null && entryPrice != null && entryPrice !== 0)
+    ? Math.round(((exitPrice - entryPrice) / entryPrice) * 10000) / 100
+    : null;
+  const holdingMs = positionBefore?.opened_at && trade?.ts
+    ? new Date(trade.ts).getTime() - new Date(positionBefore.opened_at).getTime()
+    : null;
+  const holdingHours = holdingMs != null ? Math.max(0, Math.round(holdingMs / 360000) / 10) : null;
+  const realizedDirection = pnlUsd > 1 ? "up" : pnlUsd < -1 ? "down" : "flat";
   const record = buildTrainingEventRecord("outcome", "pipeline", portfolio, context, {
     trade_id: trade?.trade_id || null,
     position_id: trade?.position_id || null,
     candidate_id: trade?.candidate_id || null,
     outcome_label: pnlUsd >= 0 ? "profit" : "loss",
     pnl_usd: pnlUsd,
-    exit_price: trade?.fill_price ?? trade?.price ?? null,
-    entry_price: positionBefore?.avg_entry_price ?? null,
-    holding_days: positionBefore?.opened_at && trade?.ts ? Math.max(0, (new Date(trade.ts).getTime() - new Date(positionBefore.opened_at).getTime()) / 86400000) : null,
+    return_pct: returnPct,
+    holding_hours: holdingHours,
+    max_gain_pct: null,
+    max_drawdown_pct: null,
+    realized_direction: realizedDirection,
+    exit_price: exitPrice,
+    entry_price: entryPrice,
+    holding_days: holdingMs != null ? Math.max(0, holdingMs / 86400000) : null,
     position_before: positionBefore || null,
     trade: trade || null
   });
