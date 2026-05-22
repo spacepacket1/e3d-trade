@@ -1171,8 +1171,8 @@ function regimePolicy(regime, settings = SETTINGS_DEFAULTS) {
       regime: normalizedRegime,
       allow_buys: true,
       allow_rotations: true,
-      allocation_multiplier: 1.15,
-      max_buys_per_cycle: settings.max_buys_per_cycle,
+      allocation_multiplier: 1.35,
+      max_buys_per_cycle: Math.min(settings.max_buys_per_cycle + 2, 5),
       max_rotations_per_cycle: settings.max_rotations_per_cycle
     };
   }
@@ -7031,7 +7031,7 @@ function buildPositionSizingDecision(action, portfolio, tradeKind = "buy") {
   const reasonCodes = [];
   const blockers = [];
 
-  const regimeMultiplier = policy.regime === "risk_on" ? 1.05 : policy.regime === "risk_off" ? 0.4 : 0.85;
+  const regimeMultiplier = policy.regime === "risk_on" ? 1.3 : policy.regime === "risk_off" ? 0.4 : 0.85;
   const liquidityMultiplier = liquidity <= 0 ? 0.75 : liquidity < 100000 ? 0.65 : 1;
   const performanceMultiplier = policy.reason_codes?.includes("negative_recent_profit_factor")
     ? computeRecentPerformanceThrottleMultiplier(policy?.recent_performance?.profit_factor)
