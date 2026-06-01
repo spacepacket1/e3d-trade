@@ -99,7 +99,11 @@ const SETTINGS_DEFAULTS = {
   age_decay_per_day: 0.75,             // score penalty per day held
   recent_performance_window_hours: 24,
   scout_max_candidates: 6,
-  fee_bps_per_side: 12.5
+  fee_bps_per_side: 12.5,
+  max_mark_deviation_ratio: 5,         // reject a position mark that deviates >5x from the e3d anchor
+  max_source_price_divergence_ratio: 3,        // general band: drop a candidate whose e3d price diverges >3x from an independent feed
+  max_source_price_divergence_ratio_pegged: 1.25, // peg-sensitive tokens (stables/FX/soft-pegs): tolerate at most ±25% across sources
+  require_independent_price_below_liquidity_usd: 250000 // below this liquidity, refuse to trade without an independent price (fail closed)
 };
 
 function nowIso() {
@@ -621,14 +625,15 @@ function syncPortfolioToMongo(portfolio) {
       );
     `;
 
-    // Pipe script via stdin to avoid ARG_MAX when the portfolio JSON is large
+    // Pipe script via stdin to avoid ARG_MAX when the portfolio JSON is large.
+    // stderr is ignored so a missing docker daemon doesn't flood the log on every cycle.
     runShell("docker", [
       "exec",
       "-i",
       MONGO_CONTAINER_NAME,
       "mongosh",
       "--quiet"
-    ], { input: mongoScript });
+    ], { input: mongoScript, stdio: ["pipe", "pipe", "ignore"] });
   } catch (err) {
     log("mongo_sync_error", { message: err.message });
   }
@@ -2692,21 +2697,41 @@ function buildAgentCoverageLog(agentId, payload) {
     : [];
   const selfReportedTypes = selfReported.map((s) => String(s?.type || s || "").toUpperCase()).filter(Boolean);
 
-  // Evidence-cited: extract story type mentions from candidate evidence[] and risks[]
+  // Evidence-cited: extract story type mentions from candidate evidence[] and risks[].
+  // The tool-use scout/harvest emit evidence as free-text strings; the v1 evidence-shortlist
+  // path emits {type, ...} objects. Scan both shapes.
   const evidenceCited = new Set();
   const allItems = [
     ...(payload?.candidates || []),
     ...(payload?.exit_candidates || []),
     ...(payload?.holdings_updates || []),
   ];
+  const expectedUpper = expected.map((t) => t.toUpperCase());
+  const scanText = (text) => {
+    if (!text) return;
+    const upper = String(text).toUpperCase();
+    for (const t of expectedUpper) {
+      // Whole-word match (\b treats underscore as a word char, so WASH_TRADE
+      // matches as one token and won't false-positive on substrings).
+      if (new RegExp(`\\b${t}\\b`).test(upper)) evidenceCited.add(t);
+    }
+  };
   for (const item of allItems) {
     for (const e of item?.evidence || []) {
-      const t = String(e?.type || e?.story_type || "").toUpperCase();
-      if (t) evidenceCited.add(t);
+      if (typeof e === "string") {
+        scanText(e);
+      } else {
+        const t = String(e?.type || e?.story_type || "").toUpperCase();
+        if (t) evidenceCited.add(t);
+      }
     }
     for (const r of item?.risks || []) {
-      const t = String(r?.type || r?.story_type || "").toUpperCase();
-      if (t) evidenceCited.add(t);
+      if (typeof r === "string") {
+        scanText(r);
+      } else {
+        const t = String(r?.type || r?.story_type || "").toUpperCase();
+        if (t) evidenceCited.add(t);
+      }
     }
   }
 
@@ -3085,7 +3110,23 @@ let _activeTokensCache = []; // shared with tool handler for /token-info fallbac
 // 3 drill-down tool calls + 1 final answer = 4 rounds total.
 const DRILL_DOWN_MAX_ROUNDS = 4;
 // Symbols that are never trading candidates — filtered out before the LLM sees them.
-const NONTRADEABLE_RE = /^(USDC?|USDT|DAI|USDS|BUSD|TUSD|FRAX|LUSD|SUSD|GUSD|PYUSD|FDUSD|USDE|SUSDE|USDY|USDP|HUSD|MUSD|CRVUSD|GHO|XAUt|PAXG|CACHE|XAUT|WETH|WBTC|cbBTC|rETH|stETH|wstETH|cbETH|ankrETH|BETH|sETH2|ETH2x|STETH|ETH|TBTC|E3D)$/i;
+// Stripping wrapper prefixes (Aave V2/V3, Compound, Spark, Yearn) catches aEthUSDC,
+// aUSDC, cUSDC, sDAI, yvUSDC, etc. — previously these slipped past an anchored regex
+// and one (aEthUSDC) cost us $950 on 2026-05-19.
+const NONTRADEABLE_BASE_RE = /^(USDC?|USDT|DAI|USDS|BUSD|TUSD|FRAX|LUSD|SUSD|GUSD|PYUSD|FDUSD|USDE|SUSDE|USDY|USDP|HUSD|MUSD|CRVUSD|GHO|RLUSD|USDX|USDK|USDM|XAUt|PAXG|CACHE|XAUT|WETH|WBTC|cbBTC|rETH|stETH|wstETH|cbETH|ankrETH|BETH|sETH2|ETH2x|STETH|ETH|TBTC|E3D)$/i;
+// Longest first so aeth/apol/etc. aren't partial-matched by the bare `a`.
+const NONTRADEABLE_WRAPPER_PREFIXES = ["aeth","apol","aarb","aavax","aopt","abas","abase","aop","yv","cm","a","c","sd","s"];
+function isNonTradeable(sym) {
+  const s = String(sym || "").toLowerCase();
+  if (!s) return false;
+  if (NONTRADEABLE_BASE_RE.test(s)) return true;
+  for (const p of NONTRADEABLE_WRAPPER_PREFIXES) {
+    if (s.length > p.length && s.startsWith(p) && NONTRADEABLE_BASE_RE.test(s.slice(p.length))) return true;
+  }
+  return false;
+}
+// Regex-shaped facade so existing `.test()` callers keep working.
+const NONTRADEABLE_RE = { test: isNonTradeable };
 
 function computeCandidateScorecard(candidate, storySig) {
   const signalTypes = Array.isArray(candidate.signal_types) ? candidate.signal_types : [];
@@ -3503,7 +3544,7 @@ function fetchScoutData() {
   // Strip stablecoins, gold tokens, and base/wrapped assets — these are not momentum-trading
   // candidates and dominate the volume ranking, causing the LLM to propose them when
   // there are no stories to guide it toward real opportunities.
-  const nonTradeablePattern = /^(USDC?|USDT|DAI|USDS|BUSD|TUSD|FRAX|LUSD|SUSD|GUSD|PYUSD|FDUSD|USDE|SUSDE|USDY|USDP|HUSD|MUSD|CRVUSD|GHO|PYUSD|XAUt|PAXG|CACHE|XAUT|WETH|WBTC|cbBTC|rETH|stETH|wstETH|cbETH|ankrETH|BETH|sETH2|ETH2x|STETH|ETH|TBTC|E3D)$/i;
+  const nonTradeablePattern = NONTRADEABLE_RE;
   const tokenUniverse = tokenUniverseAll.filter(t => !nonTradeablePattern.test(t.symbol || ""));
 
   // Enrich universe with story-mentioned tokens not in the top-volume list.
@@ -5109,9 +5150,7 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
           const addr = cleanAddress(pos.contract_address || "");
           const flow = addr ? _cycleQuantContext.token_flow[addr] : null;
           if ((flow?.price_usd ?? 0) > 0 && flow.price_usd !== pos.current_price) {
-            pos.current_price = flow.price_usd;
-            pos.market_value_usd = pos.quantity * flow.price_usd;
-            pos.last_updated_at = nowIso();
+            applyPositionMark(pos, flow.price_usd, "dexscreener_flow", markDeviationLimit(portfolio));
           }
         }
       }
@@ -5413,9 +5452,7 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
           const addr = cleanAddress(pos.contract_address || "");
           const flow = addr ? _cycleQuantContext.token_flow[addr] : null;
           if ((flow?.price_usd ?? 0) > 0 && flow.price_usd !== pos.current_price) {
-            pos.current_price = flow.price_usd;
-            pos.market_value_usd = pos.quantity * flow.price_usd;
-            pos.last_updated_at = nowIso();
+            applyPositionMark(pos, flow.price_usd, "dexscreener_flow", markDeviationLimit(portfolio));
           }
         }
       }
@@ -5990,9 +6027,7 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
       const addr = cleanAddress(pos.contract_address || "");
       const flow = addr ? _cycleQuantContext.token_flow[addr] : null;
       if ((flow?.price_usd ?? 0) > 0 && flow.price_usd !== pos.current_price) {
-        pos.current_price    = flow.price_usd;
-        pos.market_value_usd = pos.quantity * flow.price_usd;
-        pos.last_updated_at  = nowIso();
+        applyPositionMark(pos, flow.price_usd, "dexscreener_flow", markDeviationLimit(portfolio));
       }
     }
   }
@@ -7241,6 +7276,161 @@ function attachPaperOrderLifecycle(trade, options = {}) {
 // Update held position prices using the token universe fetched this cycle.
 // Prevents positions from being stuck at their entry price indefinitely —
 // accurate prices are required for Harvest to make meaningful exit decisions.
+// Per-portfolio mark-deviation limit (falls back to the default if unset).
+function markDeviationLimit(portfolio) {
+  return toNum(portfolio?.settings?.max_mark_deviation_ratio, SETTINGS_DEFAULTS.max_mark_deviation_ratio);
+}
+
+// Apply a new market price to a held position, but REJECT it if it diverges beyond `maxDev`
+// from the authoritative e3d anchor (last_market_snapshot, falling back to the existing mark /
+// entry price). This is the guard that prevents a divergent third-party tick (e.g. a DexScreener
+// price for the same address) from silently overwriting the e3d-based mark and tripping targets.
+// Returns true if the mark was applied, false if rejected.
+function applyPositionMark(pos, newPrice, source, maxDev = SETTINGS_DEFAULTS.max_mark_deviation_ratio) {
+  const price = toNum(newPrice, 0);
+  if (!(price > 0)) return false;
+  const anchor = toNum(pos?.last_market_snapshot?.market_data?.current_price,
+                  toNum(pos?.current_price, toNum(pos?.avg_entry_price, 0)));
+  if (anchor > 0 && maxDev > 0) {
+    const ratio = price / anchor;
+    if (ratio > maxDev || ratio < 1 / maxDev) {
+      log("position_mark_rejected", {
+        symbol: pos?.symbol, source, rejected_price: price, anchor, ratio: +ratio.toFixed(2)
+      });
+      return false;
+    }
+  }
+  pos.current_price = price;
+  pos.market_value_usd = pos.quantity * price;
+  pos.last_updated_at = nowIso();
+  return true;
+}
+
+// Reconcile any latched/stale mark back to the authoritative e3d snapshot so a divergent value
+// cannot persist once a token drops out of the live feeds (the "freeze" failure mode). Run at the
+// choke point right before sell decisions so targets/stops are always evaluated against a trusted price.
+function reconcilePositionMarks(portfolio) {
+  const maxDev = markDeviationLimit(portfolio);
+  const resnapped = [];
+  for (const pos of Object.values(portfolio?.positions || {})) {
+    const anchor = toNum(pos?.last_market_snapshot?.market_data?.current_price, 0);
+    const cur = toNum(pos?.current_price, 0);
+    if (!(anchor > 0) || !(cur > 0) || !(maxDev > 0)) continue;
+    const ratio = cur / anchor;
+    if (ratio > maxDev || ratio < 1 / maxDev) {
+      pos.current_price = anchor;
+      pos.market_value_usd = pos.quantity * anchor;
+      pos.last_updated_at = nowIso();
+      resnapped.push({ symbol: pos.symbol, from: cur, to: anchor, ratio: +ratio.toFixed(2) });
+    }
+  }
+  if (resnapped.length) log("position_mark_resnapped", { count: resnapped.length, positions: resnapped });
+}
+
+// Symbols that should track a peg (fiat, FX, or another asset) but slip past the hard
+// NONTRADEABLE filter — e.g. RAI (a non-fiat-pegged stable, ~$3). For these, ANY material
+// source disagreement is a bad feed rather than a trade: RAI was bought at $10.50 vs a real
+// ~$3 (3.5x), which sailed under the old 5x band and stop-lossed for -$190. Hold them to a
+// far tighter divergence band and refuse to trade them without independent corroboration.
+// Extend this list as new soft-pegged offenders are found.
+const PEG_SENSITIVE_SYMBOL_RE = /^(RAI|FLOAT|FPI|MIM|USTC|VAI|DOLA|MAI|ALUSD|DUSD|EURS|EURT|EUROC|AGEUR|XSGD|CADC|BIDR|IDRT)$/i;
+function isPegSensitive(symbol, category) {
+  if (/stable|peg|fiat|forex|\bfx\b/i.test(String(category || ""))) return true;
+  return PEG_SENSITIVE_SYMBOL_RE.test(String(symbol || "").trim());
+}
+
+// Resolve the max allowed e3d-vs-reference divergence for a candidate. Peg-sensitive tokens
+// get a far tighter band than general momentum tokens.
+function sourceDivergenceLimitFor(symbol, category, portfolio) {
+  const s = portfolio?.settings || {};
+  if (isPegSensitive(symbol, category)) {
+    return toNum(s.max_source_price_divergence_ratio_pegged,
+                 SETTINGS_DEFAULTS.max_source_price_divergence_ratio_pegged);
+  }
+  return toNum(s.max_source_price_divergence_ratio,
+               SETTINGS_DEFAULTS.max_source_price_divergence_ratio);
+}
+
+// Cross-source price validation at the candidate gate. e3d has mispriced tokens by 100-2000x — the
+// SATA incident priced it at $0.00000796 vs a real ~$0.0015, and the pipeline trusted it blindly,
+// "buying" a fictional 105M-token position. Before risk sees a candidate, corroborate e3d's price
+// against an independent on-chain feed (DexScreener, via the same enrichment harvest already uses).
+//
+// Two failure modes this guards against:
+//   1. Sources disagree beyond the symbol-aware band  -> drop (divergence).
+//   2. No independent price exists at all             -> FAIL CLOSED for the mispricing-prone
+//      population (peg-sensitive tokens + thin/unknown liquidity), where e3d misprices most often
+//      and DexScreener is least likely to have a quote. The old code trusted e3d blindly here,
+//      which is exactly how SATA/RAI-class entries got through. High-liquidity non-peg tokens are
+//      still allowed when uncorroborated, since e3d is reliable for liquid majors and blocking them
+//      all would starve the scout. Tagged on each candidate as `_price_validation`.
+function validateCandidatePricesAgainstSources(candidates, portfolio) {
+  if (!Array.isArray(candidates) || !candidates.length) return candidates || [];
+  const liqFloor = toNum(portfolio?.settings?.require_independent_price_below_liquidity_usd,
+                         SETTINGS_DEFAULTS.require_independent_price_below_liquidity_usd);
+  const survivors = [];
+  let droppedDivergence = 0, droppedNoCorroboration = 0, allowedUnvalidated = 0;
+  for (const c of candidates) {
+    const symbol = c?.token?.symbol;
+    const category = c?.token?.category;
+    const e3dPrice = toNum(c?.market_data?.current_price, 0);
+    const liquidity = toNum(c?.liquidity_data?.liquidity_usd, toNum(c?.liquidity_usd, 0));
+    const pegSensitive = isPegSensitive(symbol, category);
+    const maxDiv = sourceDivergenceLimitFor(symbol, category, portfolio);
+    const addr = cleanAddress(c?.token?.contract_address || c?.address || "");
+    let refPrice = 0, refSource = null;
+    if (addr && _cycleQuantContext) {
+      try {
+        const { flow } = enrichCandidateQuant(addr, symbol, _cycleQuantContext);
+        if ((flow?.price_usd ?? 0) > 0) { refPrice = flow.price_usd; refSource = "dexscreener"; }
+      } catch { /* tolerate — handled as missing corroboration below */ }
+    }
+
+    // Case 1: we have both prices — enforce the symbol-aware divergence band.
+    if (e3dPrice > 0 && refPrice > 0 && maxDiv > 0) {
+      const ratio = e3dPrice / refPrice;
+      const ok = !(ratio > maxDiv || ratio < 1 / maxDiv);
+      c._price_validation = { e3d_price: e3dPrice, ref_price: refPrice, ref_source: refSource,
+                              ratio: +ratio.toFixed(2), max_div: maxDiv, peg_sensitive: pegSensitive, ok };
+      if (!ok) {
+        droppedDivergence++;
+        log("candidate_price_divergence_rejected", { symbol, address: addr, ...c._price_validation });
+        continue;
+      }
+      survivors.push(c);
+      continue;
+    }
+
+    // Case 2: no independent corroboration. Fail closed for the mispricing-prone population.
+    const thinLiquidity = liqFloor > 0 && (!(liquidity > 0) || liquidity < liqFloor);
+    const requireCorroboration = pegSensitive || thinLiquidity;
+    c._price_validation = { e3d_price: e3dPrice, ref_price: refPrice || null, ref_source: refSource,
+                            ratio: null, max_div: maxDiv, peg_sensitive: pegSensitive,
+                            liquidity_usd: liquidity || null, note: "no_independent_price",
+                            ok: !requireCorroboration };
+    if (requireCorroboration) {
+      droppedNoCorroboration++;
+      log("candidate_no_corroboration_rejected", {
+        symbol, address: addr,
+        reason: pegSensitive ? "peg_sensitive_requires_independent_price" : "thin_liquidity_requires_independent_price",
+        ...c._price_validation
+      });
+      continue;
+    }
+    allowedUnvalidated++;
+    survivors.push(c);
+  }
+  if (droppedDivergence || droppedNoCorroboration || allowedUnvalidated) {
+    log("candidate_price_validation_summary", {
+      input: candidates.length, kept: survivors.length,
+      dropped_divergence: droppedDivergence,
+      dropped_no_corroboration: droppedNoCorroboration,
+      allowed_unvalidated: allowedUnvalidated
+    });
+  }
+  return survivors;
+}
+
 function refreshPositionPrices(portfolio, tokenUniverse) {
   if (!Array.isArray(tokenUniverse) || !tokenUniverse.length) return;
   const priceMap = new Map();
@@ -7255,10 +7445,8 @@ function refreshPositionPrices(portfolio, tokenUniverse) {
     const t = priceMap.get(addr);
     if (!t || !((t.price_usd ?? 0) > 0)) continue;
     const oldPrice = pos.current_price;
-    pos.current_price = t.price_usd;
-    pos.market_value_usd = pos.quantity * t.price_usd;
+    if (!applyPositionMark(pos, t.price_usd, "token_universe", markDeviationLimit(portfolio))) continue;
     if ((t.liquidity_usd ?? 0) > 0) pos.liquidity_usd = t.liquidity_usd;
-    pos.last_updated_at = nowIso();
     refreshed.push({ symbol: pos.symbol, old_price: oldPrice, new_price: t.price_usd });
   }
   if (refreshed.length) log("position_prices_refreshed", { count: refreshed.length, positions: refreshed });
@@ -7299,11 +7487,15 @@ function updateHoldingsFromScout(portfolio, updates) {
 // Symbols that should never be held as trading positions.
 // If one ends up in the portfolio (Scout hallucinated it, rotation logic opened it, etc.)
 // it gets force-exited here before any further cycle logic runs.
-const FORCE_EXIT_PATTERN = /^(USDC?|USDT|DAI|USDS|BUSD|TUSD|FRAX|LUSD|SUSD|GUSD|PYUSD|FDUSD|USDE|SUSDE|USDY|USDP|HUSD|MUSD|CRVUSD|GHO|RLUSD|USDX|USDK|USDM|XAUt|PAXG|CACHE|XAUT|WETH|WBTC|cbBTC|rETH|stETH|wstETH|cbETH|ankrETH|BETH|sETH2|ETH2x|STETH)$/i;
+const FORCE_EXIT_PATTERN = NONTRADEABLE_RE;
 
 function evaluateSellActions(portfolio) {
   const actions = [];
   const targetPct = portfolio.settings.target_partial_pct;
+
+  // Never evaluate stops/targets against a divergent (corrupt or latched-stale) mark: snap any
+  // position whose price drifted beyond the deviation limit back to the authoritative e3d anchor first.
+  reconcilePositionMarks(portfolio);
 
   for (const pos of Object.values(portfolio.positions)) {
     const price = toNum(pos.current_price, 0);
@@ -8706,6 +8898,9 @@ async function runCycle(runContext = {}) {
     for (const trade of harvestTrades) sendTradeEmail(trade);
 
     // 5. RISK ON CANDIDATES
+    // Cross-source price validation first: reject any candidate whose e3d price can't be corroborated
+    // by an independent feed (guards against the e3d mispricing that caused the SATA incident).
+    scoutPayload.candidates = validateCandidatePricesAgainstSources(scoutPayload.candidates || [], portfolio);
     const { approved, rejected } = runRiskForCandidates(scoutPayload.candidates || [], portfolio);
     log("risk_approved", approved.map((x) => ({
       symbol: x.token.symbol,
