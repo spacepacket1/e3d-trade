@@ -1738,6 +1738,7 @@ function clearMongoState() {
       "--quiet"
     ], {
       input: script,
+      stdio: ["pipe", "pipe", "ignore"],
       env: {
         ...process.env,
         MONGO_DATABASE_NAME
@@ -2130,6 +2131,7 @@ function tryLoadPortfolioFromMongo() {
       "--quiet"
     ], {
       input: script,
+      stdio: ["pipe", "pipe", "ignore"],
       env: {
         ...process.env,
         MONGO_DATABASE_NAME
@@ -2904,7 +2906,14 @@ if (IS_MAIN_MODULE) {
 
   server.on("upgrade", wsHandleUpgrade);
 
-  recoverPipelineIfRunning();
+  const recovered = recoverPipelineIfRunning();
+  if (!recovered && process.env.AUTO_START_PIPELINE !== "false") {
+    // No surviving pipeline child to reattach to — spawn a fresh one so a
+    // server restart doesn't leave the cycle loop dead.
+    const intervalSeconds = Number(process.env.AUTO_START_PIPELINE_INTERVAL_SECONDS) || 300;
+    console.log(`[server] No pipeline recovered — auto-starting (interval ${intervalSeconds}s)`);
+    startPipelineProcess(intervalSeconds);
+  }
   writeDashboardHeartbeat();
   const dashboardHeartbeatTimer = setInterval(writeDashboardHeartbeat, 30000);
   dashboardHeartbeatTimer.unref?.();
