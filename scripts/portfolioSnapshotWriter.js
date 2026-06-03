@@ -10,6 +10,30 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT = path.resolve(__dirname, "..");
 
+// Load .env before reading any process.env values (same pattern as e3dActionOutcomeExport.js)
+function loadDotEnv(root) {
+  let raw;
+  try {
+    raw = fs.readFileSync(path.join(root, ".env"), "utf8");
+  } catch {
+    return;
+  }
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eqIndex = trimmed.indexOf("=");
+    if (eqIndex < 1) continue;
+    const key = trimmed.slice(0, eqIndex).trim();
+    if (!key || key.includes(" ") || process.env[key] != null) continue;
+    let value = trimmed.slice(eqIndex + 1).split("#")[0].trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    process.env[key] = value;
+  }
+}
+loadDotEnv(ROOT);
+
 const PORTFOLIO_ID = "default";
 const INITIAL_CASH_USD = 100000;
 const COINGECKO_URL =
