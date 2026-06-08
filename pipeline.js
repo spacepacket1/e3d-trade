@@ -27,6 +27,21 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Load .env so env vars are always fresh regardless of how this process was spawned.
+try {
+  const envLines = fs.readFileSync(path.join(__dirname, ".env"), "utf8").split("\n");
+  for (const line of envLines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    let val = trimmed.slice(eq + 1).trim();
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) val = val.slice(1, -1);
+    if (key) process.env[key] = val;
+  }
+} catch (_) {}
+
 const LOG_DIR = path.join(__dirname, "logs");
 const REPORTS_DIR = path.join(__dirname, "reports");
 const PORTFOLIO_FILE = path.join(__dirname, "portfolio.json");
@@ -39,9 +54,11 @@ const RETRAINING_READINESS_FILE = path.join(REPORTS_DIR, "retraining-readiness.j
 const TRAINING_EVENT_SCHEMA_VERSION = "1.0";
 const MONGO_CONTAINER_NAME = process.env.E3D_MONGO_CONTAINER || "e3d-mongo";
 const MONGO_DATABASE_NAME = process.env.E3D_MONGO_DATABASE || "e3d";
-const CLICKHOUSE_HTTP_URL = process.env.E3D_CLICKHOUSE_HTTP_URL || "http://127.0.0.1:8123";
-const CLICKHOUSE_DATABASE_NAME = process.env.E3D_CLICKHOUSE_DATABASE || "e3d";
+const CLICKHOUSE_HTTP_URL = process.env.AWS_E3D_CLICKHOUSE_HTTP_URL || process.env.E3D_CLICKHOUSE_HTTP_URL || "http://127.0.0.1:8123";
+const CLICKHOUSE_DATABASE_NAME = process.env.AWS_E3D_CLICKHOUSE_DATABASE || process.env.E3D_CLICKHOUSE_DATABASE || "e3d";
 const CLICKHOUSE_TABLE_NAME = process.env.E3D_CLICKHOUSE_TABLE || "training_events";
+const CLICKHOUSE_USER = process.env.AWS_E3D_CLICKHOUSE_USER || process.env.E3D_CLICKHOUSE_USER || "";
+const CLICKHOUSE_PASSWORD = process.env.AWS_E3D_CLICKHOUSE_PASSWORD || process.env.E3D_CLICKHOUSE_PASSWORD || "";
 const E3D_API_BASE_URL = process.env.E3D_API_BASE_URL || "https://e3d.ai/api";
 const E3D_TOKENS_DATA_SOURCE = Number(process.env.E3D_TOKENS_DATA_SOURCE || 1);
 const E3D_TRANSACTIONS_DATA_SOURCE = Number(process.env.E3D_TRANSACTIONS_DATA_SOURCE || 1);
@@ -282,9 +299,13 @@ function filterScoutCandidatesAgainstPortfolio(candidates, portfolio) {
 
 function clickHouseQuery(query, input = "") {
   const url = `${CLICKHOUSE_HTTP_URL}/?database=${encodeURIComponent(CLICKHOUSE_DATABASE_NAME)}&query=${encodeURIComponent(query)}`;
-  return runShell("curl", ["-sS", "-X", "POST", url, "--data-binary", "@-"], {
-    input
-  });
+  const curlArgs = ["-sS", "-X", "POST", url, "--data-binary", "@-"];
+  if (CLICKHOUSE_USER) curlArgs.push("-u", `${CLICKHOUSE_USER}:${CLICKHOUSE_PASSWORD}`);
+  const result = runShell("curl", curlArgs, { input });
+  if (result && /^Code:\s*\d+/.test(result.trim())) {
+    throw new Error(`ClickHouse error: ${result.trim().slice(0, 300)}`);
+  }
+  return result;
 }
 
 function ensurePersistentStores() {

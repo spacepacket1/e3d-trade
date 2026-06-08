@@ -61,9 +61,11 @@ const DASHBOARD_HEARTBEAT_FILE = path.join(LOG_DIR, "dashboard-heartbeat.json");
 const RETRAINING_READINESS_FILE = path.join(REPORTS_DIR, "retraining-readiness.json");
 const MONGO_CONTAINER_NAME = process.env.E3D_MONGO_CONTAINER || "e3d-mongo";
 const MONGO_DATABASE_NAME = process.env.E3D_MONGO_DATABASE || "e3d";
-const CLICKHOUSE_HTTP_URL = process.env.E3D_CLICKHOUSE_HTTP_URL || "http://127.0.0.1:8123";
-const CLICKHOUSE_DATABASE_NAME = process.env.E3D_CLICKHOUSE_DATABASE || "e3d";
+const CLICKHOUSE_HTTP_URL = process.env.AWS_E3D_CLICKHOUSE_HTTP_URL || process.env.E3D_CLICKHOUSE_HTTP_URL || "http://127.0.0.1:8123";
+const CLICKHOUSE_DATABASE_NAME = process.env.AWS_E3D_CLICKHOUSE_DATABASE || process.env.E3D_CLICKHOUSE_DATABASE || "e3d";
 const CLICKHOUSE_TABLE_NAME = process.env.E3D_CLICKHOUSE_TABLE || "training_events";
+const CLICKHOUSE_USER = process.env.AWS_E3D_CLICKHOUSE_USER || process.env.E3D_CLICKHOUSE_USER || "";
+const CLICKHOUSE_PASSWORD = process.env.AWS_E3D_CLICKHOUSE_PASSWORD || process.env.E3D_CLICKHOUSE_PASSWORD || "";
 const TOKEN_METADATA_CACHE = new Map();
 const TOKEN_METADATA_TTL_MS = 6 * 60 * 60 * 1000;
 const PIPELINE_ENTRYPOINT = path.join(ROOT, "pipeline.js");
@@ -1753,8 +1755,9 @@ function clearMongoState() {
 function clearClickHouseState() {
   try {
     const query = `TRUNCATE TABLE IF EXISTS ${CLICKHOUSE_DATABASE_NAME}.${CLICKHOUSE_TABLE_NAME}`;
+    const chHeaders = CLICKHOUSE_USER ? { Authorization: `Basic ${Buffer.from(`${CLICKHOUSE_USER}:${CLICKHOUSE_PASSWORD}`).toString("base64")}` } : {};
     const response = fetch(`${CLICKHOUSE_HTTP_URL}/?database=${encodeURIComponent(CLICKHOUSE_DATABASE_NAME)}&query=${encodeURIComponent(query)}`, {
-      method: "POST"
+      method: "POST", headers: chHeaders
     });
     return Boolean(response?.ok);
   } catch {
@@ -2167,9 +2170,9 @@ function tryLoadEventsFromClickHouse() {
       LIMIT 250
       FORMAT JSONEachRow
     `;
-
+    const chHeaders2 = CLICKHOUSE_USER ? { Authorization: `Basic ${Buffer.from(`${CLICKHOUSE_USER}:${CLICKHOUSE_PASSWORD}`).toString("base64")}` } : {};
     const response = fetch(`${CLICKHOUSE_HTTP_URL}/?database=${encodeURIComponent(CLICKHOUSE_DATABASE_NAME)}&query=${encodeURIComponent(query)}`, {
-      method: "POST"
+      method: "POST", headers: chHeaders2
     });
 
     if (!response.ok) return null;
@@ -2252,8 +2255,9 @@ async function loadActivity() {
       LIMIT 250
       FORMAT JSONEachRow
     `;
+    const chHeaders3 = CLICKHOUSE_USER ? { Authorization: `Basic ${Buffer.from(`${CLICKHOUSE_USER}:${CLICKHOUSE_PASSWORD}`).toString("base64")}` } : {};
     const response = await fetch(`${CLICKHOUSE_HTTP_URL}/?database=${encodeURIComponent(CLICKHOUSE_DATABASE_NAME)}&query=${encodeURIComponent(query)}`, {
-      method: "POST"
+      method: "POST", headers: chHeaders3
     });
     if (response.ok) {
       const text = await response.text();
