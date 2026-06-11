@@ -23,6 +23,9 @@ import {
   SCOUT_EVIDENCE_SHORTLIST_DEFAULT_LIMIT,
   SCOUT_FLOW_ONLY_PER_CYCLE_LIMIT
 } from "./scripts/evidencePackets.js";
+import { fetchMapsContext } from "./scripts/mapsClient.js";
+import { buildMapsNavigatorPrecheck } from "./scripts/mapsHarvestPrecheck.js";
+import { applyMapsRouteScoreAdjustment, buildScoutMapsRoute } from "./scripts/mapsScoutRoute.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -70,6 +73,9 @@ const E3D_DOSSIER_MAX_COUNTERPARTIES = 5;
 const PAPER_ORDER_STRATEGY_VERSION = process.env.E3D_STRATEGY_VERSION || "paper-pipeline-v1";
 const PAPER_FILL_MODEL_VERSION = "paper-portfolio-fill-v1";
 const HARVEST_EVIDENCE_PACKET_MAX_ITEMS = 8;
+const MAPS_CLOSED_ROUTE_PENALTY = Number(process.env.MAPS_CLOSED_ROUTE_PENALTY || 0.25);
+const MAPS_STRENGTHENING_ROUTE_BONUS = Number(process.env.MAPS_STRENGTHENING_ROUTE_BONUS || 0.10);
+const MAPS_MIN_CONFIDENCE_THRESHOLD = Number(process.env.MAPS_MIN_CONFIDENCE_THRESHOLD || 0.50);
 
 // Rate-limit budget management.
 // Tiers: free=100/day @5000ms, premium=1000/day @1000ms, enterprise=100000/day @10ms
@@ -154,6 +160,13 @@ function log(stage, data) {
   );
 }
 
+function logAgentRaw(entry = {}) {
+  fs.appendFileSync(
+    AGENT_RAW_LOG,
+    JSON.stringify({ ts: nowIso(), ...entry }) + "\n"
+  );
+}
+
 function setLastLLMMeta(agent, meta) {
   if (!agent) return;
   LAST_LLM_META.set(agent, { ...(meta || {}) });
@@ -169,6 +182,50 @@ function runShell(command, args, options = {}) {
     maxBuffer: 10 * 1024 * 1024,
     ...options
   });
+}
+
+function buildHarvestMapsPrecheckBlock(entries = []) {
+  const lines = [];
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    const precheckLines = Array.isArray(entry?.maps_precheck?.lines) ? entry.maps_precheck.lines : [];
+    if (!precheckLines.length) continue;
+    lines.push(`Position ${entry.symbol || entry.address || "unknown"}:`);
+    lines.push(...precheckLines);
+  }
+  if (!lines.length) return [];
+  return ["--- MAPS NAVIGATOR PRE-CHECKS ---", ...lines];
+}
+
+function computeScoutThesisSignalScore(candidate = null, thesis = null, action = null) {
+  const actionScore = Number(action?.action_score);
+  if (Number.isFinite(actionScore)) {
+    return Math.max(0, Math.min(100, Math.round(actionScore * 100)));
+  }
+
+  const conviction = Number(
+    thesis?.conviction
+    ?? candidate?.thesis_conviction
+    ?? candidate?.conviction
+    ?? 0
+  );
+  if (!Number.isFinite(conviction) || conviction <= 0) return 0;
+  if (conviction > 80) return 95;
+  if (conviction >= 65) return 75;
+  if (conviction >= 50) return 55;
+  return 30;
+}
+
+function buildScoutMapsRoutePromptLines(entries = []) {
+  const lines = [];
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    const mapsRoute = entry?.packet_summary?.maps_route;
+    if (!mapsRoute) continue;
+    const symbol = entry?.symbol || entry?.packet_summary?.symbol || "unknown";
+    const confidence = Number(mapsRoute?.edge_confidence);
+    const formattedConfidence = Number.isFinite(confidence) ? confidence.toFixed(2) : "0.00";
+    lines.push(`MAPS ROUTE [${symbol}]: ${mapsRoute.destination ?? "unknown"} edge=${mapsRoute.edge_status ?? "unknown"} conf=${formattedConfidence} hazard=${mapsRoute.hazard_level ?? "unknown"}`);
+  }
+  return lines;
 }
 
 // Repair truncated JSON from LLM responses that hit max_tokens mid-output.
@@ -1823,7 +1880,10 @@ function printPortfolioSummary(portfolio) {
 
   console.log("📊 Portfolio summary:\n");
   console.log(JSON.stringify(summary, null, 2));
-  log("portfolio_summary", summary);
+  log("portfolio_summary", {
+    ...summary,
+    maps_context: _cycleMapsContext || null
+  });
 }
 
 function buildUrl(baseUrl, pathname, query = {}) {
@@ -2384,6 +2444,8 @@ function setCachedDossier(cacheKey, value) {
 let _cycleMarketContext = null;
 // Quant context: DexScreener order flow, macro regime, Binance funding rates — reset each cycle.
 let _cycleQuantContext = null;
+// Maps context: capital flow navigator signals — reset each cycle.
+let _cycleMapsContext = null;
 let _cycleRegimePolicy = null;
 let _cycleSignalSnapshot = null;
 let _cycleArbitrageSignals = [];
@@ -2859,6 +2921,14 @@ function callLLMDirect(systemPrompt, userMessage, { maxRetries = 1, agent = "unk
     system_chars: systemPrompt.length,
     user_chars: userMessage.length,
   });
+  logAgentRaw({
+    kind: "request",
+    agent,
+    req_id: reqId,
+    mode: "direct",
+    system_prompt: systemPrompt,
+    user_message: userMessage
+  });
 
   let lastErr;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -2908,6 +2978,14 @@ function callLLMDirect(systemPrompt, userMessage, { maxRetries = 1, agent = "unk
       };
       log("llm_response", meta);
       setLastLLMMeta(agent, meta);
+      logAgentRaw({
+        kind: "response",
+        agent,
+        req_id: reqId,
+        mode: "direct",
+        raw_response: text.trim(),
+        meta
+      });
       return text.trim();
     } catch (err) {
       lastErr = err;
@@ -3406,6 +3484,14 @@ function callLLMWithTools(systemPrompt, userMessage, tools, toolExecutor, { agen
     prompt_chars: systemPrompt.length + userMessage.length,
     system_chars: systemPrompt.length, user_chars: userMessage.length
   });
+  logAgentRaw({
+    kind: "request",
+    agent,
+    req_id: reqId,
+    mode: "tool_calling",
+    system_prompt: systemPrompt,
+    user_message: userMessage
+  });
 
   let totalPromptTokens = 0;
   let totalCompletionTokens = 0;
@@ -3473,6 +3559,14 @@ function callLLMWithTools(systemPrompt, userMessage, tools, toolExecutor, { agen
     };
     log("llm_response", meta);
     setLastLLMMeta(agent, meta);
+    logAgentRaw({
+      kind: "response",
+      agent,
+      req_id: reqId,
+      mode: "tool_calling",
+      raw_response: text.trim(),
+      meta
+    });
     return text.trim();
   }
 
@@ -4257,6 +4351,11 @@ function buildHarvestEvidenceReviewContext(portfolio, portfolioIntelligence = nu
         execution_data: executionData
       }
     }, portfolio, { evaluated_at: createdAt, mode: "paper", side: "sell" });
+    const mapsPrecheck = buildMapsNavigatorPrecheck({
+      symbol,
+      mapsContext: _cycleMapsContext
+    });
+    harvestInput.maps_precheck = mapsPrecheck;
     const packet = buildHarvestEvidencePacket(harvestInput, { created_at: createdAt });
     const packetSummary = {
       evidence_packet_id: packet.evidence_packet_id,
@@ -4276,6 +4375,7 @@ function buildHarvestEvidenceReviewContext(portfolio, portfolioIntelligence = nu
       quality_score: packet.quality_score,
       warnings: packet.warnings,
       blockers: packet.blockers,
+      maps_navigator_precheck: mapsPrecheck.prompt_prefix || null,
       evidence: packet.evidence.slice(0, HARVEST_EVIDENCE_PACKET_MAX_ITEMS).map((item) => ({
         evidence_id: item.evidence_id,
         source_type: item.source_type,
@@ -4291,6 +4391,7 @@ function buildHarvestEvidenceReviewContext(portfolio, portfolioIntelligence = nu
       symbol,
       dossier_item: dossierItem,
       harvest_input: harvestInput,
+      maps_precheck: mapsPrecheck,
       packet,
       packet_summary: packetSummary
     };
@@ -4739,6 +4840,16 @@ function buildScoutEvidenceShortlist(data, portfolio, options = {}) {
         liquidity_data: liquidityData,
         flow
       });
+      const mapsRoute = buildScoutMapsRoute(symbol, _cycleMapsContext);
+      const thesisSignalScoreBase = computeScoutThesisSignalScore(candidate, thesis, action);
+      const mapsRouteScoreAdjustment = applyMapsRouteScoreAdjustment(thesisSignalScoreBase, mapsRoute, {
+        closedRoutePenalty: MAPS_CLOSED_ROUTE_PENALTY,
+        strengtheningRouteBonus: MAPS_STRENGTHENING_ROUTE_BONUS,
+        minConfidenceThreshold: MAPS_MIN_CONFIDENCE_THRESHOLD
+      });
+      ranking.score += Number(mapsRouteScoreAdjustment.score_delta || 0);
+      ranking.maps_route_score_adjustment = mapsRouteScoreAdjustment;
+      ranking.maps_route = mapsRoute;
 
       entries.push({
         address: addr,
@@ -4760,6 +4871,10 @@ function buildScoutEvidenceShortlist(data, portfolio, options = {}) {
           story_evidence_count: packet.story_evidence_count,
           candidate_score: candidate?.convergence_score ?? null,
           thesis_conviction: thesis?.conviction ?? null,
+          thesis_signal_score: mapsRouteScoreAdjustment.adjusted_score,
+          thesis_signal_score_base: mapsRouteScoreAdjustment.base_score,
+          maps_route_score_adjustment: mapsRouteScoreAdjustment,
+          maps_route: mapsRoute,
           market_data: marketData,
           liquidity_data: liquidityData,
           execution_data: executionData,
@@ -4924,6 +5039,29 @@ function runScoutWithTools(portfolio, portfolioIntelligence = null) {
     "SKIP: stablecoins, wrapped assets, change_7d_pct > 300% (already pumped), MOVER/SURGE alone.",
     `SKIP ALREADY HELD: symbols=${JSON.stringify([...heldSymbols])}, addresses=${JSON.stringify([...heldAddresses])}`,
     macroContext ? `MACRO: regime=${macroContext.regime} new_positions_ok=${macroContext.new_positions_ok} tighten_stops=${macroContext.tighten_stops}` : "",
+    _cycleMapsContext?.destinations?.length
+      ? `MAPS DESTINATIONS: ${_cycleMapsContext.destinations
+          .slice(0, 3)
+          .map(d => `${d.destination}(conf=${(Number(d.confidence) || 0).toFixed(2)},${d.risk_level})`)
+          .join(", ")}`
+      : "",
+    _cycleMapsContext?.congestion?.length
+      ? `MAPS CONGESTION: ${_cycleMapsContext.congestion
+          .slice(0, 2)
+          .map(c => `${c.destination}(conf=${(Number(c.confidence) || 0).toFixed(2)})`)
+          .join(", ")}`
+      : "",
+    _cycleMapsContext?.hazards?.length
+      ? `MAPS HAZARDS: ${_cycleMapsContext.hazards
+          .slice(0, 2)
+          .map(h => `${h.origin}→${h.destination}(${h.risk_level})`)
+          .join(", ")}`
+      : "",
+    _cycleMapsContext?.closures?.length
+      ? `MAPS ROUTE CLOSURES: ${_cycleMapsContext.closures
+          .map(c => `${c.origin}→${c.destination} CLOSED — ${c.recommended_action}`)
+          .join("; ")}`
+      : "",
     macroContext?.new_positions_ok === false ? "MACRO GATE: only TIER 1 setups with conviction >= 80." : "",
     "",
     `Return up to ${scoutMaxCandidates} candidates. Prefer 0 over weak candidates.`,
@@ -5217,12 +5355,14 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
       rank: index + 1,
       ...entry.packet_summary
     }));
+    const scoutMapsRoutePromptLines = buildScoutMapsRoutePromptLines(shortlistBuild.shortlist);
     const systemPrompt = [
       "You are Scout, a crypto trading research agent.",
       "You are given compact evidence packets that were already ranked and filtered deterministically.",
       "Return STRICT JSON only: one object, no markdown, no commentary.",
       "Use only supplied evidence packets, tokens, contract addresses, evidence_packet_id values, and evidence_id values.",
       "Do not invent evidence. Do not cite evidence from a different packet. Do not propose a token that is not in the packets.",
+      ...scoutMapsRoutePromptLines,
       `Return up to ${scoutMaxCandidates} buy candidates. Prefer 0 candidates over a weak candidate.`,
       `Output shape: {scan_timestamp, candidates[], holdings_updates[], stories_checked[]}`,
       `Each candidate: {source_agent:"scout"|"user_watchlist", created_at:"${createdAt}", expires_at:"${expiresAt}", evidence_packet_id, token:{symbol,name,chain:"ethereum",contract_address,category}, setup_type, action:"buy", confidence:integer(0-100), conviction_score:integer(0-100), opportunity_score:integer(0-100), why_now, evidence:["evi_..."], risks[], entry_zone:{low,high}, invalidation_price, targets:{target_1,target_2,target_3}, market_data:{current_price,change_24h_pct,change_30m_pct,price_source,volume_24h_usd,market_cap_usd}, liquidity_data:{liquidity_usd,liquidity_source}, execution_data:{estimated_slippage_bps,quote_source}, portfolio_data:{current_token_exposure_pct:0,current_category_exposure_pct:0,current_total_exposure_pct:0}}`,
@@ -5377,6 +5517,8 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
           token_risk_scan: deepClone(shortlistEntry.scout_input.token_risk_scan),
           token_risk_scan_id: shortlistEntry.scout_input.token_risk_scan?.token_risk_scan_id || null,
           token_risk_scan_ref: buildTokenRiskScanRef(shortlistEntry.scout_input.token_risk_scan, { context: "scout_shortlist" }),
+          maps_route: shortlistEntry.packet_summary.maps_route || null,
+          maps_route_score_adjustment: shortlistEntry.packet_summary.maps_route_score_adjustment || null,
           portfolio_data: proposal?.portfolio_data && typeof proposal.portfolio_data === "object"
             ? proposal.portfolio_data
             : { current_token_exposure_pct: 0, current_category_exposure_pct: 0, current_total_exposure_pct: 0 }
@@ -6308,6 +6450,7 @@ function runHarvestDirect(portfolio, portfolioIntelligence = null) {
     `regime=${_cycleRegimePolicy.regime} allow_harvest_exits=${_cycleRegimePolicy.allow_harvest_exits} tighten_stops=${_cycleRegimePolicy.tighten_stops}`,
     `reason_codes=${(_cycleRegimePolicy.reason_codes || []).join(", ")}`
   ] : [];
+  const harvestMapsPrecheckLines = buildHarvestMapsPrecheckBlock(reviewContext.entries);
 
   const userMessage = [
     `Harvest task — ${createdAt} [evidence packets]`,
@@ -6320,6 +6463,7 @@ function runHarvestDirect(portfolio, portfolioIntelligence = null) {
     })}`,
     ...harvestMacroLines,
     ...harvestPolicyLines,
+    ...harvestMapsPrecheckLines,
     JSON.stringify({ harvest_packets: harvestPackets, stories_checked: reviewContext.stories_checked })
   ].join("\n");
 
@@ -6385,17 +6529,35 @@ function runHarvestWithTools(portfolio, portfolioIntelligence = null) {
     return emptyResult;
   }
 
-  const positionList = positions.map(p => ({
-    symbol: p.symbol, contract_address: p.contract_address, category: p.category,
-    quantity: p.quantity, avg_entry_price: p.avg_entry_price,
-    current_price: p.current_price, market_value_usd: p.market_value_usd,
-    cost_basis_usd: p.cost_basis_usd,
-    unrealized_pnl_usd: toNum(p.market_value_usd, 0) - toNum(p.cost_basis_usd, 0),
-    unrealized_pnl_pct: toNum(p.cost_basis_usd, 0) > 0
-      ? (((toNum(p.market_value_usd, 0) - toNum(p.cost_basis_usd, 0)) / toNum(p.cost_basis_usd, 0)) * 100)
-      : 0,
-    opened_at: p.opened_at
-  }));
+  const positionList = positions.map((p) => {
+    const mapsPrecheck = buildMapsNavigatorPrecheck({
+      symbol: p.symbol,
+      mapsContext: _cycleMapsContext
+    });
+    return {
+      symbol: p.symbol,
+      contract_address: p.contract_address,
+      category: p.category,
+      quantity: p.quantity,
+      avg_entry_price: p.avg_entry_price,
+      current_price: p.current_price,
+      market_value_usd: p.market_value_usd,
+      cost_basis_usd: p.cost_basis_usd,
+      unrealized_pnl_usd: toNum(p.market_value_usd, 0) - toNum(p.cost_basis_usd, 0),
+      unrealized_pnl_pct: toNum(p.cost_basis_usd, 0) > 0
+        ? (((toNum(p.market_value_usd, 0) - toNum(p.cost_basis_usd, 0)) / toNum(p.cost_basis_usd, 0)) * 100)
+        : 0,
+      opened_at: p.opened_at,
+      maps_navigator_precheck: mapsPrecheck.prompt_prefix || null
+    };
+  });
+  const toolPathMapsPrecheckLines = buildHarvestMapsPrecheckBlock(positionList.map((position) => ({
+    symbol: position.symbol,
+    address: position.contract_address,
+    maps_precheck: {
+      lines: position.maps_navigator_precheck ? position.maps_navigator_precheck.split("\n") : []
+    }
+  })));
 
   const macroContext = _cycleQuantContext?.macro;
   const macroLine = macroContext
@@ -6446,6 +6608,7 @@ function runHarvestWithTools(portfolio, portfolioIntelligence = null) {
     `Held positions (${positions.length}):`,
     JSON.stringify(positionList),
     `Cash: $${toNum(portfolio.cash_usd, 0).toFixed(2)}`,
+    ...toolPathMapsPrecheckLines,
     `Use your tools to research each position, then return your hold/exit decisions for all ${positions.length} positions.`
   ].join("\n");
 
@@ -6593,6 +6756,7 @@ function buildHarvestPrompt(portfolio, portfolioIntelligence = null) {
   const createdAt = nowIso();
   const expiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString();
   const reviewContext = buildHarvestEvidenceReviewContext(portfolio, portfolioIntelligence, { createdAt });
+  const mapsPrecheckLines = buildHarvestMapsPrecheckBlock(reviewContext.entries);
   const baseline = {
     market_regime: reviewContext.dossier.market_regime || "unknown",
     portfolio: reviewContext.dossier.prompt_snapshot?.portfolio || null,
@@ -6606,6 +6770,7 @@ function buildHarvestPrompt(portfolio, portfolioIntelligence = null) {
     `Trim/exit requires at least 2 valid evidence refs from the same packet; otherwise use monitor.`,
     `Each position_review and each exit_candidate must include evidence_packet_id.`,
     `Portfolio baseline: ${JSON.stringify(baseline)}`,
+    ...mapsPrecheckLines,
     `Harvest packets: ${JSON.stringify(reviewContext.entries.map((entry, index) => ({ rank: index + 1, ...entry.packet_summary })))}`,
     `stories_checked baseline: ${JSON.stringify(reviewContext.stories_checked)}`,
     `Output shape: {scan_timestamp, portfolio_summary, position_reviews[], exit_candidates[], stories_checked[]}`,
@@ -8747,6 +8912,7 @@ async function runCycle(runContext = {}) {
   // Reset per-cycle state
   _cycleMarketContext = null;
   _cycleQuantContext = null;
+  _cycleMapsContext = null;
   _cycleRegimePolicy = null;
   _cycleSignalSnapshot = null;
   _cycleArbitrageSignals = [];
@@ -8782,8 +8948,14 @@ async function runCycle(runContext = {}) {
   });
   setTrainingContext(trainingContext);
   // Build quant context: DexScreener flow for held positions, macro regime, Binance funding rates.
+  // Start best-effort Maps fetch before quant work so it overlaps this cycle's context assembly.
+  const cycleMapsContextPromise = fetchMapsContext({ signalLimit: 5 }).catch((error) => {
+    log("maps_context_error", { message: String(error?.message || error) });
+    return null;
+  });
   // Four external API calls total — all synchronous curl, completing in ~3s.
   _cycleQuantContext = buildCycleQuantContext(portfolio);
+  _cycleMapsContext = await cycleMapsContextPromise;
   log("quant_context", {
     macro_regime: _cycleQuantContext.macro?.regime,
     new_positions_ok: _cycleQuantContext.macro?.new_positions_ok,
@@ -8793,6 +8965,19 @@ async function runCycle(runContext = {}) {
     token_flow_count: Object.keys(_cycleQuantContext.token_flow || {}).length,
     funding_rates_count: Object.keys(_cycleQuantContext.funding_rates || {}).length,
   });
+  log("maps_context", _cycleMapsContext || null);
+  // Use flow_graph.created_at (a Maps-sourced timestamp) to detect a stuck Maps cycle.
+  // fetched_at is always "just now" so it cannot detect stale Maps data.
+  const mapsDataTimestamp = _cycleMapsContext?.flow_graph?.created_at ?? null;
+  const mapsDataMs = mapsDataTimestamp ? new Date(mapsDataTimestamp).getTime() : NaN;
+  const mapsDataAgeMs = Number.isFinite(mapsDataMs) ? Math.max(0, Date.now() - mapsDataMs) : NaN;
+  if (Number.isFinite(mapsDataAgeMs) && mapsDataAgeMs > 15 * 60 * 1000) {
+    log("maps_context_warning", {
+      warning: "maps_context_stale",
+      flow_graph_created_at: mapsDataTimestamp,
+      age_minutes: Number((mapsDataAgeMs / 60000).toFixed(2))
+    });
+  }
   _cycleRegimePolicy = buildRegimeSentinelPolicy(portfolio, _cycleQuantContext);
   portfolio.stats.market_regime = _cycleRegimePolicy.regime;
   trainingContext.market_regime = _cycleRegimePolicy.regime;
@@ -8810,6 +8995,18 @@ async function runCycle(runContext = {}) {
   const portfolioIntelligence = buildPortfolioIntelligenceDossier(portfolio);
   if (runContext.debugMode) {
     const debugSnapshot = buildDebugHandoffSnapshot(portfolio, portfolioIntelligence, runContext);
+    logAgentRaw({
+      kind: "debug_handoff",
+      agent: "scout",
+      mode: "debug",
+      handoff_message: debugSnapshot.scout.handoff_message
+    });
+    logAgentRaw({
+      kind: "debug_handoff",
+      agent: "harvest",
+      mode: "debug",
+      handoff_message: debugSnapshot.harvest.handoff_message
+    });
     console.log("🧪 Pipeline debug mode: LLM execution skipped.\n");
     console.log(JSON.stringify(debugSnapshot, null, 2));
     log("debug_handoff", {
@@ -9142,6 +9339,7 @@ async function runCycle(runContext = {}) {
     }
     const cyclePipelineLogEntries = [
       { stage: "quant_context", data: { macro_regime: _cycleQuantContext?.macro?.regime, new_positions_ok: _cycleQuantContext?.macro?.new_positions_ok, tighten_stops: _cycleQuantContext?.macro?.tighten_stops } },
+      { stage: "maps_context", data: _cycleMapsContext || null },
       { stage: "scout", data: scoutPayload },
       { stage: "agent_coverage", data: scoutCoverageLog },
       { stage: "sell_trades", data: sellTrades },
