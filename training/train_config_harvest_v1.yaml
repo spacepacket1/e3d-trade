@@ -1,4 +1,4 @@
-model: mlx-community/Qwen2.5-14B-Instruct-4bit
+model: mlx-community/Qwen2.5-7B-Instruct-4bit
 train: true
 data: ./data/harvest
 adapter_path: ./adapters_harvest_v1

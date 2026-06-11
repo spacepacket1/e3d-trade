@@ -1,5 +1,7 @@
 logs/*
 !logs/.gitkeep
+state/*
+!state/.gitkeep
 *.log
 *.pid
 .windsurf/
