@@ -1,6 +1,9 @@
 import { E3D_API_BASE_URL, e3dRequest } from "../e3dAuthClient.js";
 
 const MAPS_API_BASE_URL = process.env.E3D_MAPS_BASE_URL || E3D_API_BASE_URL;
+// Future prepaid Maps access, if introduced, should purchase credits from
+// POST /api/payments/credits/purchase with { product: "maps" } and send the
+// returned bearer key (e3d_maps_pay_...) to Maps data routes.
 
 function mapsWarn(message, meta = {}) {
   if (Object.keys(meta).length) {

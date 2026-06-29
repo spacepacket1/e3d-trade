@@ -12,6 +12,18 @@ The system's core thesis is that on-chain story signals — patterns detected in
 
 ---
 
+## Product Payments Note
+
+The trading floor currently does not implement E3D product credit purchase or x402 payment handling. Its Maps client uses session-authenticated `e3dRequest(...)` calls against `E3D_MAPS_BASE_URL` or the default `E3D_API_BASE_URL`, so the Phase 7 payments migration does not require runtime logic changes here.
+
+If a future product such as `e3d-x` or `e3d-y` needs prepaid product access:
+
+1. Register the product in the main `e3d` repo at `server/productRegistry.js`.
+2. Purchase credits through `POST /api/payments/credits/purchase` with the new `product` value.
+3. Pass the returned product bearer key for that product's routes, following the Maps pattern (`Authorization: Bearer e3d_maps_pay_...` for `product=maps`).
+
+---
+
 ## 1. Design Philosophy
 
 **AI suggests. Code decides.**
