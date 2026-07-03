@@ -8,5 +8,5 @@ state/*
 portfolio.json
 .env
 reports/
-.claude/
+.claude/*
 !.claude/settings.json
