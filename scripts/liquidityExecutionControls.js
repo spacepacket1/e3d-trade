@@ -60,7 +60,7 @@ function inferVenueType(order = {}) {
   return cleanAddress(order.contract_address || order.token?.contract_address) ? "dex" : "cex";
 }
 
-function inferLiquidityBucket(liquidityUsd) {
+export function inferLiquidityBucket(liquidityUsd) {
   if (liquidityUsd >= 1000000) return "deep";
   if (liquidityUsd >= 100000) return "medium";
   if (liquidityUsd >= 20000) return "thin";
