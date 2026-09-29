@@ -281,8 +281,8 @@ export function getActiveCapitalMandate(options = {}) {
   return active?.mandate || null;
 }
 
-export function buildMandateTrace(mandate = null) {
-  if (currentMandateStatus(mandate) !== "active") return null;
+export function buildMandateTrace(mandate = null, now = new Date()) {
+  if (currentMandateStatus(mandate, now) !== "active") return null;
   return {
     mandate_id: mandate.mandate_id,
     correlation_id: mandate.correlation_id,
