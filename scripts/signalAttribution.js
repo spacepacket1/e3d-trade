@@ -2,6 +2,7 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 import { fileURLToPath } from "url";
+import { resolveTradeEvidence } from "./tradeEvidence.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -132,19 +133,29 @@ function listJsonReports(dirPath, filePattern, expectedType) {
   }
 }
 
-function liquidityBucketForTrade(openTrade = {}, closeTrade = {}, riskEvent = null) {
-  const bucket = openTrade?.simulated_execution?.liquidity_bucket
-    || openTrade?.order_lifecycle?.simulated_execution?.liquidity_bucket
-    || openTrade?.order_lifecycle?.execution_control_ref?.liquidity_depth_bucket
-    || closeTrade?.simulated_execution?.liquidity_bucket
-    || closeTrade?.order_lifecycle?.simulated_execution?.liquidity_bucket
+function resolvePersistedTradeRecord(trade, options = {}) {
+  if (!trade || typeof trade !== "object") return trade;
+  return {
+    ...trade,
+    ...resolveTradeEvidence(trade, options)
+  };
+}
+
+export function liquidityBucketForTrade(openTrade = {}, closeTrade = {}, riskEvent = null, options = {}) {
+  const resolvedOpenTrade = resolvePersistedTradeRecord(openTrade, options) || {};
+  const resolvedCloseTrade = resolvePersistedTradeRecord(closeTrade, options) || {};
+  const bucket = resolvedOpenTrade?.simulated_execution?.liquidity_bucket
+    || resolvedOpenTrade?.order_lifecycle?.simulated_execution?.liquidity_bucket
+    || resolvedOpenTrade?.order_lifecycle?.execution_control_ref?.liquidity_depth_bucket
+    || resolvedCloseTrade?.simulated_execution?.liquidity_bucket
+    || resolvedCloseTrade?.order_lifecycle?.simulated_execution?.liquidity_bucket
     || riskEvent?.payload?.proposal?.execution_data?.liquidity_bucket
     || null;
   if (bucket) return normalizeKey(bucket);
   const liquidityUsd = toNum(
-    openTrade?.paper_trade_ticket?.liquidity_usd,
+    resolvedOpenTrade?.paper_trade_ticket?.liquidity_usd,
     toNum(
-      openTrade?.last_market_snapshot?.liquidity_data?.liquidity_usd,
+      resolvedOpenTrade?.last_market_snapshot?.liquidity_data?.liquidity_usd,
       toNum(riskEvent?.payload?.proposal?.liquidity_data?.liquidity_usd, 0)
     )
   );
@@ -154,7 +165,7 @@ function liquidityBucketForTrade(openTrade = {}, closeTrade = {}, riskEvent = nu
   return liquidityUsd > 0 ? "very_thin" : "unknown";
 }
 
-function buildEventIndex(events) {
+export function buildEventIndex(events) {
   const byCandidate = new Map();
   const byPosition = new Map();
   const byTrade = new Map();
@@ -216,22 +227,23 @@ function buildEventIndex(events) {
   return { byCandidate, byPosition, byTrade, signalSnapshots, candidates: [...candidates.values()] };
 }
 
-function buildActionIndex(actionHistory) {
+export function buildActionIndex(actionHistory, options = {}) {
   const byPosition = new Map();
   const byCandidate = new Map();
   const buys = [];
 
   for (const trade of Array.isArray(actionHistory) ? actionHistory : []) {
-    if (String(trade?.side || "").toLowerCase() !== "buy") continue;
-    const tsMs = optionalMs(trade.ts);
-    const normalized = { ...trade, ts_ms: tsMs };
+    const resolvedTrade = resolvePersistedTradeRecord(trade, options);
+    if (String(resolvedTrade?.side || "").toLowerCase() !== "buy") continue;
+    const tsMs = optionalMs(resolvedTrade.ts);
+    const normalized = { ...resolvedTrade, ts_ms: tsMs };
     buys.push(normalized);
-    if (trade?.position_id) {
-      const key = normalizeKey(trade.position_id);
+    if (resolvedTrade?.position_id) {
+      const key = normalizeKey(resolvedTrade.position_id);
       if (!byPosition.has(key)) byPosition.set(key, []);
       byPosition.get(key).push(normalized);
     }
-    const candidateKey = cleanAddress(trade?.candidate_id || trade?.contract_address);
+    const candidateKey = cleanAddress(resolvedTrade?.candidate_id || resolvedTrade?.contract_address);
     if (candidateKey) {
       if (!byCandidate.has(candidateKey)) byCandidate.set(candidateKey, []);
       byCandidate.get(candidateKey).push(normalized);
@@ -365,10 +377,13 @@ function totalSlippageUsd(...records) {
   }, 0), 2);
 }
 
-function buildTradeAttributionRows(portfolio, eventIndex, reviewMap) {
-  const actionIndex = buildActionIndex(portfolio?.action_history || []);
+export function buildTradeAttributionRows(portfolio, eventIndex, reviewMap, options = {}) {
+  const actionIndex = buildActionIndex(portfolio?.action_history || [], options);
   const closedTrades = (Array.isArray(portfolio?.closed_trades) ? portfolio.closed_trades : [])
-    .map((trade) => ({ ...trade, ts_ms: optionalMs(trade.ts) }))
+    .map((trade) => {
+      const resolvedTrade = resolvePersistedTradeRecord(trade, options);
+      return { ...resolvedTrade, ts_ms: optionalMs(resolvedTrade.ts) };
+    })
     .filter((trade) => trade.ts_ms != null)
     .sort((a, b) => a.ts_ms - b.ts_ms || String(a.trade_id || "").localeCompare(String(b.trade_id || "")));
 
@@ -474,7 +489,7 @@ function buildTradeAttributionRows(portfolio, eventIndex, reviewMap) {
       contract_address: cleanAddress(closeTrade.contract_address || openTrade?.contract_address || proposal?.token?.contract_address),
       category: normalizeKey(closeTrade.category || proposal?.token?.category),
       market_regime: normalizeKey(review?.market_regime_label || closeTrade.market_regime || riskEvent?.market_regime || executorEvent?.market_regime),
-      liquidity_bucket: liquidityBucketForTrade(openTrade, closeTrade, riskEvent),
+      liquidity_bucket: liquidityBucketForTrade(openTrade, closeTrade, riskEvent, options),
       risk_decision: normalizeKey(riskEvent?.payload?.risk_review?.decision || riskEvent?.payload?.decision),
       risk_reason_codes: riskCodeSet,
       sizing_decision: sizingDecision,
@@ -503,7 +518,7 @@ function buildTradeAttributionRows(portfolio, eventIndex, reviewMap) {
   });
 }
 
-function buildDecisionRows(eventIndex, actionIndex) {
+export function buildDecisionRows(eventIndex, actionIndex, options = {}) {
   const rows = [];
   for (const bundle of eventIndex.candidates) {
     const candidateEvent = bundle.candidate;
@@ -515,13 +530,14 @@ function buildDecisionRows(eventIndex, actionIndex) {
     const actionMatches = candidateId ? (actionIndex.byCandidate.get(candidateId) || []) : [];
     const candidateTsMs = optionalMs(candidateEvent.ts);
     const traded = actionMatches.find((trade) => trade.ts_ms != null && candidateTsMs != null && trade.ts_ms >= candidateTsMs);
+    const tradedLifecycle = traded?.order_lifecycle || null;
     const evidenceMetadata = extractEvidenceMetadata(
       riskEvent?.payload?.risk_review,
       riskEvent?.payload?.proposal,
       candidate,
       traded,
       traded?.paper_trade_ticket,
-      traded?.order_lifecycle
+      tradedLifecycle
     );
     const riskDecision = normalizeKey(riskEvent?.payload?.risk_review?.decision || riskEvent?.payload?.decision, "not_reviewed");
     const executorDecision = normalizeKey(executorEvent?.payload?.decision, "not_executed");
@@ -567,7 +583,8 @@ function buildDecisionRows(eventIndex, actionIndex) {
       liquidity_bucket: liquidityBucketForTrade(
         traded || {},
         {},
-        riskEvent || { payload: { proposal: { liquidity_data: candidate.liquidity_data || null } } }
+        riskEvent || { payload: { proposal: { liquidity_data: candidate.liquidity_data || null } } },
+        options
       ),
       risk_decision: riskDecision,
       risk_reason_codes: reasonCodes,

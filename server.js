@@ -22,6 +22,7 @@ import {
   revokeCapitalMandate,
   submitCapitalMandate
 } from "./scripts/capitalMandates.js";
+import { resolveTradeEvidence } from "./scripts/tradeEvidence.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -706,17 +707,43 @@ function summarizeRiskSnapshot(portfolio = {}, trainingEvents = []) {
   };
 }
 
-function summarizeExecutionSnapshot(tradeRecords = [], backtest = null) {
+function resolvePersistedTradeEvidenceView(trade, options = {}) {
+  if (!trade || typeof trade !== "object") {
+    return {
+      order_lifecycle: null,
+      simulated_execution: null,
+      token_risk_scan: null
+    };
+  }
+  return resolveTradeEvidence(trade, options);
+}
+
+export function projectPersistedTradeOrderRiskRefs(trade, options = {}) {
+  const evidence = resolvePersistedTradeEvidenceView(trade, options);
+  const lifecycle = evidence.order_lifecycle || null;
+  return {
+    order_id: trade?.order_id || lifecycle?.order_id || null,
+    risk_decision_id: trade?.risk_decision_id || lifecycle?.risk_decision_id || trade?.paper_trade_ticket?.risk_decision_id || null,
+    order_lifecycle: lifecycle,
+    simulated_execution: evidence.simulated_execution || null
+  };
+}
+
+export function summarizeExecutionSnapshot(tradeRecords = [], backtest = null, options = {}) {
   const orders = tradeRecords
-    .filter((trade) => trade?.order_lifecycle || trade?.simulated_execution)
-    .map((trade) => {
-      const lifecycle = trade.order_lifecycle || {};
-      const execution = trade.simulated_execution || lifecycle.simulated_execution || {};
+    .map((trade) => ({
+      trade,
+      projected: projectPersistedTradeOrderRiskRefs(trade, options)
+    }))
+    .filter(({ projected }) => projected.order_lifecycle || projected.simulated_execution)
+    .map(({ trade, projected }) => {
+      const lifecycle = projected.order_lifecycle || {};
+      const execution = projected.simulated_execution || lifecycle.simulated_execution || {};
       const control = execution?.liquidity_execution_control || {};
       const lastState = Array.isArray(lifecycle?.state_history) ? lifecycle.state_history[lifecycle.state_history.length - 1] : null;
       return {
         ts: trade.ts || null,
-        order_id: lifecycle.order_id || trade.order_id || null,
+        order_id: projected.order_id,
         symbol: trade.symbol || lifecycle.symbol || null,
         side: trade.side || lifecycle.side || null,
         state: lifecycle.current_state || execution.decision || "unknown",
@@ -2115,13 +2142,14 @@ async function enrichSoldTrade(trade, review = null) {
   const costUsd = asNumber(trade.cost_portion_usd, 0);
   const avgEntryPrice = quantity > 0 ? costUsd / quantity : asNumber(trade.avg_entry_price, 0);
   const tokenMeta = await fetchTokenMetadata(trade.contract_address);
+  const projected = projectPersistedTradeOrderRiskRefs(trade);
 
   return {
     contract_address: trade.contract_address,
     trade_id: trade.trade_id || null,
-    order_id: trade.order_id || trade.order_lifecycle?.order_id || null,
+    order_id: projected.order_id,
     order_ids: Array.isArray(trade.order_ids) ? trade.order_ids : (trade.order_id ? [trade.order_id] : []),
-    risk_decision_id: trade.risk_decision_id || trade.order_lifecycle?.risk_decision_id || trade.paper_trade_ticket?.risk_decision_id || null,
+    risk_decision_id: projected.risk_decision_id,
     risk_decision_ref: trade.risk_decision_ref || trade.paper_trade_ticket?.risk_decision_ref || null,
     position_id: trade.position_id || null,
     symbol: tokenMeta?.symbol || trade.symbol || null,

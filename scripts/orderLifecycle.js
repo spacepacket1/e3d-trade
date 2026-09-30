@@ -1,5 +1,6 @@
 import crypto from "crypto";
 import { buildLiquidityExecutionControlRef } from "./liquidityExecutionControls.js";
+import { resolveTradeEvidence } from "./tradeEvidence.js";
 
 export const ORDER_LIFECYCLE_SCHEMA_VERSION = "1.0";
 export const ORDER_STATES = Object.freeze([
@@ -214,7 +215,13 @@ export function createOrderLifecycleRecord(input = {}) {
   assertOrderMode(mode);
 
   const trade = input.trade || {};
-  const execution = input.execution || trade.simulated_execution || null;
+  const resolvedExecution = input.execution
+    ? null
+    : (() => {
+      const sidecarPath = input.sidecarPath || input.options?.sidecarPath || null;
+      return resolveTradeEvidence(trade, sidecarPath ? { sidecarPath } : {}).simulated_execution;
+    })();
+  const execution = input.execution || resolvedExecution || null;
   const requestedNotionalUsd = inferRequestedNotional(trade, execution);
   const requestedQuantity = inferRequestedQuantity(trade, execution, requestedNotionalUsd);
   const side = cleanSide(input.side || trade.side || execution?.side);
