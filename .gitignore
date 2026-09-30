@@ -11,3 +11,5 @@ reports/
 .claude/*
 !.claude/settings.json
 .e3d-pilot/
+operator-actions/*
+!operator-actions/.gitkeep

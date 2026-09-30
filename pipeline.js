@@ -53,6 +53,9 @@ try {
 const LOG_DIR = path.join(__dirname, "logs");
 const REPORTS_DIR = path.join(__dirname, "reports");
 const PORTFOLIO_FILE = path.join(__dirname, "portfolio.json");
+const OPERATOR_ACTIONS_DIR = path.join(__dirname, "operator-actions");
+const PENDING_MANUAL_ACTIONS_FILE = path.join(OPERATOR_ACTIONS_DIR, "pending-manual-actions.json");
+const MANUAL_ACTIONS_HISTORY_LOG = path.join(OPERATOR_ACTIONS_DIR, "manual-actions-history.jsonl");
 const PIPELINE_LOG = path.join(LOG_DIR, "pipeline.jsonl");
 const AGENT_RAW_LOG = path.join(LOG_DIR, "agent-raw.jsonl");
 const TRAINING_EVENT_LOG = path.join(LOG_DIR, "training-events.jsonl");
@@ -137,6 +140,7 @@ const SETTINGS_DEFAULTS = {
   reject_fraud_risk_gte: 35,
   target_partial_pct: 0.25,
   take_only_first_target_partial: true,
+  default_target_multiples: [1.5, 2.0, 3.0],  // used only when Scout's buy proposal omits targets
   age_decay_per_day: 0,                // age is not a reason to rotate a working thesis
   recent_performance_window_hours: 24,
   throttle_min_hold_hours: 24,         // ignore dust clips when throttling size
@@ -1323,13 +1327,26 @@ function filterScoutCandidatesForDesk(candidates, portfolio) {
   return kept;
 }
 
-function sanitizeTargets(targets, entryPrice) {
+// Scout's buy proposal is the only source of target_1/2/3, and it omits them on every
+// current position -- there was no fallback, so the target-hit partial-sell path in
+// evaluateSellActions() silently never engaged for anything held. Backfill from
+// default_target_multiples (entry-price multiples) whenever Scout leaves all three null,
+// so a position always has *some* deterministic profit-taking target.
+function sanitizeTargets(targets, entryPrice, settings = SETTINGS_DEFAULTS) {
   const entry = optionalNum(entryPrice);
   const source = targets && typeof targets === "object" ? targets : {};
   const out = {};
   for (const key of ["target_1", "target_2", "target_3"]) {
     const value = optionalNum(source[key]);
     out[key] = value > 0 && (!(entry > 0) || value > entry) ? value : null;
+  }
+  if (entry > 0 && !out.target_1 && !out.target_2 && !out.target_3) {
+    const multiples = Array.isArray(settings?.default_target_multiples) && settings.default_target_multiples.length === 3
+      ? settings.default_target_multiples
+      : SETTINGS_DEFAULTS.default_target_multiples;
+    out.target_1 = entry * toNum(multiples[0], 1.5);
+    out.target_2 = entry * toNum(multiples[1], 2.0);
+    out.target_3 = entry * toNum(multiples[2], 3.0);
   }
   return out;
 }
@@ -8035,6 +8052,29 @@ function reconcilePositionMarks(portfolio) {
   if (resnapped.length) log("position_mark_resnapped", { count: resnapped.length, positions: resnapped });
 }
 
+// stop_price was only ever set once, at entry, and never revisited -- a position that ran up
+// 4x kept the same stop that was sized for its entry-day volatility, giving back the entire
+// gain before the stop could trigger (see QNT, Sep 2026: stop frozen at -20% of a $61 entry
+// while price reached $285+). peak_price is already maintained on every position by
+// applyPositionMark(); ratchet the stop up toward it, using the same ATR-based distance
+// computeStopDistancePct() uses at entry. Only ever moves up -- never loosens an existing stop.
+function updateTrailingStops(portfolio) {
+  const settings = portfolio?.settings || SETTINGS_DEFAULTS;
+  const trailed = [];
+  for (const pos of Object.values(portfolio?.positions || {})) {
+    const peak = toNum(pos.peak_price, 0);
+    if (!(peak > 0)) continue;
+    const stopDistancePct = computeStopDistancePct({ market_data: pos.last_market_snapshot?.market_data }, settings);
+    const trailingStop = peak * (1 - stopDistancePct);
+    const before = toNum(pos.stop_price, 0);
+    if (trailingStop > before) {
+      pos.stop_price = trailingStop;
+      trailed.push({ symbol: pos.symbol, from: before, to: trailingStop, peak_price: peak });
+    }
+  }
+  if (trailed.length) log("position_stop_trailed", { count: trailed.length, positions: trailed });
+}
+
 // Symbols that should track a peg (fiat, FX, or another asset) but slip past the hard
 // NONTRADEABLE filter — e.g. RAI (a non-fiat-pegged stable, ~$3). For these, ANY material
 // source disagreement is a bad feed rather than a trade: RAI was bought at $10.50 vs a real
@@ -8219,6 +8259,9 @@ function evaluateSellActions(portfolio) {
   // Never evaluate stops/targets against a divergent (corrupt or latched-stale) mark: snap any
   // position whose price drifted beyond the deviation limit back to the authoritative e3d anchor first.
   reconcilePositionMarks(portfolio);
+  // Ratchet each position's stop up toward its peak before checking it below, so a winner's stop
+  // reflects how far it has actually run, not just its entry-day volatility.
+  updateTrailingStops(portfolio);
 
   for (const pos of Object.values(portfolio.positions)) {
     const price = toNum(pos.current_price, 0);
@@ -8386,6 +8429,71 @@ function executeSell(portfolio, action) {
   }
 
   return trade;
+}
+
+// Lets an operator request a trade (e.g. "sell half of QNT") without writing to
+// portfolio.json directly. A direct external write races the pipeline's own cycle:
+// whichever save lands last wins, and an in-flight cycle holding a stale in-memory
+// copy will silently clobber an external edit when it finishes (this happened twice,
+// Sep 2026, trying to manually liquidate a position). Enqueuing a request here instead
+// is race-free because it's consumed inside the pipeline's own load->mutate->save cycle,
+// against its own freshly-loaded portfolio -- there is no second writer to race against.
+//
+// Queue format (operator-actions/pending-manual-actions.json): a JSON array of
+// {type: "sell", symbol, fraction (0-1), reason}. Processed once, in order, at the top
+// of each cycle, then the file is cleared; every attempt (success or failure) is appended
+// to manual-actions-history.jsonl so nothing is silently dropped.
+function loadPendingManualActions() {
+  try {
+    const raw = fs.readFileSync(PENDING_MANUAL_ACTIONS_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function applyPendingManualActions(portfolio) {
+  const pending = loadPendingManualActions();
+  if (!pending.length) return [];
+
+  fs.mkdirSync(OPERATOR_ACTIONS_DIR, { recursive: true });
+  const results = [];
+  for (const request of pending) {
+    const record = { processed_at: nowIso(), request };
+    try {
+      if (request?.type !== "sell") {
+        throw new Error(`unsupported manual action type: ${request?.type}`);
+      }
+      const fraction = toNum(request.fraction, NaN);
+      if (!(fraction > 0) || fraction > 1) {
+        throw new Error(`invalid fraction: ${request.fraction}`);
+      }
+      if (!portfolio.positions[request.symbol]) {
+        throw new Error(`no open position for symbol: ${request.symbol}`);
+      }
+      const trade = executeSell(portfolio, {
+        symbol: request.symbol,
+        fraction,
+        reason: request.reason || "manual_operator_action"
+      });
+      if (!trade) throw new Error("executeSell returned null");
+      record.status = "executed";
+      record.trade_id = trade.trade_id;
+      record.proceeds_usd = trade.proceeds_usd;
+      record.pnl_usd = trade.pnl_usd;
+      log("manual_action_executed", { symbol: request.symbol, fraction, trade_id: trade.trade_id });
+    } catch (err) {
+      record.status = "failed";
+      record.error = err.message;
+      log("manual_action_failed", { request, error: err.message });
+    }
+    results.push(record);
+  }
+
+  fs.appendFileSync(MANUAL_ACTIONS_HISTORY_LOG, results.map((r) => JSON.stringify(r)).join("\n") + "\n");
+  fs.writeFileSync(PENDING_MANUAL_ACTIONS_FILE, "[]\n");
+  return results;
 }
 
 function rankApprovedCandidates(approved, portfolio) {
@@ -8563,7 +8671,7 @@ function openPosition(portfolio, candidate, allocationUsd, reason = "buy", optio
     portfolio?.settings || SETTINGS_DEFAULTS,
     candidate?._stop_distance_pct
   );
-  const targets = sanitizeTargets(candidate.targets, price);
+  const targets = sanitizeTargets(candidate.targets, price, portfolio?.settings || SETTINGS_DEFAULTS);
 
   const sleeve = options.sleeve || candidate?.sleeve || "thesis";
   const thesisCap = toNum(portfolio.settings.max_thesis_positions, portfolio.settings.max_open_positions);
@@ -9667,6 +9775,7 @@ async function runCycle(runContext = {}) {
   _cycleActiveCapitalMandateTrace = activeMandateTrace;
   if (activeMandateTrace) log("capital_mandate_active", activeMandateTrace);
   pruneCooldowns(portfolio);
+  applyPendingManualActions(portfolio);
   const trainingContext = {
     pipeline_run_id: runContext.pipeline_run_id || crypto.randomUUID(),
     cycle_id: runContext.cycle_id || crypto.randomUUID(),
