@@ -7968,15 +7968,24 @@ function markDeviationLimit(portfolio) {
 }
 
 // Apply a new market price to a held position, but REJECT it if it diverges beyond `maxDev`
-// from the authoritative e3d anchor (last_market_snapshot, falling back to the existing mark /
-// entry price). This is the guard that prevents a divergent third-party tick (e.g. a DexScreener
-// price for the same address) from silently overwriting the e3d-based mark and tripping targets.
+// from the position's own current mark (falling back to last_market_snapshot, then entry price,
+// for a brand-new position with no mark yet). This is the guard that prevents a divergent
+// third-party tick (e.g. a DexScreener price for the same address) from silently overwriting
+// the live mark and tripping targets.
+//
+// Anchors on pos.current_price rather than last_market_snapshot -- last_market_snapshot is only
+// written occasionally by Scout (its own prompt tells it holdings_updates[] should normally be
+// empty), while current_price is refreshed every cycle via refreshPositionPrices/token_universe.
+// Anchoring on the rarely-updated snapshot meant a real, sustained price move (QNT: $61 -> $285+
+// over two weeks, confirmed against the live market) would silently approach and then trip the
+// maxDev ceiling against a frozen weeks-old snapshot, rejecting further legitimate updates and
+// freezing the mark -- the opposite of what this guard is supposed to prevent.
 // Returns true if the mark was applied, false if rejected.
 function applyPositionMark(pos, newPrice, source, maxDev = SETTINGS_DEFAULTS.max_mark_deviation_ratio) {
   const price = toNum(newPrice, 0);
   if (!(price > 0)) return false;
-  const anchor = toNum(pos?.last_market_snapshot?.market_data?.current_price,
-                  toNum(pos?.current_price, toNum(pos?.avg_entry_price, 0)));
+  const anchor = toNum(pos?.current_price,
+                  toNum(pos?.last_market_snapshot?.market_data?.current_price, toNum(pos?.avg_entry_price, 0)));
   if (anchor > 0 && maxDev > 0) {
     const ratio = price / anchor;
     if (ratio > maxDev || ratio < 1 / maxDev) {
@@ -7994,13 +8003,24 @@ function applyPositionMark(pos, newPrice, source, maxDev = SETTINGS_DEFAULTS.max
   return true;
 }
 
-// Reconcile any latched/stale mark back to the authoritative e3d snapshot so a divergent value
-// cannot persist once a token drops out of the live feeds (the "freeze" failure mode). Run at the
+// Reconcile a latched/stale current_price back to a fresh e3d snapshot so a divergent value
+// cannot persist once a token's own price feed drops out (the "freeze" failure mode). Run at the
 // choke point right before sell decisions so targets/stops are always evaluated against a trusted price.
+//
+// Only trusts last_market_snapshot as the override authority if it was itself written recently
+// (MARK_RECONCILE_SNAPSHOT_MAX_AGE_MS). Scout, the only writer of last_market_snapshot, updates it
+// rarely by design -- an old snapshot is not evidence that current_price (refreshed every cycle)
+// has gone stale, it's just Scout not having looked recently. Treating an old snapshot as
+// authoritative here previously meant a real, sustained price move could get silently reverted
+// back to a weeks-old number right before a sell decision (see QNT, Sep 2026: current_price
+// correctly tracked a rally to $285+ while last_market_snapshot sat frozen at the Sep 17 mark).
+const MARK_RECONCILE_SNAPSHOT_MAX_AGE_MS = 60 * 60 * 1000;
 function reconcilePositionMarks(portfolio) {
   const maxDev = markDeviationLimit(portfolio);
   const resnapped = [];
   for (const pos of Object.values(portfolio?.positions || {})) {
+    const snapshotAgeMs = Date.now() - Date.parse(pos?.last_market_snapshot?.market_data?.price_timestamp || "");
+    if (!(snapshotAgeMs >= 0) || snapshotAgeMs > MARK_RECONCILE_SNAPSHOT_MAX_AGE_MS) continue;
     const anchor = toNum(pos?.last_market_snapshot?.market_data?.current_price, 0);
     const cur = toNum(pos?.current_price, 0);
     if (!(anchor > 0) || !(cur > 0) || !(maxDev > 0)) continue;
