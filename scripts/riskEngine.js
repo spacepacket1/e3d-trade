@@ -415,8 +415,14 @@ export function evaluateRiskDecision(input = {}) {
   const warnings = [];
   const checked_limits = [];
   const isBuy = side === "buy";
-  const capitalMandate = currentMandateStatus(input.capital_mandate) === "active" ? input.capital_mandate : null;
-  const mandateTrace = buildMandateTrace(capitalMandate);
+  // Evaluate mandate status against the same evaluationTs used for every
+  // other time-relative check in this function (turnover, PnL, cooldowns),
+  // not the real wall clock -- currentMandateStatus() defaults to
+  // `new Date()` when its `now` argument is omitted, which silently treats
+  // a mandate as expired the moment real time passes its expires_at,
+  // independent of when this decision is actually being evaluated for.
+  const capitalMandate = currentMandateStatus(input.capital_mandate, evaluationTs || undefined) === "active" ? input.capital_mandate : null;
+  const mandateTrace = buildMandateTrace(capitalMandate, evaluationTs ? new Date(evaluationTs) : new Date());
   const mode = cleanText(input?.mode || "paper");
   const riskOverrideRequested = Boolean(input.policy);
   const riskOverridePermission = riskOverrideRequested ? buildOperatorPermissionPolicy({

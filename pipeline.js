@@ -8,7 +8,7 @@ import { buildCycleQuantContext, enrichCandidateQuant, batchEnrichTokenFlow } fr
 import { createOrderLifecycleRecord } from "./scripts/orderLifecycle.js";
 import { evaluateRiskDecision, buildRiskDecisionRef } from "./scripts/riskEngine.js";
 import { buildTokenRiskScan, buildTokenRiskScanRef } from "./scripts/tokenRiskScanner.js";
-import { buildLiquidityExecutionControls } from "./scripts/liquidityExecutionControls.js";
+import { buildLiquidityExecutionControls, inferLiquidityBucket } from "./scripts/liquidityExecutionControls.js";
 import { buildMarketDataQuality, buildMarketDataQualityRef } from "./scripts/marketDataQuality.js";
 import { recordOperatorAction } from "./scripts/auditTrail.js";
 import {
@@ -7844,7 +7844,21 @@ function buildPaperFillExecution(trade) {
   const side = String(trade?.side || "").toLowerCase() === "sell" ? "sell" : "buy";
   const settings = trade?.settings || SETTINGS_DEFAULTS;
   const quotedPrice = toNum(trade?.quoted_price, toNum(trade?.price, 0));
-  const defaultSlippageBps = side === "sell" ? 75 : 50;
+  // Default slippage scales with actual liquidity rather than a flat rate --
+  // a flat 75bps regardless of liquidity meant a forced exit on a $30k-liquidity
+  // token was simulated the same as one on a $5M token. Missing liquidity data
+  // buckets as "very_thin" (the conservative/worst case), not "deep" -- unknown
+  // liquidity should never look cheap to trade out of.
+  const liquidityUsd = toNum(
+    trade?.execution_data?.liquidity_usd,
+    toNum(trade?.liquidity_usd, toNum(trade?.liquidity_data?.liquidity_usd, 0))
+  );
+  const liquidityBucket = inferLiquidityBucket(liquidityUsd);
+  const LIQUIDITY_DEFAULT_SLIPPAGE_BPS = {
+    sell: { deep: 75, medium: 125, thin: 250, very_thin: 400 },
+    buy: { deep: 50, medium: 90, thin: 175, very_thin: 300 }
+  };
+  const defaultSlippageBps = LIQUIDITY_DEFAULT_SLIPPAGE_BPS[side][liquidityBucket];
   const slippageBps = Math.max(0, toNum(
     trade?.slippage_bps_applied,
     toNum(trade?.execution_data?.estimated_slippage_bps, defaultSlippageBps)
@@ -8270,6 +8284,10 @@ function executeSell(portfolio, action) {
     price: pos.current_price,
     quoted_price: pos.current_price,
     quantity: qty,
+    // Current liquidity, not just whatever execution_data (if any) was attached
+    // at entry -- a forced exit (stop-loss, fraud breach) should price against
+    // today's liquidity, not a stale snapshot from whenever the position opened.
+    liquidity_usd: toNum(pos.liquidity_usd, toNum(pos?.last_market_snapshot?.liquidity_data?.liquidity_usd, 0)),
     execution_data: action?.execution_data || pos?.last_market_snapshot?.execution_data || null,
     settings: portfolio?.settings || SETTINGS_DEFAULTS
   });
@@ -8506,6 +8524,7 @@ function openPosition(portfolio, candidate, allocationUsd, reason = "buy", optio
     quoted_price: price,
     cost_usd: allocationUsd,
     paper_trade_ticket: options.paperTradeTicket || null,
+    liquidity_usd: toNum(candidate?.liquidity_data?.liquidity_usd, toNum(candidate?.liquidity_usd, 0)),
     execution_data: candidate?.execution_data || null,
     settings: portfolio?.settings || SETTINGS_DEFAULTS
   });

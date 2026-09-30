@@ -24,6 +24,11 @@ const riskPolicy = {
   max_slippage_bps: 150
 };
 
+// applyMandateScoutBias() intentionally evaluates mandate status against the
+// real wall clock (it's a live per-cycle check, not a deterministic
+// evaluated_at-scoped decision like evaluateRiskDecision) -- so a fixture
+// with a fixed calendar expires_at is a time bomb that silently starts
+// failing once real time passes it. Anchor it to test-run time instead.
 function mandate(overrides = {}) {
   return {
     mandate_id: "mandate-fixture-1",
@@ -33,7 +38,7 @@ function mandate(overrides = {}) {
     created_at: "2026-08-27T12:00:00.000Z",
     approved_at: "2026-08-27T12:01:00.000Z",
     effective_at: "2026-08-27T12:02:00.000Z",
-    expires_at: "2026-09-27T12:02:00.000Z",
+    expires_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
     correlation_id: "corr-fixture-1",
     proposal_id: "proposal-fixture-1",
     decision_id: "decision-fixture-1",
