@@ -8491,6 +8491,16 @@ function applyPendingManualActions(portfolio) {
     results.push(record);
   }
 
+  // Persist the mutated portfolio (e.g. the sell) immediately, rather than leaving it to
+  // the cycle's natural end-of-run save -- a cycle can take minutes (LLM calls) and this
+  // process can be killed at any point in between (OOM ceiling, restart, crash). Found the
+  // hard way: the history/queue bookkeeping below used to run first, so a kill after it but
+  // before the cycle's own savePortfolio() left an action permanently recorded as "executed"
+  // with the mutation never actually reaching portfolio.json. Saving here first means the
+  // history/queue writes only happen once the mutation is durably on disk.
+  const executedAny = results.some((r) => r.status === "executed");
+  if (executedAny) savePortfolio(portfolio);
+
   fs.appendFileSync(MANUAL_ACTIONS_HISTORY_LOG, results.map((r) => JSON.stringify(r)).join("\n") + "\n");
   fs.writeFileSync(PENDING_MANUAL_ACTIONS_FILE, "[]\n");
   return results;
