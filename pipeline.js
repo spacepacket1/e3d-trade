@@ -8061,24 +8061,45 @@ function reconcilePositionMarks(portfolio) {
   if (resnapped.length) log("position_mark_resnapped", { count: resnapped.length, positions: resnapped });
 }
 
+// max_position_pct only ever gates how much NEW capital a sizing decision commits to a
+// position -- it deliberately does not force-sell a position that outgrew it purely via price
+// appreciation (that would mean selling your best performer to fund more of what hasn't
+// worked). But a large position's trailing stop should still tighten as its share of equity
+// grows past the normal sizing cap: the same percentage-distance stop represents a much
+// bigger dollar swing on an oversized position (gap/liquidity-crisis risk this desk's 4x/day
+// cycle cadence and paper-simulated fills can't react to instantly), and no amount of good
+// ordinary-reversal exit logic substitutes for bounding that tail risk. Scales linearly from
+// no tightening at max_position_pct down to the min_stop_distance_pct floor at 3x that weight.
+function tightenStopDistanceForPositionWeight(baseDistancePct, weightPct, settings) {
+  const capPct = toNum(settings.max_position_pct, SETTINGS_DEFAULTS.max_position_pct);
+  const minDistancePct = toNum(settings.min_stop_distance_pct, SETTINGS_DEFAULTS.min_stop_distance_pct);
+  if (!(capPct > 0) || weightPct <= capPct) return baseDistancePct;
+  const overCapRatio = Math.min((weightPct - capPct) / (capPct * 2), 1);
+  return baseDistancePct - (baseDistancePct - minDistancePct) * overCapRatio;
+}
+
 // stop_price was only ever set once, at entry, and never revisited -- a position that ran up
 // 4x kept the same stop that was sized for its entry-day volatility, giving back the entire
 // gain before the stop could trigger (see QNT, Sep 2026: stop frozen at -20% of a $61 entry
 // while price reached $285+). peak_price is already maintained on every position by
 // applyPositionMark(); ratchet the stop up toward it, using the same ATR-based distance
-// computeStopDistancePct() uses at entry. Only ever moves up -- never loosens an existing stop.
+// computeStopDistancePct() uses at entry, tightened further for oversized positions (see
+// tightenStopDistanceForPositionWeight). Only ever moves up -- never loosens an existing stop.
 function updateTrailingStops(portfolio) {
   const settings = portfolio?.settings || SETTINGS_DEFAULTS;
+  const equity = equityUsd(portfolio);
   const trailed = [];
   for (const pos of Object.values(portfolio?.positions || {})) {
     const peak = toNum(pos.peak_price, 0);
     if (!(peak > 0)) continue;
-    const stopDistancePct = computeStopDistancePct({ market_data: pos.last_market_snapshot?.market_data }, settings);
+    const baseDistancePct = computeStopDistancePct({ market_data: pos.last_market_snapshot?.market_data }, settings);
+    const weightPct = equity > 0 ? toNum(pos.market_value_usd, 0) / equity : 0;
+    const stopDistancePct = tightenStopDistanceForPositionWeight(baseDistancePct, weightPct, settings);
     const trailingStop = peak * (1 - stopDistancePct);
     const before = toNum(pos.stop_price, 0);
     if (trailingStop > before) {
       pos.stop_price = trailingStop;
-      trailed.push({ symbol: pos.symbol, from: before, to: trailingStop, peak_price: peak });
+      trailed.push({ symbol: pos.symbol, from: before, to: trailingStop, peak_price: peak, weight_pct: +weightPct.toFixed(4), stop_distance_pct: +stopDistancePct.toFixed(4) });
     }
   }
   if (trailed.length) log("position_stop_trailed", { count: trailed.length, positions: trailed });
