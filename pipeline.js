@@ -3196,7 +3196,14 @@ const HARVEST_ADAPTER_PATH = process.env.HARVEST_ADAPTER_PATH || null;
 const LLM_MODEL = process.env.LLM_MODEL || "mlx-community/Qwen2.5-14B-Instruct-4bit";
 
 const COINGECKO_API_KEY = process.env.COINGECKO_API_KEY || "";
-const COINGECKO_BASE = "https://pro-api.coingecko.com/api/v3";
+// COINGECKO_API_KEY as configured (CG-... format) is a Demo-tier key, which only
+// authenticates against api.coingecko.com with x-cg-demo-api-key -- the pro-api.coingecko.com
+// host with x-cg-pro-api-key this previously used silently failed every call (error_code
+// 10002, swallowed by the catch below), so this enrichment has never actually worked.
+// Set COINGECKO_API_TIER=pro if the key is ever upgraded to a Pro-tier key.
+const COINGECKO_IS_PRO = process.env.COINGECKO_API_TIER === "pro";
+const COINGECKO_BASE = COINGECKO_IS_PRO ? "https://pro-api.coingecko.com/api/v3" : "https://api.coingecko.com/api/v3";
+const COINGECKO_API_KEY_HEADER = COINGECKO_IS_PRO ? "x-cg-pro-api-key" : "x-cg-demo-api-key";
 
 // Batch price lookup — one call for up to 30 contract addresses.
 // Returns { address: { usd, usd_market_cap, usd_24h_vol, usd_24h_change, usd_7d_change } }
@@ -3206,11 +3213,12 @@ function fetchCoinGeckoBatch(addresses) {
     const params = `contract_addresses=${addresses.slice(0, 30).join(",")}&vs_currencies=usd&include_market_cap=true&include_24hr_vol=true&include_24hr_change=true&include_7d_change=true`;
     const stdout = execFileSync("curl", [
       "-s", `${COINGECKO_BASE}/simple/token_price/ethereum?${params}`,
-      "-H", `x-cg-pro-api-key: ${COINGECKO_API_KEY}`,
+      "-H", `${COINGECKO_API_KEY_HEADER}: ${COINGECKO_API_KEY}`,
       "--max-time", "15",
     ], { encoding: "utf8", timeout: 20000 });
     const result = JSON.parse(stdout);
-    if (result?.error_code) { log("coingecko_error", { error: result.error_code }); return {}; }
+    const errorCode = result?.error_code ?? result?.status?.error_code;
+    if (errorCode) { log("coingecko_error", { error: errorCode, message: result?.error_message ?? result?.status?.error_message }); return {}; }
     return result;
   } catch { return {}; }
 }
@@ -3221,7 +3229,7 @@ function fetchCoinGeckoDetail(address) {
   try {
     const stdout = execFileSync("curl", [
       "-s", `${COINGECKO_BASE}/coins/ethereum/contract/${address}`,
-      "-H", `x-cg-pro-api-key: ${COINGECKO_API_KEY}`,
+      "-H", `${COINGECKO_API_KEY_HEADER}: ${COINGECKO_API_KEY}`,
       "--max-time", "15",
     ], { encoding: "utf8", timeout: 20000 });
     const d = JSON.parse(stdout);
@@ -8202,6 +8210,34 @@ function refreshPositionPrices(portfolio, tokenUniverse) {
   if (refreshed.length) log("position_prices_refreshed", { count: refreshed.length, positions: refreshed });
 }
 
+// refreshPositionPrices() above only has as-fresh-as-the-last-Scout-scan prices
+// (tokenUniverse ultimately traces back to buildPrices.js, which runs on a ~30min cycle --
+// too stale for deciding whether to add to or exit a held position in real time, confirmed
+// against TradingView: e3d's own feed showed QNT $295.77 while TradingView showed $282 at
+// the same moment). CoinGecko is a faster, independently-sourced cross-check specifically
+// for currently-held positions, where price-staleness risk is highest-stakes. One batched
+// call covers the whole book (up to 30 positions); applies through the same
+// applyPositionMark() deviation guard as every other price source, so a bad CoinGecko tick
+// gets rejected exactly like a bad DexScreener tick would.
+function refreshHeldPositionPricesFromCoinGecko(portfolio) {
+  const positions = Object.values(portfolio.positions || {});
+  if (!positions.length) return;
+  const addresses = [...new Set(positions.map((pos) => cleanAddress(pos.contract_address || "")).filter(Boolean))];
+  if (!addresses.length) return;
+  const prices = fetchCoinGeckoBatch(addresses);
+  if (!Object.keys(prices).length) return;
+  const refreshed = [];
+  for (const pos of positions) {
+    const addr = cleanAddress(pos.contract_address || "");
+    const usd = prices[addr]?.usd;
+    if (!(usd > 0)) continue;
+    const oldPrice = pos.current_price;
+    if (!applyPositionMark(pos, usd, "coingecko", markDeviationLimit(portfolio))) continue;
+    refreshed.push({ symbol: pos.symbol, old_price: oldPrice, new_price: usd });
+  }
+  if (refreshed.length) log("position_prices_refreshed_coingecko", { count: refreshed.length, positions: refreshed });
+}
+
 function updateHoldingsFromScout(portfolio, updates) {
   const byAddr = new Map();
   for (const u of updates) {
@@ -8257,6 +8293,11 @@ function evaluateSellActions(portfolio) {
   const targetPct = portfolio.settings.target_partial_pct;
   const minPartialSellUsd = toNum(portfolio.settings.min_partial_sell_usd, SETTINGS_DEFAULTS.min_partial_sell_usd);
 
+  // Cross-check held positions against CoinGecko before evaluating stops/targets -- the
+  // existing token_universe feed (via buildPrices.js) refreshes on a ~30min cycle, too
+  // stale for a decision this time-sensitive. Runs first so reconcile/trailing-stop below
+  // react to the freshest price available.
+  refreshHeldPositionPricesFromCoinGecko(portfolio);
   // Never evaluate stops/targets against a divergent (corrupt or latched-stale) mark: snap any
   // position whose price drifted beyond the deviation limit back to the authoritative e3d anchor first.
   reconcilePositionMarks(portfolio);
