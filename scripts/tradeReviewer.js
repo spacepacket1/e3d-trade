@@ -2,6 +2,7 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 import { fileURLToPath } from "url";
+import { resolveTradeEvidence } from "./tradeEvidence.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -176,7 +177,16 @@ function storyLabels(proposal, trade = null) {
   return [...new Set(labels.map((item) => normalize(item)).filter((item) => item !== "unknown"))];
 }
 
-function reviewTrade(trade, events, reviewedAt) {
+function resolvePersistedTradeRecord(trade, options = {}) {
+  if (!trade || typeof trade !== "object") return trade;
+  return {
+    ...trade,
+    ...resolveTradeEvidence(trade, options)
+  };
+}
+
+export function reviewTrade(trade, events, reviewedAt, options = {}) {
+  trade = resolvePersistedTradeRecord(trade, options);
   const pnl = toNum(trade.pnl_usd, 0);
   const cost = toNum(trade.cost_portion_usd, 0);
   const pnlPct = cost > 0 ? (pnl / cost) * 100 : 0;

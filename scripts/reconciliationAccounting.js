@@ -2,6 +2,7 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 import { fileURLToPath } from "url";
+import { resolveTradeEvidence, DEFAULT_SIDECAR_PATH } from "./tradeEvidence.js";
 
 export const RECONCILIATION_ACCOUNTING_SCHEMA_VERSION = "1.0";
 export const RECONCILIATION_POLICY_VERSION = "paper-replay-reconciliation-v1";
@@ -110,7 +111,15 @@ function positionValue(position = {}) {
   return toNum(position.market_value_usd, toNum(position.current_value_usd, toNum(position.quantity, 0) * toNum(position.current_price, 0)));
 }
 
-function normalizePaperTrades(portfolio = {}) {
+function resolvePersistedTradeRecord(trade, options = {}) {
+  if (!trade || typeof trade !== "object") return trade;
+  return {
+    ...trade,
+    ...resolveTradeEvidence(trade, options)
+  };
+}
+
+export function normalizePaperTrades(portfolio = {}, options = {}) {
   const closedById = new Map((Array.isArray(portfolio.closed_trades) ? portfolio.closed_trades : [])
     .map((trade) => [tradeKey(trade), trade]));
   const seen = new Set();
@@ -121,7 +130,7 @@ function normalizePaperTrades(portfolio = {}) {
     .filter((trade) => trade && typeof trade === "object")
     .map((trade) => {
       const key = tradeKey(trade);
-      const merged = { ...(closedById.get(key) || {}), ...trade };
+      const merged = resolvePersistedTradeRecord({ ...(closedById.get(key) || {}), ...trade }, options);
       const side = cleanSide(merged.side);
       const price = toNum(merged.price, 0);
       const quantity = toNum(merged.quantity, price > 0 ? toNum(merged.cost_usd || merged.proceeds_usd || merged.gross_proceeds_usd, 0) / price : 0);
@@ -685,9 +694,11 @@ export function generateReconciliationAccountingReport(options = {}) {
   const generatedAt = options.generatedAt || latestSourceTs || new Date(0).toISOString();
   const allIssues = [...paper.issues, ...replay.issues].sort((a, b) => a.issue_id.localeCompare(b.issue_id));
   const status = allIssues.some((issue) => issue.severity === "critical") ? "mismatch" : "reconciled";
+  const sidecarRaw = fs.existsSync(DEFAULT_SIDECAR_PATH) ? fs.readFileSync(DEFAULT_SIDECAR_PATH, "utf8") : "";
   const inputHash = sha256(stableStringify({
     policy_version: RECONCILIATION_POLICY_VERSION,
     portfolio_sha256: sha256(portfolioRaw),
+    trade_evidence_sidecar_sha256: sha256(sidecarRaw),
     backtest_report_id: backtest?.report_id || null,
     backtest_input_hash: backtest?.input_hash || null,
     backtest_output_hash: backtest?.determinism?.output_hash || null

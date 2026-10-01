@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import { resolveTradeEvidence } from "./tradeEvidence.js";
 
 export const EVIDENCE_PACKET_SCHEMA_VERSION = "1.0";
 export const EVIDENCE_PACKET_BUILDER_VERSION = "evidence-packets-v1";
@@ -420,11 +421,22 @@ function buildDataQualityEvidence(input = {}) {
   }];
 }
 
-function buildTokenRiskEvidence(input = {}) {
-  const scan = input?.token_risk_scan && typeof input.token_risk_scan === "object"
-    ? input.token_risk_scan
-    : input?.token_risk_scan_ref && typeof input.token_risk_scan_ref === "object"
-      ? input.token_risk_scan_ref
+function resolvePersistedTradeTokenRiskInput(input = {}, options = {}) {
+  if (!input || typeof input !== "object") return input;
+  if (Object.prototype.hasOwnProperty.call(input, "token_risk_scan")) return input;
+  if (!input.trade_id && !input.evidence_ref) return input;
+  const evidence = resolveTradeEvidence(input, options);
+  return evidence.token_risk_scan
+    ? { ...input, token_risk_scan: evidence.token_risk_scan }
+    : input;
+}
+
+function buildTokenRiskEvidence(input = {}, options = {}) {
+  const resolvedInput = resolvePersistedTradeTokenRiskInput(input, options);
+  const scan = resolvedInput?.token_risk_scan && typeof resolvedInput.token_risk_scan === "object"
+    ? resolvedInput.token_risk_scan
+    : resolvedInput?.token_risk_scan_ref && typeof resolvedInput.token_risk_scan_ref === "object"
+      ? resolvedInput.token_risk_scan_ref
       : null;
   if (!scan) return [];
   const decision = cleanText(scan.decision) || "warn";
@@ -436,7 +448,7 @@ function buildTokenRiskEvidence(input = {}) {
     label: "token_risk_scan",
     direction: "risk",
     strength: decision === "block" ? 95 : warnings.length ? 72 : 55,
-    freshness_seconds: normalizeFreshnessSeconds(null, scan.evaluated_at, input.created_at),
+    freshness_seconds: normalizeFreshnessSeconds(null, scan.evaluated_at, resolvedInput.created_at),
     summary: clipText([
       `decision ${decision}`,
       blockers.length ? `blockers ${blockers.join("|")}` : null,
@@ -492,7 +504,7 @@ function buildPerformanceEvidence(input = {}) {
   }];
 }
 
-function collectBaseEvidence(input, packetBasis) {
+function collectBaseEvidence(input, packetBasis, options = {}) {
   const collected = [];
   for (const item of Array.isArray(input?.evidence_items) ? input.evidence_items : []) pushEvidence(collected, item);
   for (const item of Array.isArray(input?.evidence) ? input.evidence : []) pushEvidence(collected, item);
@@ -500,7 +512,7 @@ function collectBaseEvidence(input, packetBasis) {
   for (const item of buildMarketEvidence(input, packetBasis.packet_type)) pushEvidence(collected, item);
   for (const item of buildThesisEvidence(input)) pushEvidence(collected, item);
   for (const item of buildWatchlistEvidence(input)) pushEvidence(collected, item);
-  for (const item of buildTokenRiskEvidence(input)) pushEvidence(collected, item);
+  for (const item of buildTokenRiskEvidence(input, options)) pushEvidence(collected, item);
   for (const item of buildDataQualityEvidence(input)) pushEvidence(collected, item);
   if (packetBasis.packet_type === "harvest_position") {
     for (const item of buildPortfolioEvidence(input)) pushEvidence(collected, item);
@@ -543,7 +555,7 @@ function buildMissingEvidence(packetType, counts, flags = {}) {
   return missing;
 }
 
-function scoreEvidencePacket(packetType, evidence, input = {}) {
+function scoreEvidencePacket(packetType, evidence, input = {}, options = {}) {
   const counts = {
     evidence_count: evidence.length,
     bullish_count: evidence.filter((item) => item.direction === "bullish").length,
@@ -573,7 +585,7 @@ function scoreEvidencePacket(packetType, evidence, input = {}) {
   if (packetType === "harvest_position" && counts.portfolio_evidence_count === 0) blockers.push("missing_portfolio_context");
   if (packetType === "harvest_position" && counts.bearish_count + counts.risk_count === 0) warnings.push("no_direct_exit_evidence");
 
-  const tokenRiskScan = input?.token_risk_scan;
+  const tokenRiskScan = resolvePersistedTradeTokenRiskInput(input, options)?.token_risk_scan;
   if (Array.isArray(tokenRiskScan?.blockers) && tokenRiskScan.blockers.length) {
     blockers.push(...tokenRiskScan.blockers.map((code) => `token_risk:${code}`));
   }
@@ -644,12 +656,12 @@ function normalizePacketInput(input = {}, packetType, options = {}) {
 
 function buildEvidencePacket(input = {}, packetType, options = {}) {
   const basis = normalizePacketInput(input, packetType, options);
-  const evidence = collectBaseEvidence({ ...input, created_at: basis.created_at }, basis);
+  const evidence = collectBaseEvidence({ ...input, created_at: basis.created_at }, basis, options);
   const scoring = scoreEvidencePacket(packetType, evidence, {
     ...input,
     symbol: basis.symbol,
     contract_address: basis.contract_address
-  });
+  }, options);
   const packetDigest = sha256(stableStringify({
     builder_version: EVIDENCE_PACKET_BUILDER_VERSION,
     packet_type: basis.packet_type,

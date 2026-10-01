@@ -130,7 +130,7 @@ function normalizeTrade(record) {
   };
 }
 
-function collectActionRecords(portfolio) {
+export function collectActionRecords(portfolio, options = {}) {
   const actions = Array.isArray(portfolio.action_history) ? portfolio.action_history : [];
   const closed = Array.isArray(portfolio.closed_trades) ? portfolio.closed_trades : [];
   const seen = new Set();

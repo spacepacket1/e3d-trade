@@ -11,6 +11,7 @@ import { buildTokenRiskScan, buildTokenRiskScanRef } from "./scripts/tokenRiskSc
 import { buildLiquidityExecutionControls, inferLiquidityBucket } from "./scripts/liquidityExecutionControls.js";
 import { buildMarketDataQuality, buildMarketDataQualityRef } from "./scripts/marketDataQuality.js";
 import { recordOperatorAction } from "./scripts/auditTrail.js";
+import { externalizeTradeEvidence, resolveTradeEvidence } from "./scripts/tradeEvidence.js";
 import {
   buildEvidenceDiagnosticsEvent,
   buildHarvestEvidenceDiagnostics,
@@ -8478,6 +8479,11 @@ function applyPendingManualActions(portfolio) {
         reason: request.reason || "manual_operator_action"
       });
       if (!trade) throw new Error("executeSell returned null");
+      try {
+        externalizeTradeEvidence(trade);
+      } catch (evidenceErr) {
+        log("trade_evidence_externalize_failed", { trade_id: trade.trade_id, symbol: trade.symbol, error: evidenceErr.message });
+      }
       record.status = "executed";
       record.trade_id = trade.trade_id;
       record.proceeds_usd = trade.proceeds_usd;
@@ -8560,6 +8566,11 @@ function executeRotation(portfolio, action, review = null) {
   });
 
   if (!sellTrade) return null;
+  try {
+    externalizeTradeEvidence(sellTrade);
+  } catch (evidenceErr) {
+    log("trade_evidence_externalize_failed", { trade_id: sellTrade.trade_id, symbol: sellTrade.symbol, error: evidenceErr.message });
+  }
 
   const candidate = action.to_candidate;
   const equity = equityUsd(portfolio);
@@ -8646,6 +8657,11 @@ function executeRotation(portfolio, action, review = null) {
   if (buyTrade) {
     attachRiskDecisionMetadata(buyTrade, rotationRiskDecision, getTrainingContext());
     attachPaperOrderLifecycle(buyTrade, { risk_decision_ref: buyTrade.risk_decision_ref });
+    try {
+      externalizeTradeEvidence(buyTrade);
+    } catch (evidenceErr) {
+      log("trade_evidence_externalize_failed", { trade_id: buyTrade.trade_id, symbol: buyTrade.symbol, error: evidenceErr.message });
+    }
   }
 
   return { sellTrade, buyTrade };
@@ -8936,7 +8952,14 @@ function executeTrendSleeve(portfolio, quantContext) {
         fraction: 1,
         reason: "trend_overlay:risk_off"
       });
-      if (trade) sells.push(trade);
+      if (trade) {
+        try {
+          externalizeTradeEvidence(trade);
+        } catch (evidenceErr) {
+          log("trade_evidence_externalize_failed", { trade_id: trade.trade_id, symbol: trade.symbol, error: evidenceErr.message });
+        }
+        sells.push(trade);
+      }
     }
     if (sells.length) log("trend_sleeve_flatten", { regime: bookRegime, sold: sells.map((t) => t.symbol) });
     return { buys, sells };
@@ -8985,6 +9008,11 @@ function executeTrendSleeve(portfolio, quantContext) {
     });
     if (trade) {
       if (portfolio.positions[vehicle.symbol]) portfolio.positions[vehicle.symbol].sleeve = "trend_overlay";
+      try {
+        externalizeTradeEvidence(trade);
+      } catch (evidenceErr) {
+        log("trade_evidence_externalize_failed", { trade_id: trade.trade_id, symbol: trade.symbol, error: evidenceErr.message });
+      }
       buys.push(trade);
     }
   }
@@ -9928,7 +9956,14 @@ async function runCycle(runContext = {}) {
     const sellTrades = [];
     for (const action of sellActions) {
       const trade = executeSell(portfolio, action);
-      if (trade) sellTrades.push(trade);
+      if (trade) {
+        try {
+          externalizeTradeEvidence(trade);
+        } catch (evidenceErr) {
+          log("trade_evidence_externalize_failed", { trade_id: trade.trade_id, symbol: trade.symbol, error: evidenceErr.message });
+        }
+        sellTrades.push(trade);
+      }
     }
     if (sellTrades.length) log("sell_trades", sellTrades);
     for (const trade of sellTrades) sendTradeEmail(trade);
@@ -10010,6 +10045,11 @@ async function runCycle(runContext = {}) {
         applyEvidenceMetadata(trade.paper_trade_ticket, item.action);
         applyEvidenceMetadata(trade, item.action);
         attachPaperOrderLifecycle(trade);
+        try {
+          externalizeTradeEvidence(trade);
+        } catch (evidenceErr) {
+          log("trade_evidence_externalize_failed", { trade_id: trade.trade_id, symbol: trade.symbol, error: evidenceErr.message });
+        }
         harvestTrades.push(trade);
       }
     }
@@ -10167,6 +10207,11 @@ async function runCycle(runContext = {}) {
       if (trade) {
         attachRiskDecisionMetadata(trade, riskDecision, getTrainingContext());
         attachPaperOrderLifecycle(trade, { risk_decision_ref: trade.risk_decision_ref });
+        try {
+          externalizeTradeEvidence(trade);
+        } catch (evidenceErr) {
+          log("trade_evidence_externalize_failed", { trade_id: trade.trade_id, symbol: trade.symbol, error: evidenceErr.message });
+        }
         buyTrades.push(trade);
       }
     }
@@ -10505,5 +10550,6 @@ export {
   computeStopDistancePct,
   hydrateCandidateTradingMetrics,
   executeTrendSleeve,
-  maybeRecordHorizonMarks
+  maybeRecordHorizonMarks,
+  resolveTradeEvidence
 };

@@ -5,6 +5,7 @@ import { fileURLToPath } from "url";
 import { getAuthStatus } from "../e3dAuthClient.js";
 import { evaluateLiveCapabilityStatus } from "./custodyControls.js";
 import { resolveRiskPolicy } from "./riskEngine.js";
+import { resolveTradeEvidence } from "./tradeEvidence.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -201,6 +202,14 @@ function latestStage(records = [], stage) {
   return [...records].reverse().find((entry) => entry?.stage === stage) || null;
 }
 
+function resolvePersistedTradeRecord(trade, options = {}) {
+  if (!trade || typeof trade !== "object") return trade;
+  return {
+    ...trade,
+    ...resolveTradeEvidence(trade, options)
+  };
+}
+
 function pipelineStatusSummary(pipelineLog, trainingEvents, generatedAtMs, thresholds, pidFile = PIPELINE_PID_FILE) {
   const pid = (() => {
     try {
@@ -354,14 +363,14 @@ function venueAndSignerHealthSummary(portfolio = {}) {
   };
 }
 
-function collectOrderRecords(portfolio = {}) {
+export function collectOrderRecords(portfolio = {}, options = {}) {
   const records = [
     ...(Array.isArray(portfolio?.action_history) ? portfolio.action_history : []),
     ...(Array.isArray(portfolio?.closed_trades) ? portfolio.closed_trades : [])
   ];
   const seen = new Set();
   return records
-    .map((record) => record?.order_lifecycle || null)
+    .map((record) => resolvePersistedTradeRecord(record, options)?.order_lifecycle || null)
     .filter((order) => order?.order_id)
     .filter((order) => {
       if (seen.has(order.order_id)) return false;
