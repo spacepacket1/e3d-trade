@@ -1018,6 +1018,54 @@ function buildRunLedgerRecord({ trainingContext, cycleStartTs, cycleEndTs, scout
   };
 }
 
+// Number(null) === 0, Number("") === 0, Number(false) === 0 -- all finite, all silently
+// wrong. A missing/blank/boolean price or score must stay null, never become a fabricated
+// zero that then looks like a real (and potentially large, if compared against a real
+// price) held-position move or score delta downstream in jevCycleCadenceGate.js.
+function cadenceSnapshotFiniteNumber(value) {
+  if (value === null || value === undefined || typeof value === "boolean") return null;
+  if (typeof value === "string" && !value.trim()) return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function buildCycleCadenceSnapshot(trainingContext, approved, portfolio, cognitiveState) {
+  const approvedCandidates = [];
+  for (const candidate of Array.isArray(approved) ? approved : []) {
+    const address = cleanAddress(candidate?.token?.contract_address || candidate?.contract_address || "");
+    if (!address) continue;
+    approvedCandidates.push({
+      address,
+      symbol: candidate?.token?.symbol || candidate?.symbol || ""
+    });
+  }
+
+  const heldPositions = [];
+  for (const position of Object.values(portfolio?.positions || {})) {
+    const address = cleanAddress(position?.contract_address || "");
+    if (!address) continue;
+    heldPositions.push({
+      address,
+      symbol: position?.symbol || "",
+      current_price: cadenceSnapshotFiniteNumber(position?.current_price)
+    });
+  }
+
+  const candidates = Array.isArray(cognitiveState?.candidates) ? cognitiveState.candidates : [];
+  const finiteScores = candidates
+    .map((candidate) => cadenceSnapshotFiniteNumber(candidate?.scorecard?.composite_score))
+    .filter((score) => score !== null);
+
+  return {
+    cycle_id: trainingContext?.cycle_id || null,
+    completed_at: nowIso(),
+    approved_candidates: approvedCandidates,
+    held_positions: heldPositions,
+    candidate_count: candidates.length,
+    top_composite_score: finiteScores.length ? Math.max(...finiteScores) : null
+  };
+}
+
 function recordHarvestDecisionEvent(proposal, harvest, portfolio, context = {}, intelligence = null) {
   const token = proposal?.token || {};
   const record = buildTrainingEventRecord("harvest_decision", "harvest", portfolio, context, {
@@ -10299,6 +10347,7 @@ async function runCycle(runContext = {}) {
     // 10. PNL + SAVE
     const stats = computePortfolioStats(portfolio);
     log("stats", stats);
+    log("cycle_cadence_snapshot", buildCycleCadenceSnapshot(trainingContext, approved, portfolio, _lastCognitiveState));
 
     savePortfolio(portfolio);
 

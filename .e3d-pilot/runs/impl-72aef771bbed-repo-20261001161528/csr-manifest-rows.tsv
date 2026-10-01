@@ -1,0 +1,15 @@
+2026-05-20T07:19:46-0700	docs/e3d-action-outcome-export-feature-ticket.md	1	Exporter Skeleton	codex	gpt-5.4	exec	0	0
+2026-05-20T07:25:06-0700	docs/e3d-action-outcome-export-feature-ticket.md	2	Destination Tables	codex	gpt-5.4	exec	0	0
+2026-05-20T07:27:09-0700	docs/e3d-action-outcome-export-feature-ticket.md	3	Read Local Events	codex	gpt-5.4	exec	0	0
+2026-05-20T07:31:38-0700	docs/e3d-action-outcome-export-feature-ticket.md	4	Mapping	codex	gpt-5.4	exec	0	0
+2026-05-20T07:36:03-0700	docs/e3d-action-outcome-export-feature-ticket.md	5	Insert and Dedupe	codex	gpt-5.4	exec	0	0
+2026-05-20T07:38:58-0700	docs/e3d-action-outcome-export-feature-ticket.md	6	Manual Validation	codex	gpt-5.4	exec	0	0
+2026-05-20T07:41:15-0700	docs/e3d-action-outcome-export-feature-ticket.md	7	Cron	codex	gpt-5.4	exec	0	0
+2026-06-11T11:05:35-0700	docs/maps-navigation-integration-feature-ticket.md	1	Maps API Client	codex	gpt-5.4	exec	0	0
+2026-06-11T11:07:34-0700	docs/maps-navigation-integration-feature-ticket.md	2	Cycle Context Injection	codex	gpt-5.4	exec	0	0
+2026-06-11T11:12:26-0700	docs/maps-navigation-integration-feature-ticket.md	3	Harvest Pre-Check for Route Closures and Hazards	codex	gpt-5.4	exec	0	0
+2026-06-11T11:17:08-0700	docs/maps-navigation-integration-feature-ticket.md	4	FlowGraph Edge Check for Scout Route Validation	codex	gpt-5.4	exec	0	0
+2026-09-30T07:21:03-0700	/var/folders/vn/jrwn6x0579v_26grcpvwp_200000gn/T//e3d-pilot.impl-d1ff54b97c44-repo-20260929154934.7q9gYs/.e3d-pilot/runs/impl-d1ff54b97c44-repo-20260929154934/spec-final.md	1	Implement and Verify the Shadow Gate	codex	gpt-5.4	exec	0	0
+2026-09-30T14:48:21-0700	/var/folders/vn/jrwn6x0579v_26grcpvwp_200000gn/T//e3d-pilot.impl-853c86a9132f-repo-20260930192036.TkZpbU/.e3d-pilot/runs/impl-853c86a9132f-repo-20260930192036/spec-final.md	1	Sidecar Evidence Storage and Compatibility Resolver	codex	gpt-5.4	exec	0	0
+2026-09-30T14:52:10-0700	/var/folders/vn/jrwn6x0579v_26grcpvwp_200000gn/T//e3d-pilot.impl-853c86a9132f-repo-20260930192036.TkZpbU/.e3d-pilot/runs/impl-853c86a9132f-repo-20260930192036/spec-final.md	2	Migrate Trade Evidence Consumers	codex	gpt-5.4	exec	0	0
+2026-10-01T09:45:45-0700	/var/folders/vn/jrwn6x0579v_26grcpvwp_200000gn/T//e3d-pilot.impl-72aef771bbed-repo-20261001161528.pKue5n/.e3d-pilot/runs/impl-72aef771bbed-repo-20261001161528/spec-final.md	1	Shadow-Mode Jev Cadence Gate	codex	gpt-5.4	exec	0	0
