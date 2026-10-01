@@ -108,6 +108,49 @@ function readEvidenceLine(line) {
   }
 }
 
+// resolveTradeEvidence() is called once per trade by every consumer that loops over
+// portfolio history (reconciliationAccounting.js, signalAttribution.js, etc. -- 1,845+
+// trades as of the Sep 2026 migration). Without caching, each call re-read and re-parsed
+// the entire sidecar file, turning a single report into an O(trades x file size) scan --
+// confirmed live: signalAttribution.js took over 2.5 minutes and was still running when
+// killed, pegged at 100%+ CPU, against an 18MB sidecar. Cache the parsed
+// trade_id -> evidence map per resolved sidecarPath, keyed on the file's mtimeMs/size so a
+// change (a new externalized trade) is picked up on the next call rather than served stale.
+const sidecarCache = new Map();
+
+function loadSidecarRecordsByTradeId(sidecarPath) {
+  let stats;
+  try {
+    stats = fs.statSync(sidecarPath);
+  } catch {
+    sidecarCache.delete(sidecarPath);
+    return null;
+  }
+  const cached = sidecarCache.get(sidecarPath);
+  if (cached && cached.mtimeMs === stats.mtimeMs && cached.size === stats.size) {
+    return cached.recordsByTradeId;
+  }
+  let raw;
+  try {
+    raw = fs.readFileSync(sidecarPath, "utf8");
+  } catch {
+    sidecarCache.delete(sidecarPath);
+    return null;
+  }
+  const recordsByTradeId = new Map();
+  for (const line of raw.split("\n")) {
+    const record = readEvidenceLine(line);
+    if (!isValidEvidenceRecord(record)) continue;
+    recordsByTradeId.set(record.trade_id, {
+      order_lifecycle: record.order_lifecycle ?? null,
+      token_risk_scan: record.token_risk_scan ?? null,
+      simulated_execution: record.simulated_execution ?? null
+    });
+  }
+  sidecarCache.set(sidecarPath, { mtimeMs: stats.mtimeMs, size: stats.size, recordsByTradeId });
+  return recordsByTradeId;
+}
+
 function resolveTradeEvidence(trade, options = {}) {
   if (!trade || typeof trade !== "object" || Array.isArray(trade)) {
     return buildAbsentEvidence();
@@ -119,26 +162,10 @@ function resolveTradeEvidence(trade, options = {}) {
     return buildAbsentEvidence();
   }
 
-  let raw;
-  try {
-    raw = fs.readFileSync(resolveSidecarPath(options), "utf8");
-  } catch {
-    return buildAbsentEvidence();
-  }
+  const recordsByTradeId = loadSidecarRecordsByTradeId(resolveSidecarPath(options));
+  if (!recordsByTradeId) return buildAbsentEvidence();
 
-  let resolved = null;
-  for (const line of raw.split("\n")) {
-    const record = readEvidenceLine(line);
-    if (!isValidEvidenceRecord(record)) continue;
-    if (record.trade_id !== trade.evidence_ref) continue;
-    resolved = {
-      order_lifecycle: record.order_lifecycle ?? null,
-      token_risk_scan: record.token_risk_scan ?? null,
-      simulated_execution: record.simulated_execution ?? null
-    };
-  }
-
-  return resolved || buildAbsentEvidence();
+  return recordsByTradeId.get(trade.evidence_ref) || buildAbsentEvidence();
 }
 
 function externalizeTradeEvidence(trade, options = {}) {
