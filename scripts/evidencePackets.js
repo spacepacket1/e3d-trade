@@ -9,6 +9,7 @@ export const SCOUT_FLOW_ONLY_MIN_BUY_SELL_RATIO_1H = 3.5;
 export const SCOUT_FLOW_ONLY_MIN_LIQUIDITY_USD = 150000;
 export const SCOUT_FLOW_ONLY_MIN_VOLUME_24H_USD = 75000;
 export const SCOUT_FLOW_ONLY_MIN_MARKET_CAP_USD = 5000000;
+export const LATE_SIGNAL_STORY_TYPES = new Set(["MOVER", "SURGE"]);
 
 const SOURCE_TYPES = new Set([
   "story",
@@ -46,6 +47,11 @@ function cleanText(value) {
 function cleanAddress(value) {
   const text = String(value ?? "").trim().toLowerCase();
   return text || null;
+}
+
+function normalizeStoryType(value) {
+  const text = cleanText(value);
+  return text ? text.toUpperCase() : null;
 }
 
 function stableStringify(value) {
@@ -269,10 +275,22 @@ function normalizeEvidenceItem(item, packetBasis) {
     freshness_seconds: normalizeFreshnessSeconds(item?.freshness_seconds, item?.timestamp || item?.ts || item?.created_at || item?.updated_at, packetBasis.created_at),
     summary
   };
+  const storyType = sourceType === "story" ? normalizeStoryType(item?.story_type) : null;
+  if (storyType) evidence.story_type = storyType;
   return {
     evidence_id: buildEvidenceId(packetBasis, evidence),
     ...evidence
   };
+}
+
+export function countGenuineStoryEvidence(evidence = []) {
+  return (Array.isArray(evidence) ? evidence : []).filter((item) => {
+    const sourceType = item?.source_type;
+    if (sourceType === "thesis" || sourceType === "watchlist") return true;
+    if (sourceType !== "story") return false;
+    const storyType = normalizeStoryType(item?.story_type);
+    return !storyType || !LATE_SIGNAL_STORY_TYPES.has(storyType);
+  }).length;
 }
 
 function pushEvidence(target, item) {
@@ -531,6 +549,7 @@ function collectBaseEvidence(input, packetBasis, options = {}) {
         direction: item.direction,
         strength: item.strength,
         freshness_seconds: item.freshness_seconds,
+        ...(item.story_type ? { story_type: item.story_type } : {}),
         summary: item.summary
       });
       if (seen.has(key)) return false;
@@ -562,7 +581,7 @@ function scoreEvidencePacket(packetType, evidence, input = {}, options = {}) {
     bearish_count: evidence.filter((item) => item.direction === "bearish").length,
     risk_count: evidence.filter((item) => item.direction === "risk").length,
     market_evidence_count: evidence.filter((item) => ["market_data", "flow", "liquidity", "data_quality"].includes(item.source_type)).length,
-    story_evidence_count: evidence.filter((item) => ["story", "thesis", "watchlist"].includes(item.source_type)).length,
+    story_evidence_count: countGenuineStoryEvidence(evidence),
     portfolio_evidence_count: evidence.filter((item) => item.source_type === "portfolio").length,
     data_quality_count: evidence.filter((item) => item.source_type === "data_quality").length,
     token_risk_count: evidence.filter((item) => item.source_type === "token_risk").length
@@ -675,6 +694,7 @@ function buildEvidencePacket(input = {}, packetType, options = {}) {
       direction: item.direction,
       strength: item.strength,
       freshness_seconds: item.freshness_seconds,
+      ...(item.story_type ? { story_type: item.story_type } : {}),
       summary: item.summary
     }))
   }));
@@ -721,12 +741,13 @@ export function evaluateScoutPacketEligibility(packet = {}, input = {}) {
       )
   );
   const metrics = scoutFlowOnlyMetrics(input);
-  const isFlowOnly = packet?.story_evidence_count === 0 && evidence.some((item) => item?.source_type === "flow");
+  const genuineStoryEvidenceCount = countGenuineStoryEvidence(evidence);
+  const isFlowOnly = genuineStoryEvidenceCount === 0 && evidence.some((item) => item?.source_type === "flow");
   const reasons = [];
 
   if ((packet?.evidence_count ?? 0) < 3) reasons.push("requires_minimum_three_evidence_items");
   if ((packet?.market_evidence_count ?? 0) < 1) reasons.push("missing_market_liquidity_flow_or_quality_evidence");
-  if (!isFlowOnly && (packet?.story_evidence_count ?? 0) < 1) reasons.push("missing_story_thesis_candidate_or_watchlist_evidence");
+  if (!isFlowOnly && genuineStoryEvidenceCount < 1) reasons.push("missing_story_thesis_candidate_or_watchlist_evidence");
   if (hardBlockers.size) reasons.push("hard_packet_blocker");
   if (Number.isFinite(metrics.liquidity_usd) && metrics.liquidity_usd <= 0) reasons.push("zero_liquidity_untradeable");
 

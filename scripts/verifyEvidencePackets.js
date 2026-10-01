@@ -8,6 +8,69 @@ import {
 
 const createdAt = "2026-04-28T12:00:00.000Z";
 
+function buildScoutPacketWithEvidence(evidence, overrides = {}) {
+  return buildScoutEvidencePacket({
+    created_at: createdAt,
+    token: {
+      symbol: "TEST",
+      contract_address: "0xtest000000000000000000000000000000000001"
+    },
+    evidence,
+    market_data: {
+      current_price: 0.87,
+      change_24h_pct: 7.2,
+      volume_24h_usd: 510000,
+      market_cap_usd: 8200000,
+      price_source: "e3d",
+      price_timestamp: "2026-04-28T11:57:00.000Z"
+    },
+    liquidity_data: {
+      liquidity_usd: 240000,
+      liquidity_source: "e3d",
+      liquidity_timestamp: "2026-04-28T11:56:30.000Z"
+    },
+    flow: {
+      flow_signal: "strong_accumulation",
+      buy_sell_ratio_1h: 4.9,
+      source: "dexscreener",
+      timestamp: "2026-04-28T11:58:00.000Z"
+    },
+    market_data_quality: {
+      data_quality_id: "mdq-test",
+      evaluated_at: "2026-04-28T11:58:00.000Z",
+      normalized: { confidence: 91 },
+      blockers: [],
+      warnings: [],
+      degraded_data_mode: false
+    },
+    token_risk_scan: {
+      token_risk_scan_id: "trs-test",
+      evaluated_at: "2026-04-28T11:58:30.000Z",
+      decision: "pass",
+      blockers: [],
+      warnings: []
+    },
+    ...overrides
+  });
+}
+
+function buildScoutEligibilityInput(overrides = {}) {
+  return {
+    market_data: {
+      volume_24h_usd: 510000,
+      market_cap_usd: 8200000
+    },
+    liquidity_data: {
+      liquidity_usd: 240000
+    },
+    flow: {
+      flow_signal: "strong_accumulation",
+      buy_sell_ratio_1h: 4.9
+    },
+    ...overrides
+  };
+}
+
 const strongScoutInput = {
   created_at: createdAt,
   strategy_version: "paper-pipeline-v1",
@@ -133,6 +196,218 @@ const flowOnlyEligibility = evaluateScoutPacketEligibility(flowOnlyScout, {
 });
 assert.equal(flowOnlyEligibility.eligible, true);
 assert.equal(flowOnlyEligibility.flow_only, true);
+
+for (const lateType of ["MOVER", "mover", "SuRgE"]) {
+  const lateStoryPacket = buildScoutPacketWithEvidence([
+    {
+      source_type: "story",
+      source_ref: `story-${lateType}`,
+      label: "story_signal",
+      direction: "bullish",
+      strength: 77,
+      story_type: lateType,
+      summary: `Late signal ${lateType}`
+    }
+  ], {
+    token: {
+      symbol: `LATE_${lateType}`,
+      contract_address: `0x${String(lateType).toLowerCase().padEnd(40, "0").slice(0, 40)}`
+    }
+  });
+  assert.equal(lateStoryPacket.story_evidence_count, 0, `${lateType} story should not count as genuine evidence`);
+  assert.ok(lateStoryPacket.warnings.includes("flow_only_candidate"), `${lateType} story should still warn as flow-only`);
+  const lateEligibility = evaluateScoutPacketEligibility({
+    ...lateStoryPacket,
+    story_evidence_count: 99
+  }, buildScoutEligibilityInput());
+  assert.equal(lateEligibility.flow_only, true, `${lateType} late story with flow should classify as flow-only`);
+  assert.equal(lateEligibility.eligible, true, `${lateType} late story packet should remain eligible when flow-only thresholds pass`);
+}
+
+for (const genuineType of ["STAGING", "CLUSTER"]) {
+  const genuineStoryPacket = buildScoutPacketWithEvidence([
+    {
+      source_type: "story",
+      source_ref: `story-${genuineType}`,
+      label: "story_signal",
+      direction: "bullish",
+      strength: 77,
+      story_type: genuineType,
+      summary: `Fresh signal ${genuineType}`
+    }
+  ], {
+    token: {
+      symbol: genuineType,
+      contract_address: `0x${String(genuineType).toLowerCase().padEnd(40, "1").slice(0, 40)}`
+    }
+  });
+  assert.ok(genuineStoryPacket.story_evidence_count > 0, `${genuineType} should count as genuine evidence`);
+  const genuineEligibility = evaluateScoutPacketEligibility(genuineStoryPacket, buildScoutEligibilityInput());
+  assert.equal(genuineEligibility.flow_only, false, `${genuineType} should not be flow-only`);
+}
+
+const thesisOnlyPacket = buildScoutPacketWithEvidence([
+  {
+    source_type: "thesis",
+    source_ref: "thesis-only",
+    label: "thesis_support",
+    direction: "bullish",
+    strength: 72,
+    summary: "Thesis-only support"
+  }
+]);
+assert.ok(thesisOnlyPacket.story_evidence_count > 0, "thesis evidence should count as genuine story-side support");
+assert.equal(evaluateScoutPacketEligibility(thesisOnlyPacket, buildScoutEligibilityInput()).flow_only, false);
+
+const watchlistOnlyPacket = buildScoutPacketWithEvidence([
+  {
+    source_type: "watchlist",
+    source_ref: "watchlist-only",
+    label: "watchlist_context",
+    direction: "bullish",
+    strength: 46,
+    summary: "user watchlist"
+  }
+]);
+assert.ok(watchlistOnlyPacket.story_evidence_count > 0, "watchlist evidence should count as genuine story-side support");
+assert.equal(evaluateScoutPacketEligibility(watchlistOnlyPacket, buildScoutEligibilityInput()).flow_only, false);
+
+const shortlistContextPacket = buildScoutPacketWithEvidence([
+  {
+    source_type: "story",
+    source_ref: "shortlist-context",
+    label: "e3d_candidate_context",
+    direction: "bullish",
+    strength: 71,
+    summary: "Scout shortlist candidate context"
+  }
+]);
+assert.ok(shortlistContextPacket.story_evidence_count > 0, "legacy shortlist context story with no type should stay genuine");
+assert.equal(evaluateScoutPacketEligibility(shortlistContextPacket, buildScoutEligibilityInput()).flow_only, false);
+
+const legacyStoryBase = {
+  source_type: "story",
+  source_ref: "legacy-story",
+  label: "story_signal",
+  direction: "bullish",
+  strength: 68,
+  summary: "Legacy story without typed classification"
+};
+const legacyStoryPacket = buildScoutPacketWithEvidence([legacyStoryBase], {
+  token: {
+    symbol: "LEGACY",
+    contract_address: "0xlegacy0000000000000000000000000000000001"
+  }
+});
+const blankStoryTypePacket = buildScoutPacketWithEvidence([{ ...legacyStoryBase, story_type: "" }], {
+  token: {
+    symbol: "LEGACY",
+    contract_address: "0xlegacy0000000000000000000000000000000001"
+  }
+});
+const whitespaceStoryTypePacket = buildScoutPacketWithEvidence([{ ...legacyStoryBase, story_type: "   " }], {
+  token: {
+    symbol: "LEGACY",
+    contract_address: "0xlegacy0000000000000000000000000000000001"
+  }
+});
+for (const packet of [legacyStoryPacket, blankStoryTypePacket, whitespaceStoryTypePacket]) {
+  assert.ok(packet.story_evidence_count > 0, "legacy story forms should remain genuine");
+  const normalizedLegacyStory = packet.evidence.find((item) => item.source_type === "story");
+  assert.ok(normalizedLegacyStory, "legacy packet should preserve its story evidence");
+  assert.equal(Object.prototype.hasOwnProperty.call(normalizedLegacyStory, "story_type"), false, "blank or missing story types should be omitted after normalization");
+}
+assert.equal(legacyStoryPacket.evidence[0].evidence_id, blankStoryTypePacket.evidence[0].evidence_id, "blank story_type should keep the legacy evidence id stable");
+assert.equal(legacyStoryPacket.evidence[0].evidence_id, whitespaceStoryTypePacket.evidence[0].evidence_id, "whitespace story_type should keep the legacy evidence id stable");
+assert.equal(legacyStoryPacket.evidence_packet_id, blankStoryTypePacket.evidence_packet_id, "blank story_type should keep the packet id stable");
+assert.equal(legacyStoryPacket.evidence_packet_id, whitespaceStoryTypePacket.evidence_packet_id, "whitespace story_type should keep the packet id stable");
+
+const noStoryNoFlowPacket = buildScoutEvidencePacket({
+  created_at: createdAt,
+  token: {
+    symbol: "NOSTORY",
+    contract_address: "0xnostory00000000000000000000000000000001"
+  },
+  market_data: {
+    current_price: 1.2,
+    change_24h_pct: 3.1,
+    volume_24h_usd: 410000,
+    market_cap_usd: 9100000,
+    price_source: "e3d",
+    price_timestamp: "2026-04-28T11:57:00.000Z"
+  },
+  liquidity_data: {
+    liquidity_usd: 260000,
+    liquidity_source: "e3d",
+    liquidity_timestamp: "2026-04-28T11:56:30.000Z"
+  },
+  market_data_quality: {
+    data_quality_id: "mdq-nostory",
+    evaluated_at: "2026-04-28T11:58:00.000Z",
+    normalized: { confidence: 93 },
+    blockers: [],
+    warnings: [],
+    degraded_data_mode: false
+  },
+  token_risk_scan: {
+    token_risk_scan_id: "trs-nostory",
+    evaluated_at: "2026-04-28T11:58:30.000Z",
+    decision: "pass",
+    blockers: [],
+    warnings: []
+  }
+});
+const noStoryNoFlowEligibility = evaluateScoutPacketEligibility(noStoryNoFlowPacket, {
+  market_data: {
+    volume_24h_usd: 410000,
+    market_cap_usd: 9100000
+  },
+  liquidity_data: {
+    liquidity_usd: 260000
+  }
+});
+assert.equal(noStoryNoFlowPacket.story_evidence_count, 0, "packet without story-side evidence should have zero genuine count");
+assert.equal(noStoryNoFlowEligibility.flow_only, false, "zero genuine count without flow should not be flow-only");
+assert.ok(noStoryNoFlowEligibility.reasons.includes("missing_story_thesis_candidate_or_watchlist_evidence"));
+
+const typedStoryStagingPacket = buildScoutPacketWithEvidence([
+  {
+    source_type: "story",
+    source_ref: "typed-story",
+    label: "story_signal",
+    direction: "bullish",
+    strength: 70,
+    story_type: " staging ",
+    summary: "Typed story identity regression"
+  }
+], {
+  token: {
+    symbol: "TYPED",
+    contract_address: "0xtyped0000000000000000000000000000000001"
+  }
+});
+const typedStoryClusterPacket = buildScoutPacketWithEvidence([
+  {
+    source_type: "story",
+    source_ref: "typed-story",
+    label: "story_signal",
+    direction: "bullish",
+    strength: 70,
+    story_type: "cluster",
+    summary: "Typed story identity regression"
+  }
+], {
+  token: {
+    symbol: "TYPED",
+    contract_address: "0xtyped0000000000000000000000000000000001"
+  }
+});
+const stagingStoryEvidence = typedStoryStagingPacket.evidence.find((item) => item.source_type === "story");
+const clusterStoryEvidence = typedStoryClusterPacket.evidence.find((item) => item.source_type === "story");
+assert.equal(stagingStoryEvidence.story_type, "STAGING", "stored story type should be uppercased");
+assert.equal(clusterStoryEvidence.story_type, "CLUSTER", "stored story type should be uppercased");
+assert.notEqual(stagingStoryEvidence.evidence_id, clusterStoryEvidence.evidence_id, "non-blank story type should change evidence identity");
+assert.notEqual(typedStoryStagingPacket.evidence_packet_id, typedStoryClusterPacket.evidence_packet_id, "non-blank story type should change packet identity");
 
 const weakScout = buildScoutEvidencePacket({
   created_at: createdAt,
