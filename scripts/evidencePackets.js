@@ -4,7 +4,7 @@ import { resolveTradeEvidence } from "./tradeEvidence.js";
 export const EVIDENCE_PACKET_SCHEMA_VERSION = "1.0";
 export const EVIDENCE_PACKET_BUILDER_VERSION = "evidence-packets-v1";
 export const SCOUT_EVIDENCE_SHORTLIST_DEFAULT_LIMIT = 12;
-export const SCOUT_FLOW_ONLY_PER_CYCLE_LIMIT = 0;
+export const SCOUT_FLOW_ONLY_PER_CYCLE_LIMIT = 1;
 export const SCOUT_FLOW_ONLY_MIN_BUY_SELL_RATIO_1H = 3.5;
 export const SCOUT_FLOW_ONLY_MIN_LIQUIDITY_USD = 150000;
 export const SCOUT_FLOW_ONLY_MIN_VOLUME_24H_USD = 75000;
@@ -726,7 +726,7 @@ function scoutFlowOnlyMetrics(input = {}) {
     liquidity_usd: toNum(liquidityData.liquidity_usd, toNum(input.liquidity_usd, NaN)),
     volume_24h_usd: toNum(marketData.volume_24h_usd, toNum(input.volume_24h_usd, NaN)),
     market_cap_usd: toNum(marketData.market_cap_usd, toNum(input.market_cap_usd, NaN)),
-    flow_signal: cleanText(flow?.flow_signal || input.flow_signal)?.toLowerCase() || null
+    flow_signal: cleanText(flow?.flow_signal ?? input.flow_signal)?.toLowerCase() || null
   };
 }
 
@@ -753,9 +753,7 @@ export function evaluateScoutPacketEligibility(packet = {}, input = {}) {
 
   const flowOnlyPasses =
     isFlowOnly
-    && metrics.flow_signal
-    && !metrics.flow_signal.includes("distribution")
-    && metrics.buy_sell_ratio_1h >= SCOUT_FLOW_ONLY_MIN_BUY_SELL_RATIO_1H
+    && (!metrics.flow_signal || !metrics.flow_signal.includes("distribution"))
     && metrics.liquidity_usd >= SCOUT_FLOW_ONLY_MIN_LIQUIDITY_USD
     && metrics.volume_24h_usd >= SCOUT_FLOW_ONLY_MIN_VOLUME_24H_USD
     && metrics.market_cap_usd >= SCOUT_FLOW_ONLY_MIN_MARKET_CAP_USD;
