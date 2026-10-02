@@ -1,5 +1,6 @@
 import assert from "assert/strict";
 import fs from "fs";
+import { SCOUT_FLOW_ONLY_PER_CYCLE_LIMIT } from "./evidencePackets.js";
 
 const originalAppendFileSync = fs.appendFileSync;
 fs.appendFileSync = () => {};
@@ -11,6 +12,7 @@ const {
   buildScoutEvidenceShortlist,
   evaluateBuyActions,
   evaluateRotationActions,
+  filterScoutCandidatesForDesk,
   filterScoutCandidatesAgainstPortfolio,
   openPosition,
   rankApprovedCandidates,
@@ -101,6 +103,11 @@ function buildCandidate(overrides = {}) {
       quote_source: "e3d",
       quote_timestamp: overrides.quote_timestamp ?? "2026-10-01T16:00:00.000Z"
     },
+    setup_type: overrides.setup_type ?? null,
+    source: overrides.source ?? "scout",
+    conviction_score: overrides.conviction_score ?? 70,
+    evidence_warnings: structuredClone(overrides.evidence_warnings ?? []),
+    evidence_summary: structuredClone(overrides.evidence_summary ?? null),
     targets,
     invalidation_price: overrides.invalidation_price ?? Number((price * 0.8).toFixed(4)),
     _score: overrides._score ?? 120,
@@ -191,12 +198,83 @@ function buildShortlistData() {
   };
 }
 
+function buildFlowOnlyShortlistData() {
+  return {
+    tokenUniverse: [
+      {
+        address: "0xalfa",
+        symbol: "ALFA",
+        name: "Alfa",
+        price_usd: 2.1,
+        change_24h: 8.5,
+        change_30m: 1.2,
+        volume_24h_usd: 180000,
+        market_cap_usd: 9800000,
+        liquidity_usd: 260000,
+        flow_signal: "accumulation",
+        buy_sell_ratio_1h: null,
+        price_change_1h_pct: 0.9
+      },
+      {
+        address: "0xbravo",
+        symbol: "BRAVO",
+        name: "Bravo",
+        price_usd: 1.4,
+        change_24h: 7.8,
+        change_30m: 1.1,
+        volume_24h_usd: 170000,
+        market_cap_usd: 9100000,
+        liquidity_usd: 255000,
+        flow_signal: "accumulation",
+        buy_sell_ratio_1h: null,
+        price_change_1h_pct: 0.7
+      }
+    ],
+    stories: {
+      MOVER: [
+        {
+          id: "story-alfa-mover",
+          story_type: "MOVER",
+          title: "Late mover continuation",
+          score: 74,
+          meta: {
+            primary: { address: "0xalfa" }
+          }
+        }
+      ],
+      SURGE: [
+        {
+          id: "story-bravo-surge",
+          story_type: "SURGE",
+          title: "Late surge continuation",
+          score: 72,
+          meta: {
+            primary: { address: "0xbravo" }
+          }
+        }
+      ]
+    },
+    e3dCandidates: [],
+    e3dTheses: [],
+    e3dWatchlist: [],
+    e3dActions: [],
+    cgDetailMap: new Map(),
+    avoidAddresses: new Set(),
+    disqualifierTypes: new Set(["WASH_TRADE", "LOOP", "LIQUIDITY_DRAIN", "SPREAD_WIDENING", "EXCHANGE_FLOW", "SECURITY_RISK", "RUG_LIQUIDITY_PULL", "TREASURY_DISTRIBUTION"]),
+    lateSignalTypes: new Set(["MOVER", "SURGE"]),
+    secondaryTypes: new Set(),
+    buySignalTypes: new Set(["STAGING", "CLUSTER", "FUNNEL", "NEW_WALLETS", "ACCUMULATION", "SMART_MONEY", "SMART_MONEY_LEADER", "STEALTH_ACCUMULATION", "THESIS", "BREAKOUT_CONFIRMED", "FLOW", "HOTLINKS", "DISCOVERY", "WHALE"])
+  };
+}
+
 function approxEqual(actual, expected, epsilon = 1e-9) {
   assert.ok(Math.abs(actual - expected) <= epsilon, `expected ${actual} to be within ${epsilon} of ${expected}`);
 }
 
 try {
+  assert.equal(SCOUT_FLOW_ONLY_PER_CYCLE_LIMIT, 1);
   assert.equal(SETTINGS_DEFAULTS.scout_max_candidates, 1);
+  assert.equal(SETTINGS_DEFAULTS.flow_only_max_position_pct, 0.015);
   assert.equal(resolveScoutMaxCandidates(SETTINGS_DEFAULTS), 1);
   assert.equal(resolveScoutMaxCandidates({ scout_max_candidates: 8 }), 8);
   assert.equal(resolveScoutMaxCandidates({ scout_max_candidates: 0 }), 1);
@@ -426,6 +504,47 @@ try {
   ]);
   assert.equal(collisionBuyActions.length, 0, "a symbol-colliding, different-address candidate must be skipped entirely rather than consuming a buy slot for a trade execution will reject");
 
+  const originalAppendCapture = fs.appendFileSync;
+  const deskLogs = [];
+  fs.appendFileSync = (filePath, contents) => {
+    deskLogs.push({ filePath, contents: String(contents) });
+  };
+  try {
+    const deskCanonicalCandidate = buildCandidate({
+      symbol: "FLOWA",
+      address: "0xflowa",
+      setup_type: "flow_only_breakout",
+      liquidity_usd: 300000,
+      change_24h_pct: 10,
+      evidence_warnings: [],
+      evidence_summary: { warnings: ["flow_only_candidate"] }
+    });
+    const deskNonCanonicalCandidate = buildCandidate({
+      symbol: "FLOWB",
+      address: "0xflowb",
+      setup_type: "flow_only_breakout",
+      liquidity_usd: 300000,
+      change_24h_pct: 10
+    });
+    const deskKept = filterScoutCandidatesForDesk(
+      [deskCanonicalCandidate, deskNonCanonicalCandidate],
+      buildPortfolio({ settings: { scout_max_candidates: 5 } })
+    );
+    assert.deepEqual(deskKept.map((candidate) => candidate.token.symbol), ["FLOWA"]);
+    const parsedDeskLogs = deskLogs.map((entry) => JSON.parse(entry.contents.trim()));
+    assert.equal(
+      parsedDeskLogs.some((entry) =>
+        entry.stage === "scout_desk_filter"
+        && entry.data?.symbol === "FLOWB"
+        && entry.data?.reason === "flow_only_disabled"
+      ),
+      true,
+      "non-canonical flow-only labels must remain filtered with the flow_only_disabled reason"
+    );
+  } finally {
+    fs.appendFileSync = originalAppendCapture;
+  }
+
   const renamedTickerRotationPortfolio = buildPortfolio({
     cash_usd: 25000,
     positions: {
@@ -539,6 +658,114 @@ try {
   assert.equal(buyActions[0].candidate.token.symbol, "astro");
   assert.equal(buyActions[0].reason, "pyramid_add");
 
+  const flowOnlyCapPortfolio = buildPortfolio({
+    cash_usd: 50000,
+    settings: { max_buys_per_cycle: 5, min_trade_usd: 50 }
+  });
+  flowOnlyCapPortfolio.stats = { equity_usd: 10000 };
+  const flowOnlyCappedActions = evaluateBuyActions(flowOnlyCapPortfolio, [
+    buildCandidate({
+      symbol: "FLOWCAP",
+      address: "0xflowcap",
+      approved_size_pct: 10,
+      evidence_warnings: ["flow_only_candidate"]
+    })
+  ]);
+  assert.equal(flowOnlyCappedActions.length, 1);
+  approxEqual(flowOnlyCappedActions[0].allocation_usd, 150, 1e-9);
+  assert.equal(flowOnlyCappedActions[0].reason, "new_position");
+
+  const flowOnlyBelowCapPortfolio = buildPortfolio({
+    cash_usd: 50000,
+    settings: { max_buys_per_cycle: 5, min_trade_usd: 50 }
+  });
+  flowOnlyBelowCapPortfolio.stats = { equity_usd: 10000 };
+  const flowOnlyBelowCapActions = evaluateBuyActions(flowOnlyBelowCapPortfolio, [
+    buildCandidate({
+      symbol: "FLOWSMALL",
+      address: "0xflowsmall",
+      approved_size_pct: 1,
+      evidence_warnings: ["flow_only_candidate"]
+    })
+  ]);
+  assert.equal(flowOnlyBelowCapActions.length, 1);
+  approxEqual(flowOnlyBelowCapActions[0].allocation_usd, 100, 1e-9);
+
+  const nonFlowOnlyPortfolio = buildPortfolio({
+    cash_usd: 50000,
+    settings: { max_buys_per_cycle: 5, min_trade_usd: 50 }
+  });
+  nonFlowOnlyPortfolio.stats = { equity_usd: 10000 };
+  const nonFlowOnlyActions = evaluateBuyActions(nonFlowOnlyPortfolio, [
+    buildCandidate({
+      symbol: "PLAIN",
+      address: "0xplain",
+      approved_size_pct: 10
+    })
+  ]);
+  assert.equal(nonFlowOnlyActions.length, 1);
+  approxEqual(nonFlowOnlyActions[0].allocation_usd, 1000, 1e-9);
+
+  const summaryOnlyFlowOnlyPortfolio = buildPortfolio({
+    cash_usd: 50000,
+    settings: { max_buys_per_cycle: 5, min_trade_usd: 50 }
+  });
+  summaryOnlyFlowOnlyPortfolio.stats = { equity_usd: 10000 };
+  const summaryOnlyFlowOnlyActions = evaluateBuyActions(summaryOnlyFlowOnlyPortfolio, [
+    buildCandidate({
+      symbol: "FLOWSUM",
+      address: "0xflowsum",
+      approved_size_pct: 10,
+      evidence_warnings: [],
+      evidence_summary: { warnings: ["flow_only_candidate"] }
+    })
+  ]);
+  assert.equal(summaryOnlyFlowOnlyActions.length, 1);
+  approxEqual(summaryOnlyFlowOnlyActions[0].allocation_usd, 150, 1e-9);
+
+  const cashCappedFlowOnlyPortfolio = buildPortfolio({
+    cash_usd: 120,
+    settings: { max_buys_per_cycle: 5, min_trade_usd: 50 }
+  });
+  cashCappedFlowOnlyPortfolio.stats = { equity_usd: 10000 };
+  const cashCappedFlowOnlyActions = evaluateBuyActions(cashCappedFlowOnlyPortfolio, [
+    buildCandidate({
+      symbol: "FLOWCASH",
+      address: "0xflowcash",
+      approved_size_pct: 10,
+      evidence_warnings: ["flow_only_candidate"]
+    })
+  ]);
+  assert.equal(cashCappedFlowOnlyActions.length, 1);
+  approxEqual(cashCappedFlowOnlyActions[0].allocation_usd, 120, 1e-9);
+
+  const flowOnlyAddPortfolio = buildPortfolio({
+    cash_usd: 50000,
+    positions: {
+      FLOWADD: buildHeldPosition("FLOWADD", "0xflowadd", {
+        quantity: 1000,
+        current_price: 1,
+        avg_entry_price: 1,
+        cost_basis_usd: 1000,
+        market_value_usd: 1000
+      })
+    },
+    settings: { max_position_pct: 0.2, max_buys_per_cycle: 5, min_trade_usd: 50 }
+  });
+  flowOnlyAddPortfolio.stats = { equity_usd: 10000 };
+  const flowOnlyAddActions = evaluateBuyActions(flowOnlyAddPortfolio, [
+    buildCandidate({
+      symbol: "flowadd",
+      address: "0xflowadd",
+      approved_size_pct: 50,
+      evidence_warnings: ["flow_only_candidate"]
+    })
+  ]);
+  assert.equal(flowOnlyAddActions.length, 1);
+  assert.equal(flowOnlyAddActions[0].reason, "pyramid_add");
+  approxEqual(flowOnlyAddActions[0].allocation_usd, 1000, 1e-9);
+  assert.ok(flowOnlyAddActions[0].allocation_usd > flowOnlyAddPortfolio.stats.equity_usd * SETTINGS_DEFAULTS.flow_only_max_position_pct);
+
   const failedAddPortfolio = buildPortfolio({
     cash_usd: 15000,
     positions: {
@@ -638,6 +865,36 @@ try {
   assert.equal(disqualifiedShortlistResult.entries.length, 0);
   assert.equal(disqualifiedShortlistResult.shortlist.length, 0);
   assert.equal(disqualifiedShortlistResult.blocked.length, 0);
+
+  const originalEvidenceShortlistLimit = process.env.SCOUT_EVIDENCE_SHORTLIST_LIMIT;
+  process.env.SCOUT_EVIDENCE_SHORTLIST_LIMIT = "2";
+  try {
+    const flowOnlyShortlistResult = buildScoutEvidenceShortlist(buildFlowOnlyShortlistData(), buildPortfolio({
+      cash_usd: 18000,
+      positions: {}
+    }), {
+      createdAt: "2026-10-01T16:00:00.000Z",
+      heldAddresses: new Set(),
+      heldSymbols: new Set(),
+      disqualifiedAddresses: new Set()
+    });
+
+    assert.equal(flowOnlyShortlistResult.shortlist_limit, 2);
+    assert.equal(flowOnlyShortlistResult.entries.length, 2);
+    assert.equal(flowOnlyShortlistResult.entries.every((entry) =>
+      entry.ranking.eligibility.flow_only
+      && entry.ranking.eligibility.flow_only_passes
+      && entry.ranking.eligibility.eligible
+      && entry.packet.warnings.includes("flow_only_candidate")
+    ), true, "both shortlist fixtures should remain canonically flow-only and otherwise eligible");
+    assert.deepEqual(flowOnlyShortlistResult.shortlist.map((entry) => entry.symbol), ["ALFA"]);
+    assert.equal(flowOnlyShortlistResult.blocked.length, 1);
+    assert.equal(flowOnlyShortlistResult.blocked[0].symbol, "BRAVO");
+    assert.deepEqual(flowOnlyShortlistResult.blocked[0].reasons, ["flow_only_cap_exceeded"]);
+  } finally {
+    if (originalEvidenceShortlistLimit === undefined) delete process.env.SCOUT_EVIDENCE_SHORTLIST_LIMIT;
+    else process.env.SCOUT_EVIDENCE_SHORTLIST_LIMIT = originalEvidenceShortlistLimit;
+  }
 
   const heldCandidate = buildCandidate({ symbol: "astro", address: "0xastro", _score: 210 });
   const unheldCandidate = buildCandidate({ symbol: "NOVA", address: "0xnova", _score: 190, category: "ai" });

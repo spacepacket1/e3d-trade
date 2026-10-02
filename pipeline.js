@@ -123,6 +123,7 @@ const SETTINGS_DEFAULTS = {
   max_open_positions: 8,               // 6 thesis + 2 trend overlay
   max_thesis_positions: 6,
   max_position_pct: 0.12,              // 12% of equity max per position
+  flow_only_max_position_pct: 0.015,   // ceiling for a newly opened flow-only position
   risk_per_trade_pct: 0.08,            // fallback notional if ATR/R is unavailable
   risk_r_pct: 0.02,                    // 2% of equity at risk per thesis trade (1R)
   atr_stop_multiple: 2.5,
@@ -1406,6 +1407,8 @@ function filterScoutCandidatesForDesk(candidates, portfolio) {
     const setup = String(candidate?.setup_type || candidate?.source || "").toLowerCase();
     const conviction = toNum(candidate?.conviction_score, 0);
     const thesisBacked = setup.includes("thesis") && conviction >= 65;
+    const canonicalFlowOnly = hasCanonicalFlowOnlyWarning(candidate);
+    const flowOnlyLabeled = setup.includes("flow_only") || setup === "flow-only" || candidate?.flow_only === true;
 
     if (liq > 0 && liq < minLiq) {
       log("scout_desk_filter", { symbol: candidate?.token?.symbol, reason: "liquidity_below_min", liquidity_usd: liq });
@@ -1419,7 +1422,7 @@ function filterScoutCandidatesForDesk(candidates, portfolio) {
       log("scout_desk_filter", { symbol: candidate?.token?.symbol, reason: "chasing_24h_move", change_24h_pct: change24, liquidity_usd: liq });
       continue;
     }
-    if (setup.includes("flow_only") || setup === "flow-only" || candidate?.flow_only === true) {
+    if (flowOnlyLabeled && !canonicalFlowOnly) {
       log("scout_desk_filter", { symbol: candidate?.token?.symbol, reason: "flow_only_disabled" });
       continue;
     }
@@ -4542,6 +4545,14 @@ function cleanEvidenceList(values = []) {
     .filter(Boolean))];
 }
 
+function hasCanonicalFlowOnlyWarning(source = {}) {
+  const warnings = cleanEvidenceList([
+    ...(Array.isArray(source?.evidence_warnings) ? source.evidence_warnings : []),
+    ...(Array.isArray(source?.evidence_summary?.warnings) ? source.evidence_summary.warnings : [])
+  ]);
+  return warnings.includes("flow_only_candidate");
+}
+
 function buildCompactEvidenceSummary(packet = null, refs = []) {
   const packetEvidence = Array.isArray(packet?.evidence) ? packet.evidence : [];
   const refsUsed = cleanEvidenceList(refs);
@@ -4599,8 +4610,14 @@ function extractEvidenceMetadata(source = {}) {
       ? Math.max(0, Math.min(100, Math.round(toNum(source.evidence_quality_score, 0))))
       : (summary?.quality_score ?? null),
     evidence_ref_count: Math.max(0, Math.round(toNum(source?.evidence_ref_count, refs.length))),
-    evidence_blockers: cleanEvidenceList(source?.evidence_blockers || summary?.blockers),
-    evidence_warnings: cleanEvidenceList(source?.evidence_warnings || summary?.warnings),
+    evidence_blockers: cleanEvidenceList([
+      ...(Array.isArray(source?.evidence_blockers) ? source.evidence_blockers : []),
+      ...(Array.isArray(summary?.blockers) ? summary.blockers : [])
+    ]),
+    evidence_warnings: cleanEvidenceList([
+      ...(Array.isArray(source?.evidence_warnings) ? source.evidence_warnings : []),
+      ...(Array.isArray(summary?.warnings) ? summary.warnings : [])
+    ]),
     evidence_refs: refs,
     evidence_summary: summary
   };
@@ -9085,6 +9102,10 @@ function evaluateBuyActions(portfolio, approved) {
     const allocPct = Math.min(desiredPct, settings.max_position_pct);
 
     let allocationUsd = Math.min(portfolio.cash_usd, eq * allocPct);
+    if (!isAdd && eq > 0 && hasCanonicalFlowOnlyWarning(c)) {
+      const flowOnlyMaxPct = toNum(settings.flow_only_max_position_pct, SETTINGS_DEFAULTS.flow_only_max_position_pct);
+      allocationUsd = Math.min(allocationUsd, eq * Math.max(0, flowOnlyMaxPct));
+    }
     if (isAdd && eq > 0) {
       const existingWeightPct = toNum(portfolio.positions[existingPositionKey]?.market_value_usd, 0) / eq;
       const remainingPositionHeadroom = Math.max(0, settings.max_position_pct - existingWeightPct);
@@ -10765,6 +10786,7 @@ export {
   evaluateRotationActions,
   evaluateSellActions,
   executeSell,
+  filterScoutCandidatesForDesk,
   filterScoutCandidatesAgainstPortfolio,
   rankApprovedCandidates,
   resolveScoutEvidenceRefMinimum,

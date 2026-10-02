@@ -196,6 +196,168 @@ const flowOnlyEligibility = evaluateScoutPacketEligibility(flowOnlyScout, {
 });
 assert.equal(flowOnlyEligibility.eligible, true);
 assert.equal(flowOnlyEligibility.flow_only, true);
+assert.equal(flowOnlyEligibility.flow_only_passes, true);
+
+const qntLateSignalPacket = buildScoutEvidencePacket({
+  created_at: createdAt,
+  token: {
+    symbol: "QNT",
+    contract_address: "0xqnt000000000000000000000000000000000001"
+  },
+  evidence: [
+    {
+      source_type: "story",
+      source_ref: "story-qnt-mover",
+      label: "story_signal",
+      direction: "bullish",
+      strength: 74,
+      story_type: "MOVER",
+      summary: "Late MOVER continuation without thesis or watchlist support."
+    },
+    {
+      source_type: "flow",
+      source_ref: "flow-qnt-manual",
+      label: "flow_signal",
+      direction: "bullish",
+      strength: 69,
+      summary: "Flow context remains present despite absent DEX flow fields."
+    }
+  ],
+  market_data: {
+    current_price: 112.4,
+    change_24h_pct: 8.1,
+    volume_24h_usd: 134777,
+    market_cap_usd: 887545978,
+    price_source: "e3d",
+    price_timestamp: "2026-04-28T11:57:00.000Z"
+  },
+  liquidity_data: {
+    liquidity_usd: 199244,
+    liquidity_source: "e3d",
+    liquidity_timestamp: "2026-04-28T11:56:30.000Z"
+  },
+  market_data_quality: {
+    data_quality_id: "mdq-qnt",
+    evaluated_at: "2026-04-28T11:58:00.000Z",
+    normalized: { confidence: 94 },
+    blockers: [],
+    warnings: [],
+    degraded_data_mode: false
+  },
+  token_risk_scan: {
+    token_risk_scan_id: "trs-qnt",
+    evaluated_at: "2026-04-28T11:58:30.000Z",
+    decision: "pass",
+    blockers: [],
+    warnings: []
+  }
+});
+
+assert.equal(qntLateSignalPacket.story_evidence_count, 0, "QNT mover-only packet should keep genuine story count at zero");
+assert.ok(qntLateSignalPacket.warnings.includes("flow_only_candidate"), "QNT mover-only packet should keep canonical flow-only warning");
+
+const qntThresholdInput = {
+  market_data: {
+    volume_24h_usd: 134777,
+    market_cap_usd: 887545978
+  },
+  liquidity_data: {
+    liquidity_usd: 199244
+  }
+};
+
+for (const scenario of [
+  {
+    label: "missing",
+    input: qntThresholdInput
+  },
+  {
+    label: "null",
+    input: {
+      ...qntThresholdInput,
+      flow: {
+        flow_signal: null,
+        buy_sell_ratio_1h: null
+      }
+    }
+  },
+  {
+    label: "blank",
+    input: {
+      ...qntThresholdInput,
+      flow: {
+        flow_signal: "   ",
+        buy_sell_ratio_1h: null
+      }
+    }
+  }
+]) {
+  const eligibility = evaluateScoutPacketEligibility(qntLateSignalPacket, scenario.input);
+  assert.equal(eligibility.flow_only, true, `${scenario.label} DEX flow should preserve canonical flow-only classification`);
+  assert.equal(eligibility.flow_only_passes, true, `${scenario.label} DEX flow should not imply distribution`);
+  assert.equal(eligibility.eligible, true, `${scenario.label} DEX flow should keep the QNT packet eligible`);
+}
+
+for (const flowSignal of ["distribution", "strong_distribution"]) {
+  const eligibility = evaluateScoutPacketEligibility(qntLateSignalPacket, {
+    ...qntThresholdInput,
+    flow: {
+      flow_signal: flowSignal,
+      buy_sell_ratio_1h: null
+    }
+  });
+  assert.equal(eligibility.flow_only, true, `${flowSignal} should not change canonical flow-only classification`);
+  assert.equal(eligibility.flow_only_passes, false, `${flowSignal} should fail flow-only eligibility`);
+  assert.equal(eligibility.eligible, false, `${flowSignal} should block flow-only eligibility`);
+  assert.ok(eligibility.reasons.includes("flow_only_thresholds_not_met"), `${flowSignal} should report the threshold failure`);
+}
+
+for (const scenario of [
+  {
+    label: "liquidity",
+    input: {
+      ...qntThresholdInput,
+      liquidity_data: { liquidity_usd: 149999 }
+    }
+  },
+  {
+    label: "volume",
+    input: {
+      ...qntThresholdInput,
+      market_data: {
+        volume_24h_usd: 74999,
+        market_cap_usd: 887545978
+      }
+    }
+  },
+  {
+    label: "market cap",
+    input: {
+      ...qntThresholdInput,
+      market_data: {
+        volume_24h_usd: 134777,
+        market_cap_usd: 4999999
+      }
+    }
+  }
+]) {
+  const eligibility = evaluateScoutPacketEligibility(qntLateSignalPacket, scenario.input);
+  assert.equal(eligibility.flow_only_passes, false, `${scenario.label} minimum should still be enforced independently`);
+  assert.equal(eligibility.eligible, false, `${scenario.label} minimum should still block eligibility`);
+  assert.ok(eligibility.reasons.includes("flow_only_thresholds_not_met"), `${scenario.label} failure should report the threshold reason`);
+}
+
+for (const ratio of [null, 0.2, 9.7]) {
+  const eligibility = evaluateScoutPacketEligibility(qntLateSignalPacket, {
+    ...qntThresholdInput,
+    flow: {
+      flow_signal: "strong_accumulation",
+      buy_sell_ratio_1h: ratio
+    }
+  });
+  assert.equal(eligibility.flow_only_passes, true, `buy/sell ratio ${ratio} should no longer change flow-only eligibility`);
+  assert.equal(eligibility.eligible, true, `buy/sell ratio ${ratio} should leave the QNT packet eligible`);
+}
 
 for (const lateType of ["MOVER", "mover", "SuRgE"]) {
   const lateStoryPacket = buildScoutPacketWithEvidence([
