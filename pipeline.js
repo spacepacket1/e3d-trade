@@ -20,6 +20,7 @@ import {
 import {
   buildHarvestEvidencePacket,
   buildScoutEvidencePacket,
+  LATE_SIGNAL_STORY_TYPES,
   rankScoutPacket,
   SCOUT_EVIDENCE_SHORTLIST_DEFAULT_LIMIT,
   SCOUT_FLOW_ONLY_PER_CYCLE_LIMIT
@@ -412,8 +413,60 @@ function isScoutCandidateAlreadyHeld(candidate, portfolio) {
   });
 }
 
+function normalizeSymbolKey(value) {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+function findPortfolioPositionKey(portfolio, symbol) {
+  const normalizedSymbol = normalizeSymbolKey(symbol);
+  if (!normalizedSymbol) return null;
+  for (const key of Object.keys(portfolio?.positions || {})) {
+    if (normalizeSymbolKey(key) === normalizedSymbol) return key;
+  }
+  return null;
+}
+
+// Resolves which stored position (if any) a buy/add candidate identifies with, using contract
+// address as the primary key and symbol only as a fallback for legacy data missing an address.
+// Returns conflict:true (and key:null) when the symbol and address point at different stored
+// positions, or when a same-symbol match has a different stored address -- callers must refuse
+// the trade in that case rather than merge distinct assets or silently overwrite a position.
+function resolveExistingPositionKey(portfolio, symbol, contractAddress) {
+  const positions = portfolio?.positions || {};
+  const normalizedAddr = cleanAddress(contractAddress || "");
+  const addressMatchKey = normalizedAddr
+    ? Object.keys(positions).find((key) => cleanAddress(positions[key]?.contract_address || "") === normalizedAddr) || null
+    : null;
+  const symbolMatchKey = findPortfolioPositionKey(portfolio, symbol);
+  if (addressMatchKey && symbolMatchKey && addressMatchKey !== symbolMatchKey) {
+    return { key: null, conflict: true };
+  }
+  if (symbolMatchKey) {
+    const storedAddr = cleanAddress(positions[symbolMatchKey]?.contract_address || "");
+    if (storedAddr && normalizedAddr && storedAddr !== normalizedAddr) {
+      return { key: null, conflict: true };
+    }
+  }
+  return { key: addressMatchKey || symbolMatchKey || null, conflict: false };
+}
+
+function findCooldownKeysCaseInsensitive(portfolio, symbol) {
+  const normalizedSymbol = normalizeSymbolKey(symbol);
+  if (!normalizedSymbol) return [];
+  return Object.keys(portfolio?.cooldowns || {}).filter((key) => normalizeSymbolKey(key) === normalizedSymbol);
+}
+
+function hasActiveCooldownCaseInsensitive(portfolio, symbol) {
+  return findCooldownKeysCaseInsensitive(portfolio, symbol).some((matchedKey) => isInCooldown(portfolio, matchedKey));
+}
+
 function filterScoutCandidatesAgainstPortfolio(candidates, portfolio) {
-  return (Array.isArray(candidates) ? candidates : []).filter((candidate) => !isScoutCandidateAlreadyHeld(candidate, portfolio));
+  return (Array.isArray(candidates) ? candidates : []).filter((candidate) => {
+    if (!isScoutCandidateAlreadyHeld(candidate, portfolio)) return true;
+    const symbol = candidate?.token?.symbol || candidate?.symbol || "";
+    const identity = resolveExistingPositionKey(portfolio, symbol, cleanAddress(candidate?.token?.contract_address || candidate?.contract_address || ""));
+    return !hasActiveCooldownCaseInsensitive(portfolio, identity.key || symbol);
+  });
 }
 
 function clickHouseQuery(query, input = "") {
@@ -3741,7 +3794,7 @@ function buildCognitiveState(portfolio) {
     Object.values(portfolio?.positions || {}).map(p => cleanAddress(p?.contract_address || "")).filter(Boolean)
   );
   const startMs = nowMs();
-  const warningSignalTypes = new Set(["MOVER", "SURGE"]);
+  const warningSignalTypes = LATE_SIGNAL_STORY_TYPES;
 
   // Focused API calls — candidates, stories, tokens sorted by signal activity, and Decision
   // Layer actions (for deterministic e3d_action_id/e3d_action_type attachment below — mirrors
@@ -3776,7 +3829,7 @@ function buildCognitiveState(portfolio) {
     "BREAKOUT_CONFIRMED", "FLOW", "HOTLINKS", "DISCOVERY", "WHALE"]);
 
   // Build disqualified address set and story signal map in one pass
-  const disqualifiedAddresses = new Set([...heldAddresses]);
+  const disqualifiedAddresses = new Set();
   const storySignals = new Map(); // address → { types, conviction, summaries }
 
   for (const s of allStories) {
@@ -3829,15 +3882,17 @@ function buildCognitiveState(portfolio) {
     const addr = cleanAddress(c?.entity_address || c?.token_address || c?.address || c?.contract_address || "");
     // entity_symbol is the correct field on the /candidates response
     const sym  = String(c?.entity_symbol || c?.symbol || c?.token?.symbol || "").toUpperCase();
-    if (!addr || disqualifiedAddresses.has(addr) || heldAddresses.has(addr)) continue;
+    if (!addr || disqualifiedAddresses.has(addr)) continue;
     if (NONTRADEABLE_RE.test(sym)) continue;
     // Drop candidates with zero opportunity score AND zero price — these are empty
     // placeholder records with no usable market data (REFLEXIVE_CROWDING junk).
     if (!Number(c?.opportunity_score) && !Number(c?.price_at_creation)) continue;
     const market = marketByAddr.get(addr) || {};
+    const resolvedSymbol = sym || market.symbol || "";
+    if (heldAddresses.has(addr) && hasActiveCooldownCaseInsensitive(portfolio, resolveExistingPositionKey(portfolio, resolvedSymbol, addr).key || resolvedSymbol)) continue;
     const storySig = storySignals.get(addr);
     pool.set(addr, {
-      symbol:       sym || market.symbol || "",
+      symbol:       resolvedSymbol,
       address:      addr,
       source:       "e3d_candidate",
       signal_types: ["E3D_CANDIDATE", ...(storySig ? [...storySig.types] : [])],
@@ -3854,9 +3909,10 @@ function buildCognitiveState(portfolio) {
   }
 
   for (const [addr, sig] of storySignals.entries()) {
-    if (disqualifiedAddresses.has(addr) || heldAddresses.has(addr) || pool.has(addr)) continue;
+    if (disqualifiedAddresses.has(addr) || pool.has(addr)) continue;
     const market = marketByAddr.get(addr) || {};
     const sym = market.symbol || "";
+    if (heldAddresses.has(addr) && hasActiveCooldownCaseInsensitive(portfolio, resolveExistingPositionKey(portfolio, sym, addr).key || sym)) continue;
     if (NONTRADEABLE_RE.test(sym)) continue;
     // Require the token to appear in the E3D universe snapshot. Tokens absent from the
     // universe are micro-caps or wallet addresses: they'll fail /token-info (500) and
@@ -4028,7 +4084,7 @@ function fetchScoutData() {
     "BREAKOUT_CONFIRMED", "FLOW", "HOTLINKS", "DISCOVERY", "DELEGATE_SURGE",
     "SMART_MONEY_LEADER"]);
   // POST-PUMP late signals — move already happened, NOT a buy trigger on its own
-  const lateSignalTypes = new Set(["MOVER", "SURGE"]);
+  const lateSignalTypes = LATE_SIGNAL_STORY_TYPES;
   const secondaryTypes = new Set(["CONCENTRATION_SHIFT", "INSIDER_TIMING", "TOKEN_QUALITY_SCORE",
     "SANDWICH", "MIRROR", "VOLUME_PROFILE_ANOMALY"]);
 
@@ -5084,8 +5140,6 @@ function resolveScoutEvidenceRefMinimum(entry = {}) {
 
 function buildScoutEvidenceShortlist(data, portfolio, options = {}) {
   const createdAt = options.createdAt || nowIso();
-  const heldAddresses = options.heldAddresses || new Set();
-  const heldSymbols = options.heldSymbols || new Set();
   const disqualifiedAddresses = options.disqualifiedAddresses || new Set();
   const shortlistLimit = Math.max(1, Math.trunc(toNum(process.env.SCOUT_EVIDENCE_SHORTLIST_LIMIT, SCOUT_EVIDENCE_SHORTLIST_DEFAULT_LIMIT)));
 
@@ -5141,7 +5195,7 @@ function buildScoutEvidenceShortlist(data, portfolio, options = {}) {
   const entries = [];
   const packetErrors = [];
   for (const addr of candidateAddresses) {
-    if (!addr || disqualifiedAddresses.has(addr) || heldAddresses.has(addr)) continue;
+    if (!addr || disqualifiedAddresses.has(addr)) continue;
     if (data?.avoidAddresses?.has(addr)) continue;
 
     try {
@@ -5163,7 +5217,9 @@ function buildScoutEvidenceShortlist(data, portfolio, options = {}) {
         || watchlist?.label
         || ""
       ).trim().toUpperCase();
-      if (!symbol || heldSymbols.has(symbol.toLowerCase())) continue;
+      if (!symbol) continue;
+      const shortlistIdentity = resolveExistingPositionKey(portfolio, symbol, addr);
+      if (shortlistIdentity.key && hasActiveCooldownCaseInsensitive(portfolio, shortlistIdentity.key)) continue;
 
       const marketData = {
         current_price: tokenRow?.price_usd ?? cg?.price_usd ?? thesis?.price_usd ?? null,
@@ -5485,7 +5541,7 @@ function runScoutWithTools(portfolio, portfolioIntelligence = null) {
     "",
     "QUALITY GATE — required for ALL proposals: price_usd > 0, liquidity_usd > 100000, market_cap_usd > 2000000, volume_24h_usd > 10000.",
     "SKIP: stablecoins, wrapped assets, change_7d_pct > 300% (already pumped), MOVER/SURGE alone.",
-    `SKIP ALREADY HELD: symbols=${JSON.stringify([...heldSymbols])}, addresses=${JSON.stringify([...heldAddresses])}`,
+    `HELD POSITIONS CONTEXT: symbols=${JSON.stringify([...heldSymbols])}, addresses=${JSON.stringify([...heldAddresses])}. You may propose an add to a held position only when the symbol is NOT in the 24-hour add cooldown and only for a genuinely fresh, evidence-backed reason, not continued price appreciation alone. Apply the same quality bar as a new entry. DISQUALIFIER exclusions remain mandatory.`,
     macroContext ? `MACRO: regime=${macroContext.regime} new_positions_ok=${macroContext.new_positions_ok} tighten_stops=${macroContext.tighten_stops}` +
       (macroContext.dxy ? ` dxy_24h=${macroContext.dxy.change_24h_pct}%` : "") +
       (macroContext.equity_index ? ` equity_24h=${macroContext.equity_index.change_24h_pct}%` : "") +
@@ -5556,7 +5612,7 @@ function runScoutWithTools(portfolio, portfolioIntelligence = null) {
 
   const batchResult = parseScoutJSON(rawText);
   const rawCandidates = Array.isArray(batchResult?.candidates) ? batchResult.candidates : [];
-  const unhelded = filterScoutCandidatesAgainstPortfolio(rawCandidates, portfolio);
+  const portfolioFiltered = filterScoutCandidatesAgainstPortfolio(rawCandidates, portfolio);
 
   // Build a real-market lookup from cognitive state to override LLM-reported values in the
   // quality gate. The LLM sometimes hallucitates market data (e.g. identical $925 liquidity
@@ -5584,7 +5640,7 @@ function runScoutWithTools(portfolio, portfolioIntelligence = null) {
     }
   }
 
-  const qualifiedCandidates = unhelded.filter(c => {
+  const qualifiedCandidates = portfolioFiltered.filter(c => {
     const addr = cleanAddress(c?.token?.contract_address || "");
     if (!addr) { log("scout_tool_candidate_dropped", { reason: "no_address", symbol: c?.token?.symbol }); return false; }
     const real = cogStateMarketByAddr.get(addr) || {};
@@ -5596,7 +5652,6 @@ function runScoutWithTools(portfolio, portfolioIntelligence = null) {
       log("scout_tool_candidate_dropped", { reason: "quality_gate_failed", symbol: c?.token?.symbol, addr, liq, mcap, vol, price, real_data_available: cogStateMarketByAddr.has(addr) });
       return false;
     }
-    if (heldAddresses.has(addr)) { log("scout_tool_candidate_dropped", { reason: "already_held", addr }); return false; }
     return true;
   }).map(c => {
     const addr = cleanAddress(c?.token?.contract_address || "");
@@ -5609,7 +5664,7 @@ function runScoutWithTools(portfolio, portfolioIntelligence = null) {
     };
   });
 
-  log("scout_tool_candidates", { raw: rawCandidates.length, after_held: unhelded.length, qualified: qualifiedCandidates.length });
+  log("scout_tool_candidates", { raw: rawCandidates.length, after_portfolio_filter: portfolioFiltered.length, qualified: qualifiedCandidates.length });
 
   return {
     scan_timestamp: createdAt,
@@ -5695,7 +5750,7 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
   }
 
   // Build disqualified address set from stories tagged as disqualifiers
-  const disqualifiedAddresses = new Set([...heldAddresses]);
+  const disqualifiedAddresses = new Set();
   for (const [type, items] of Object.entries(data.stories)) {
     if (!data.disqualifierTypes.has(type)) continue;
     for (const s of (items || [])) {
@@ -6183,7 +6238,9 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
     "3. Stories show ON-CHAIN SIGNALS. A story's subject may be a wallet, LP, or contract — only use as a candidate if in_token_universe=true AND quality gate is met.",
     "4. THESIS EXCEPTION: If a thesis has direction=LONG and conviction >= 65, propose it even when in_token_universe=false, provided the thesis includes a price. Quality gate still applies to whatever market data is available.",
     `5. Return up to ${scoutMaxCandidates} candidates. 1 strong candidate is better than ${scoutMaxCandidates} weak ones. Returning 0 candidates is correct when nothing genuinely meets the bar — the pipeline will survive a skipped cycle; a bad entry will not.`,
-    "6. Exclude addresses in DISQUALIFIERS and already-held: " + `symbols=${JSON.stringify([...heldSymbols])} addresses=${JSON.stringify([...heldAddresses])}`,
+    "6. Exclude addresses in DISQUALIFIERS. Held names are context, not automatic exclusions: "
+      + `symbols=${JSON.stringify([...heldSymbols])} addresses=${JSON.stringify([...heldAddresses])}. `
+      + "You may propose an add to a held position only when the symbol is not in the 24-hour add cooldown and only for a genuinely fresh, evidence-backed reason, not continued price appreciation alone. Apply the same quality bar as a new entry.",
     "",
     `Output shape: {scan_timestamp, candidates[], holdings_updates[], stories_checked[]}`,
     `Each candidate: {source_agent:"scout"|"user_watchlist", created_at:"${createdAt}", expires_at:"${expiresAt}", token:{symbol,name,chain:"ethereum",contract_address,category}, setup_type, action:"buy", confidence:integer(0-100), conviction_score:integer(0-100), opportunity_score:integer(0-100), why_now, evidence[], risks[], entry_zone:{low,high}, invalidation_price, targets:{target_1,target_2,target_3}, market_data:{current_price,change_24h_pct,change_30m_pct,price_source:"e3d",market_cap_usd}, liquidity_data:{liquidity_usd,liquidity_source:"e3d"}, execution_data:{estimated_slippage_bps,quote_source:"e3d"}, portfolio_data:{current_token_exposure_pct:0,current_category_exposure_pct:0,current_total_exposure_pct:0}}`,
@@ -7274,8 +7331,9 @@ function buildScoutPrompt(portfolio, portfolioIntelligence = null) {
     `Scout task — ${createdAt}. Return STRICT JSON only (one object, no markdown).`,
     `Follow the full Research Protocol in TOOLS.md: disqualifier sweep first, then buy signals, then per-candidate deep checks.`,
     `Return up to ${resolveScoutMaxCandidates(portfolio?.settings || SETTINGS_DEFAULTS)} buy candidate. 0 is better than a weak name. Use real values from your research — no placeholder zeros.`,
-    `Exclude held tokens: ${JSON.stringify(exclusions.held_symbols)}`,
-    `Excluded addresses: ${JSON.stringify(exclusions.held_addresses)}`,
+    `Held symbols for context only: ${JSON.stringify(exclusions.held_symbols)}`,
+    `Held addresses for context only: ${JSON.stringify(exclusions.held_addresses)}`,
+    `A held token may be proposed only as an add when it is not in the 24-hour add cooldown, the reason is genuinely fresh and evidence-backed, and the case is stronger than simple continued price appreciation. Apply the same quality bar as a new entry. DISQUALIFIER exclusions remain mandatory.`,
     `Output fields: scan_timestamp, candidates[], holdings_updates[], stories_checked[].`,
     `Each candidate: source_agent="scout", created_at, expires_at="${expiresAt}", token{symbol,name,chain,contract_address,category}, setup_type, action="buy", confidence, conviction_score, opportunity_score, why_now, evidence[], risks[], entry_zone{low,high}, invalidation_price, targets{target_1,target_2,target_3}, market_data, liquidity_data, execution_data, portfolio_data.`,
     `stories_checked[]: one entry per story type fetched — {type, found, tokens[]|disqualified_addresses[]}.`,
@@ -8624,8 +8682,11 @@ function applyPendingManualActions(portfolio) {
 
 function rankApprovedCandidates(approved, portfolio) {
   return approved
-    .filter((c) => !portfolio.positions[c.token.symbol])
-    .filter((c) => !isInCooldown(portfolio, c.token.symbol))
+    .filter((c) => {
+      const symbol = c?.token?.symbol || c?.symbol || "";
+      const identity = resolveExistingPositionKey(portfolio, symbol, cleanAddress(c?.token?.contract_address || ""));
+      return !hasActiveCooldownCaseInsensitive(portfolio, identity.key || symbol);
+    })
     .sort((a, b) => b._score - a._score);
 }
 
@@ -8641,7 +8702,15 @@ function rankHeldPositions(portfolio) {
 function evaluateRotationActions(portfolio, approved) {
   const actions = [];
   const settings = portfolio.settings;
-  const rankedCandidates = rankApprovedCandidates(approved, portfolio);
+  const rankedCandidates = rankApprovedCandidates(approved, portfolio)
+    .filter((candidate) => {
+      const identity = resolveExistingPositionKey(
+        portfolio,
+        candidate?.token?.symbol || candidate?.symbol || "",
+        cleanAddress(candidate?.token?.contract_address || "")
+      );
+      return !identity.key && !identity.conflict;
+    });
   const rankedHeld = rankHeldPositions(portfolio);
 
   if (!rankedCandidates.length || !rankedHeld.length) return actions;
@@ -8799,7 +8868,12 @@ function openPosition(portfolio, candidate, allocationUsd, reason = "buy", optio
   if (!(quantity > 0) || !(grossCostUsd > 0)) return null;
   if (portfolio.cash_usd < totalCashDebitUsd) return null;
 
-  const symbol = candidate.token.symbol;
+  const requestedSymbol = String(candidate?.token?.symbol || "").trim();
+  const requestedAddr = cleanAddress(candidate?.token?.contract_address || "");
+  const positionIdentity = resolveExistingPositionKey(portfolio, requestedSymbol, requestedAddr);
+  if (positionIdentity.conflict) return null;
+  const storedPositionKey = positionIdentity.key;
+  const symbol = storedPositionKey || requestedSymbol;
   const strategyVersion = options.strategyVersion || candidate?.strategy_version || PAPER_ORDER_STRATEGY_VERSION;
   const stopPrice = saneStopPrice(
     candidate.invalidation_price,
@@ -8811,22 +8885,41 @@ function openPosition(portfolio, candidate, allocationUsd, reason = "buy", optio
 
   const sleeve = options.sleeve || candidate?.sleeve || "thesis";
   const thesisCap = toNum(portfolio.settings.max_thesis_positions, portfolio.settings.max_open_positions);
-  if (!portfolio.positions[symbol] && sleeve !== "trend_overlay" && countThesisPositions(portfolio) >= thesisCap) {
+  if (!storedPositionKey && sleeve !== "trend_overlay" && countThesisPositions(portfolio) >= thesisCap) {
     return null;
   }
-  if (!portfolio.positions[symbol] && Object.keys(portfolio.positions).length >= portfolio.settings.max_open_positions) {
+  if (!storedPositionKey && Object.keys(portfolio.positions).length >= portfolio.settings.max_open_positions) {
     return null;
   }
+  if (storedPositionKey && hasActiveCooldownCaseInsensitive(portfolio, storedPositionKey)) return null;
   const context = getTrainingContext();
   const training = ensureCandidateTrainingMetadata(candidate, context);
   const tokenRiskScan = options.tokenRiskScan || options.paperTradeTicket?.token_risk_scan || candidate?.token_risk_scan || null;
 
   portfolio.cash_usd -= totalCashDebitUsd;
 
-  const existing = portfolio.positions[symbol];
+  const existing = storedPositionKey ? portfolio.positions[storedPositionKey] : null;
   if (existing) {
-    const totalCost = existing.cost_basis_usd + totalCashDebitUsd;
-    const totalQty = existing.quantity + quantity;
+    const existingCostBasis = toNum(existing.cost_basis_usd, 0);
+    const existingQuantity = toNum(existing.quantity, 0);
+    const totalCost = existingCostBasis + totalCashDebitUsd;
+    const totalQty = existingQuantity + quantity;
+    const existingTargets = existing?.targets && typeof existing.targets === "object" ? existing.targets : {};
+    const partialsTaken = existing?.partials_taken && typeof existing.partials_taken === "object" ? existing.partials_taken : {};
+    const mergedTargets = {};
+    for (const key of ["target_1", "target_2", "target_3"]) {
+      const existingTarget = toNum(existingTargets?.[key], NaN);
+      const nextTarget = toNum(targets?.[key], NaN);
+      if (partialsTaken?.[key] === true) {
+        mergedTargets[key] = existingTargets?.[key];
+      } else if (Number.isFinite(nextTarget) && nextTarget > 0) {
+        mergedTargets[key] = nextTarget;
+      } else if (Number.isFinite(existingTarget) && existingTarget > 0) {
+        mergedTargets[key] = existingTarget;
+      } else {
+        mergedTargets[key] = null;
+      }
+    }
 
     existing.quantity = totalQty;
     existing.cost_basis_usd = totalCost;
@@ -8835,8 +8928,8 @@ function openPosition(portfolio, candidate, allocationUsd, reason = "buy", optio
     existing.market_value_usd = totalQty * price;
     existing.peak_price = Math.max(existing.peak_price ?? existing.avg_entry_price, price);
     existing.trough_price = Math.min(existing.trough_price ?? existing.avg_entry_price, price);
-    existing.stop_price = stopPrice;
-    existing.targets = targets;
+    existing.stop_price = Math.max(toNum(existing.stop_price, 0), stopPrice);
+    existing.targets = mergedTargets;
     existing.score = candidate._score ?? computePositionScoreLike(candidate);
     existing.category = candidate.token.category || existing.category || "unknown";
     existing.sleeve = existing.sleeve || sleeve;
@@ -8852,8 +8945,15 @@ function openPosition(portfolio, candidate, allocationUsd, reason = "buy", optio
     existing.last_market_snapshot = {
       market_data: deepClone(candidate.market_data || {}),
       liquidity_data: deepClone(candidate.liquidity_data || {}),
-      execution_data: deepClone(candidate.execution_data || {})
-    };
+        execution_data: deepClone(candidate.execution_data || {})
+      };
+    if (existing.sleeve !== "trend_overlay") {
+      portfolio.cooldowns = normalizePortfolioCooldowns(portfolio.cooldowns || {});
+      portfolio.cooldowns[storedPositionKey] = {
+        until: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+        reason: "pyramid_add"
+      };
+    }
   } else {
     portfolio.positions[symbol] = {
       symbol,
@@ -8950,24 +9050,29 @@ function evaluateBuyActions(portfolio, approved) {
   const thesisOpen = countThesisPositions(portfolio);
   const thesisCap = toNum(settings.max_thesis_positions, settings.max_open_positions);
   const openPositions = Object.keys(portfolio.positions).length;
-
-  if (thesisOpen >= thesisCap || openPositions >= settings.max_open_positions) return actions;
-
   const maxNewPerDay = Math.max(0, Math.trunc(toNum(settings.max_new_positions_per_day, 1)));
-  if (maxNewPerDay > 0 && countNewPositionsSince(portfolio, startOfLocalDayMs()) >= maxNewPerDay) {
+  const usedNewPositionsToday = countNewPositionsSince(portfolio, startOfLocalDayMs());
+  if (maxNewPerDay > 0 && usedNewPositionsToday >= maxNewPerDay) {
     log("buy_engine_daily_cap", {
       max_new_positions_per_day: maxNewPerDay,
-      used_today: countNewPositionsSince(portfolio, startOfLocalDayMs())
+      used_today: usedNewPositionsToday
     });
-    return actions;
   }
 
-  let remainingSlots = Math.max(0, thesisCap - thesisOpen);
+  let remainingThesisSlots = Math.max(0, thesisCap - thesisOpen);
+  let remainingOpenSlots = Math.max(0, settings.max_open_positions - openPositions);
+  let remainingDailyNewSlots = maxNewPerDay > 0 ? Math.max(0, maxNewPerDay - usedNewPositionsToday) : Number.POSITIVE_INFINITY;
   let buysUsed = 0;
 
   for (const c of ranked) {
     if (buysUsed >= settings.max_buys_per_cycle) break;
-    if (remainingSlots <= 0) break;
+    const candidateSymbol = c?.token?.symbol || c?.symbol || "";
+    const candidateAddr = cleanAddress(c?.token?.contract_address || "");
+    const candidateIdentity = resolveExistingPositionKey(portfolio, candidateSymbol, candidateAddr);
+    if (candidateIdentity.conflict) continue;
+    const existingPositionKey = candidateIdentity.key;
+    const isAdd = Boolean(existingPositionKey);
+    if (!isAdd && (remainingThesisSlots <= 0 || remainingOpenSlots <= 0 || remainingDailyNewSlots <= 0)) continue;
 
     const eq = equityUsd(portfolio);
     const approvedPct = toNum(c?._risk?.approved_size_pct, 0) / 100;
@@ -8980,6 +9085,11 @@ function evaluateBuyActions(portfolio, approved) {
     const allocPct = Math.min(desiredPct, settings.max_position_pct);
 
     let allocationUsd = Math.min(portfolio.cash_usd, eq * allocPct);
+    if (isAdd && eq > 0) {
+      const existingWeightPct = toNum(portfolio.positions[existingPositionKey]?.market_value_usd, 0) / eq;
+      const remainingPositionHeadroom = Math.max(0, settings.max_position_pct - existingWeightPct);
+      allocationUsd = Math.min(allocationUsd, eq * remainingPositionHeadroom);
+    }
     if (allocationUsd < settings.min_trade_usd) continue;
 
     const category = c.token.category || "unknown";
@@ -8994,11 +9104,15 @@ function evaluateBuyActions(portfolio, approved) {
       type: "buy",
       candidate: c,
       allocation_usd: allocationUsd,
-      reason: "new_position"
+      reason: isAdd ? "pyramid_add" : "new_position"
     });
 
     buysUsed += 1;
-    remainingSlots -= 1;
+    if (!isAdd) {
+      remainingThesisSlots -= 1;
+      remainingOpenSlots -= 1;
+      if (Number.isFinite(remainingDailyNewSlots)) remainingDailyNewSlots -= 1;
+    }
   }
 
   return actions;
@@ -10643,11 +10757,16 @@ export {
   computeRecentPerformanceThrottleMultiplier,
   buildRegimeSentinelPolicy,
   buildPositionSizingDecision,
+  buildScoutEvidenceShortlist,
   buildPaperFillExecution,
   buildFrequentAddressRepairWarning,
   buildPipelineWarningsForCycle,
+  evaluateBuyActions,
+  evaluateRotationActions,
   evaluateSellActions,
   executeSell,
+  filterScoutCandidatesAgainstPortfolio,
+  rankApprovedCandidates,
   resolveScoutEvidenceRefMinimum,
   resolveScoutMaxCandidates,
   normalizePortfolioCooldowns,
