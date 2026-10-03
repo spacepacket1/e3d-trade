@@ -55,6 +55,7 @@ const REPORTS_DIR = path.join(ROOT, "reports");
 const BACKTEST_REPORTS_DIR = path.join(REPORTS_DIR, "backtests");
 const PROMOTION_REPORTS_DIR = path.join(REPORTS_DIR, "promotions");
 const ATTRIBUTION_REPORTS_DIR = path.join(REPORTS_DIR, "attribution");
+const PROFIT_TAKE_CALIBRATION_REPORTS_DIR = path.join(REPORTS_DIR, "profit-take-calibration");
 const OPERATIONS_REPORTS_DIR = path.join(REPORTS_DIR, "operations");
 const INCIDENTS_DIR = path.join(REPORTS_DIR, "incidents");
 const RECONCILIATION_REPORTS_DIR = path.join(REPORTS_DIR, "reconciliation");
@@ -275,6 +276,34 @@ function listAttributionReportFiles() {
   }
 }
 
+export function listProfitTakeCalibrationReportFiles() {
+  try {
+    if (!fs.existsSync(PROFIT_TAKE_CALIBRATION_REPORTS_DIR)) return [];
+    const names = fs.readdirSync(PROFIT_TAKE_CALIBRATION_REPORTS_DIR)
+      .filter((name) => /^profit-take-calibration-\d{8}-\d{6}(?:-\d+)?\.json$/.test(name));
+
+    const reports = [];
+    for (const name of names) {
+      const filePath = path.join(PROFIT_TAKE_CALIBRATION_REPORTS_DIR, name);
+      const report = readReportFile(filePath);
+      // A single unreadable/corrupt report file must not hide every other valid
+      // one -- skip it and keep going, matching listAttributionReportFiles' behavior.
+      if (!report) continue;
+      if (report?.report_type === "profit_take_calibration") {
+        reports.push({ filePath, filename: name, report });
+      }
+    }
+
+    return reports.sort((a, b) => {
+      const generatedCompare = String(b.report.generated_at || "").localeCompare(String(a.report.generated_at || ""));
+      if (generatedCompare !== 0) return generatedCompare;
+      return String(b.filename || "").localeCompare(String(a.filename || ""));
+    });
+  } catch {
+    return [];
+  }
+}
+
 function listOperationsReportFiles() {
   try {
     if (!fs.existsSync(OPERATIONS_REPORTS_DIR)) return [];
@@ -445,6 +474,33 @@ function summarizeAttributionReport(report) {
     top_positive_setups: Array.isArray(summary.top_positive_setups) ? summary.top_positive_setups.slice(0, 5) : [],
     top_negative_setups: Array.isArray(summary.top_negative_setups) ? summary.top_negative_setups.slice(0, 5) : [],
     candidate_count: decisionSummary.candidate_count ?? null
+  };
+}
+
+export function summarizeProfitTakeCalibrationReport(report) {
+  const cohorts = report?.cohorts && typeof report.cohorts === "object" ? report.cohorts : {};
+  const summarizeCohort = (cohortKey) => {
+    const cohort = cohorts?.[cohortKey];
+    return {
+      trade_count: cohort?.trade_count ?? null,
+      with_both_count: cohort?.with_both_count ?? null,
+      h24: cohort?.h24 || null,
+      h48: cohort?.h48 || null
+    };
+  };
+
+  return {
+    report_id: report?.report_id || null,
+    generated_at: report?.generated_at || null,
+    trade_count: report?.trade_count ?? null,
+    with_24h_count: report?.with_24h_count ?? null,
+    with_48h_count: report?.with_48h_count ?? null,
+    with_both_count: report?.with_both_count ?? null,
+    cohorts: {
+      stop_loss: summarizeCohort("stop_loss"),
+      target_hit: summarizeCohort("target_hit"),
+      manual_action: summarizeCohort("manual_action")
+    }
   };
 }
 
@@ -2743,6 +2799,12 @@ async function handleRequest(req, res) {
 
   if (url.pathname === "/api/attribution/reports" && req.method === "GET") {
     const reports = listAttributionReportFiles().slice(0, 30).map(({ report }) => summarizeAttributionReport(report));
+    sendJson(res, 200, reports);
+    return;
+  }
+
+  if (url.pathname === "/api/profit-take-calibration/reports" && req.method === "GET") {
+    const reports = listProfitTakeCalibrationReportFiles().slice(0, 30).map(({ report }) => summarizeProfitTakeCalibrationReport(report));
     sendJson(res, 200, reports);
     return;
   }
