@@ -1,33 +1,26 @@
 # Phase 2 Summary
 
 - Phase: 2
-- Title: Canonical Metadata Propagation, Desk Survival, and New-Entry Size Cap
+- Title: Report API and Reports-Tab Panel
 - Provider: codex
 - Model: gpt-5.4
-- Completed: 2026-10-02T06:42:48-0700
+- Completed: 2026-10-02T08:47:24-0700
 - Exit status: 0
 
 ## Implementation Handoff
 
-- Phase implemented: Phase 2 - Canonical Metadata Propagation, Desk Survival, and New-Entry Size Cap.
-- Updated `pipeline.js` settings defaults with `flow_only_max_position_pct: 0.015` beside `max_position_pct`.
-- Added a narrow canonical-warning helper that recognizes `flow_only_candidate` only from `evidence_warnings` and `evidence_summary.warnings`.
-- Changed `extractEvidenceMetadata()` to merge warnings/blockers from both top-level evidence metadata and compact summaries so canonical warnings are preserved through existing metadata copy paths.
-- Changed `filterScoutCandidatesForDesk()` so the `flow_only_disabled` branch now exempts canonically warned proposals while still dropping non-canonical flow-only-labeled candidates with the same logged reason.
-- Exported `filterScoutCandidatesForDesk` for direct regression coverage.
-- Changed `evaluateBuyActions()` so only brand-new positions carrying the canonical `flow_only_candidate` warning are capped at `equity * flow_only_max_position_pct`.
-- Kept existing add sizing, cash limits, `max_position_pct`, category headroom, minimum trade rejection, and other constraints intact; the smallest applicable cap still wins.
-- Extended `scripts/verifyScoutRelaxation.js` to cover:
-- desk survival for canonical flow-only proposals using summary-only warning metadata,
-- continued desk rejection plus `flow_only_disabled` logging for non-canonical flow-only labels,
-- exact 1.5% capping for oversized flow-only new entries,
-- unchanged sizing for under-cap flow-only new entries and non-flow-only new entries,
-- existing-position add behavior remaining governed by add headroom instead of the new-entry flow-only cap,
-- canonical summary warning propagation into buy evaluation,
-- other caps still producing allocations below the flow-only ceiling.
-- Tests run: `node --check pipeline.js`, `node --check scripts/verifyScoutRelaxation.js`, `node scripts/verifyScoutRelaxation.js`, `npm install`, `npm run check`.
+- Phase implemented: Phase 2 - Report API and Reports-tab panel for profit-take calibration.
+- `server.js` now discovers runtime reports from `reports/profit-take-calibration` with a dedicated listing path, filename validation, `readReportFile()` parsing, strict `report_type === "profit_take_calibration"` filtering, newest-first sorting by `generated_at` then filename, and empty-list fallback on directory or parse failures.
+- Added a narrow summary mapper that returns only `report_id`, `generated_at`, `trade_count`, `with_24h_count`, `with_48h_count`, `with_both_count`, and cohort `trade_count` / `with_both_count` / `h24` / `h48`.
+- Added `GET /api/profit-take-calibration/reports`, capped to the newest 30 summaries and returning `[]` when the report directory is missing, unreadable, empty, or malformed.
+- `dashboard/app.js` now keeps a separate reports-tab loader, data state, and error state for calibration reports and fetches them only when `page === "reports"` alongside the existing reports fetch.
+- Added a dedicated Reports-tab section using existing panel/card/grid/badge/loading/error/empty-state patterns and rendering the latest calibration report only.
+- The panel shows generated time, total trades, 24h/48h/both counts, and ordered cohort rows for Stop Loss, Target Hit, and Manual Action with evaluated counts, beat-hold percentages, and USD deltas for both horizons.
+- Null rates and deltas render as `—`; numeric zero stays visible as zero; positive and negative deltas remain visually distinct through existing badge styling.
+- Existing attribution report discovery, existing reports-tab content, and other dashboard loaders were left unchanged.
+- Tests run: `node --check server.js`, `node --check dashboard/app.js`, `npm install`, `npm run check`.
 - Verification result: passed.
-- Unresolved follow-ups: none for this phase; later phases were intentionally not implemented.
+- Unresolved follow-ups: none within this phase.
 
 ## Verification
 - passed: `npm install && npm run check`
@@ -36,7 +29,10 @@
 - ` M .codex-spec-runner/manifest.tsv`
 - ` M .codex-spec-runner/summaries/phase-1.md`
 - ` M .codex-spec-runner/summaries/phase-2.md`
-- ` M pipeline.js`
-- ` M scripts/evidencePackets.js`
-- ` M scripts/verifyEvidencePackets.js`
-- ` M scripts/verifyScoutRelaxation.js`
+- ` M dashboard/app.js`
+- ` M package.json`
+- ` M server.js`
+- `?? scripts/installProfitTakeCalibrationCron.sh`
+- `?? scripts/profitTakeCalibration.js`
+- `?? scripts/removeProfitTakeCalibrationCron.sh`
+- `?? scripts/verifyProfitTakeCalibration.js`

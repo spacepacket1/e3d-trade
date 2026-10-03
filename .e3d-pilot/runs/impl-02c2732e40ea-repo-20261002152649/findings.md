@@ -1,0 +1,36 @@
+---
+head_sha: 0dc6121dfc391eabe74aa04a64e05ceb792f0f08
+focus: default
+implementation_run_id: impl-02c2732e40ea-repo-20261002152649
+---
+
+# Findings
+
+## Local State
+
+Approved idea `idea-02c2732e40ea` is being implemented for `/Users/mini/e3d-trade`.
+
+## External Context
+
+CONTEXT: Sep 2026 shipped the first deterministic profit-taking mechanism (commit 8b51d48: trailing stops via updateTrailingStops(), default targets via sanitizeTargets(), the manual action queue) with prior-based parameters (trailing-stop ATR distance, [1.5x, 2.0x, 3.0x] default target multiples) -- no prior calibration against actual outcomes. The only way to tell whether a triggered exit was a good decision today is operator intuition. This candidate adds a calibration report: for every closed trade whose exit reason indicates the Sep 2026 mechanism fired, fetch the token's price 24h and 48h after the exit and report whether the exit beat continuing to hold, net of what the position would have returned either way.
+
+GROUNDING (verified against this repo's real portfolio.json closed_trades, 1847 total trades, reason-value counts): reason === 'stop_loss' (61 occurrences, covers BOTH the original ATR-based stop and a stop that was trailed up by updateTrailingStops() before firing -- both write the same pos.stop_price field, so there is no separate 'trailing' vs 'initial stop' reason string to distinguish, and this candidate does not need to distinguish them); reason matching /^target_[1-3]$/ (target_1: 38, target_2: 23, target_3: 21 occurrences -- these are the literal stored strings, NOT a normalized 'target_hit'); reason starting with 'manual_operator' (1 occurrence today, 'manual_operator_partial_liquidation_50pct' -- covers the default 'manual_operator_action' and any operator-authored descriptive variant, since applyPendingManualActions() at pipeline.js ~line 8642 sets `reason: request.reason || "manual_operator_action"` from free-text operator input). Exits with any other reason (harvest_exit:*, rotation_out:*, trend_overlay:*, fraud_risk_breach, stub_flatten, non_tradeable_force_exit -- these are Harvest's own judgment-based exits or hard safety exits, not the Sep 2026 deterministic profit-taking mechanism) are explicitly out of this cohort.
+
+SCOPE:
+1. New script scripts/profitTakeCalibration.js, modeled directly on scripts/recordOutcomes.js's existing emitRejectionOutcomes()/main() pattern (same file, ~line 125 and ~line 167) -- an idempotent, horizon-gated ledger walker, not a one-shot script:
+   - Maintain its own append-only ledger at logs/profit-take-calibration.jsonl (NOT portfolio.json -- portfolio.json is a protected_path and must not be written to by this change; only read from, specifically its closed_trades array).
+   - On each run: read portfolio.json's closed_trades (read-only). For every trade whose reason matches the cohort definition above (stop_loss, target_[1-3], or manual_operator*) and whose trade_id is not already present in the calibration ledger, append a new ledger row: {trade_id, symbol, contract_address, exit_reason, exit_cohort: "stop_loss"|"target_hit"|"manual_action", exit_ts, exit_price, quantity, pnl_usd, cost_basis_usd, hold_price_24h: null, hold_price_48h: null, beat_hold_24h: null, beat_hold_48h: null, recorded_at: <iso now>}.
+   - For every existing ledger row where hold_price_24h is still null and exit_ts is now >= 24h in the past: fetch the token's current price using the exact same mechanism scripts/recordOutcomes.js's fetchTokenPrice() already uses (E3D API /token-info/<address>, via curl with E3D_API_BASE_URL/E3D_API_KEY -- reuse or duplicate that function verbatim, do not add a new price source). Store it as hold_price_24h. Compute beat_hold_24h: true when the realized exit (pnl_usd, i.e. what was actually captured) was better than what continuing to hold until now would have produced (quantity * hold_price_24h - cost_basis_usd), false otherwise. Same for hold_price_48h at the 48h horizon, independently (a row can have its 24h value filled before its 48h value).
+   - Running the script when nothing has crossed a new horizon must be a safe no-op (same idempotency guarantee as recordOutcomes.js's existing horizon checks).
+2. The same script (or a small reporting function within it) computes and can emit a summary: per exit_cohort (stop_loss / target_hit / manual_action), count of rows with both horizons filled, how many beat_hold_24h/beat_hold_48h were true, average and median (pnl_usd vs counterfactual-hold-value) delta in USD, as of the most recent run. Write this summary to reports/profit-take-calibration/<timestamp>.json (new directory, matching the existing reports/attribution/ and reports/backtests/ layout pattern already in this repo).
+3. Add a cron-style invocation note / package.json script entry (follow whatever existing pattern schedules scripts/recordOutcomes.js -- check crontab -l and package.json scripts for the exact existing recordOutcomes invocation and replicate that pattern for the new script, do not invent a different scheduling mechanism).
+4. In server.js, add `GET /api/profit-take-calibration/reports` returning the most recent report summaries, following the exact existing pattern at /api/attribution/reports (server.js ~line 2744: list report files from the new reports/profit-take-calibration/ directory, slice to a reasonable count, return via sendJson). No new report-listing abstraction -- reuse whatever listAttributionReportFiles()-equivalent pattern already exists for consistency, or the closest existing one (e.g. listOperationsReportFiles()).
+5. In dashboard/app.js's Reports tab, add a new panel/section showing the latest profit-take-calibration summary: per-cohort beat-hold rate and average USD delta at 24h and 48h, fetched from the new /api/profit-take-calibration/reports endpoint. Follow the existing Reports tab's UI pattern for an existing report type (e.g. attribution or operations) rather than introducing a new UI pattern.
+6. scripts/verifyProfitTakeCalibration.js: deterministic regression coverage for the cohort-matching regex/logic (stop_loss, target_1/target_2/target_3, manual_operator* match; harvest_exit/rotation_out/trend_overlay/fraud_risk_breach/stub_flatten/non_tradeable_force_exit do not match), the idempotent horizon-gating (a ledger row already past 24h with hold_price_24h already set is not re-fetched; a row not yet 24h old is left alone; a row crossing 48h after already having its 24h value filled only fills the 48h value), and that no code path in this change writes to portfolio.json.
+
+NON-GOALS (explicitly out of scope -- do not implement):
+- Changing the trailing-stop distance, default target multiples, or any other parameter of the Sep 2026 profit-taking mechanism itself based on this data -- this candidate only measures, a follow-up idea would act on the findings once there is a real sample.
+- Any new price-data source (CoinGecko, DexScreener, etc.) -- reuse the existing E3D token-info fetchTokenPrice() mechanism exactly as scripts/recordOutcomes.js already uses it.
+- Writing anything to portfolio.json.
+- Distinguishing an original hard stop from a trailed stop -- both share the same stop_loss reason string and are treated as one cohort, as explained above.
+- Any change to Scout, Harvest, risk review, or sizing logic.

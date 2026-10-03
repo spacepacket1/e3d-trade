@@ -123,19 +123,38 @@ function prettyAgo(value) {
   return `${hrs}h ago`;
 }
 
-function formatPct(value, digits = 2) {
+// Number(null) === 0, Number("") === 0, and Number(false) === 0 all pass
+// Number.isFinite(), so a genuinely missing value (e.g. a calibration horizon
+// that hasn't been evaluated yet) would otherwise render as a real "0%"/"$0"
+// result indistinguishable from an actual zero outcome. Reject those inputs
+// before coercion instead.
+function toFiniteNumberOrNull(value) {
+  if (value === null || value === undefined || typeof value === "boolean") return null;
+  if (typeof value === "string" && !value.trim()) return null;
   const num = Number(value);
-  return Number.isFinite(num) ? `${num.toFixed(digits)}%` : "—";
+  return Number.isFinite(num) ? num : null;
+}
+
+function formatPct(value, digits = 2) {
+  const num = toFiniteNumberOrNull(value);
+  return num === null ? "—" : `${num.toFixed(digits)}%`;
+}
+
+function formatUsdValue(value, { signed = false } = {}) {
+  const num = toFiniteNumberOrNull(value);
+  if (num === null) return "—";
+  if (signed && num > 0) return `+${fmtUsd.format(num)}`;
+  return fmtUsd.format(num);
 }
 
 function formatCount(value) {
-  const num = Number(value);
-  return Number.isFinite(num) ? fmtNum.format(num) : "—";
+  const num = toFiniteNumberOrNull(value);
+  return num === null ? "—" : fmtNum.format(num);
 }
 
 function formatTokenUsage(value) {
-  const num = Number(value);
-  return Number.isFinite(num) ? fmtNum.format(num) : "—";
+  const num = toFiniteNumberOrNull(value);
+  return num === null ? "—" : fmtNum.format(num);
 }
 
 function compactList(values, limit = 3) {
@@ -535,6 +554,120 @@ function ProfessionalDashboardPanel({ professional, error }) {
         )
       )
     )
+  );
+}
+
+const CALIBRATION_COHORTS = [
+  { key: "stop_loss", label: "Stop Loss" },
+  { key: "target_hit", label: "Target Hit" },
+  { key: "manual_action", label: "Manual Action" }
+];
+
+function calibrationDeltaBadgeClass(value) {
+  const num = toFiniteNumberOrNull(value);
+  if (num === null) return "badge";
+  if (num > 0) return "badge badge-green";
+  if (num < 0) return "badge badge-red";
+  return "badge badge-amber";
+}
+
+function ProfitTakeCalibrationReportSection({ report, loading, error }) {
+  return React.createElement(
+    "section",
+    { className: "card panel reports-panel" },
+    React.createElement(
+      "div",
+      { className: "panel-head" },
+      React.createElement("h2", null, "Profit-Take Calibration"),
+      React.createElement("span", { className: "panel-note" }, "Latest calibration summary from runtime reports")
+    ),
+    error ? React.createElement("div", { className: "card error" }, error) : null,
+    loading && !report ? React.createElement("div", { className: "empty-state" }, "Loading calibration report…") : null,
+    !loading && !error && !report ? React.createElement("div", { className: "empty-state" }, "No calibration reports have been written yet.") : null,
+    report ? React.createElement(
+      React.Fragment,
+      null,
+      React.createElement(
+        "div",
+        { className: "report-compact-grid" },
+        React.createElement("div", { className: "report-compact-stat" },
+          React.createElement("span", null, "Generated"),
+          React.createElement("strong", null, prettyDateTime(report.generated_at))
+        ),
+        React.createElement("div", { className: "report-compact-stat" },
+          React.createElement("span", null, "Trades"),
+          React.createElement("strong", null, formatCount(report.trade_count))
+        ),
+        React.createElement("div", { className: "report-compact-stat" },
+          React.createElement("span", null, "24h observed"),
+          React.createElement("strong", null, formatCount(report.with_24h_count))
+        ),
+        React.createElement("div", { className: "report-compact-stat" },
+          React.createElement("span", null, "48h observed"),
+          React.createElement("strong", null, formatCount(report.with_48h_count))
+        ),
+        React.createElement("div", { className: "report-compact-stat" },
+          React.createElement("span", null, "Both horizons"),
+          React.createElement("strong", null, formatCount(report.with_both_count))
+        )
+      ),
+      React.createElement(
+        "div",
+        { className: "reports-list" },
+        CALIBRATION_COHORTS.map(({ key, label }) => {
+          const cohort = report?.cohorts?.[key] || {};
+          return React.createElement(
+            "div",
+            { className: "report-candidate-card", key },
+            React.createElement(
+              "div",
+              { className: "report-candidate-head" },
+              React.createElement(
+                "div",
+                { className: "report-candidate-identity" },
+                React.createElement("strong", null, label),
+                React.createElement("span", { className: "report-candidate-meta" }, `${formatCount(cohort.trade_count)} trades`)
+              ),
+              React.createElement("span", { className: "badge" }, `${formatCount(cohort.with_both_count)} both`)
+            ),
+            React.createElement(
+              "div",
+              { className: "report-candidate-metrics" },
+              React.createElement("span", null, `24h eval ${formatCount(cohort?.h24?.evaluated_count)}`),
+              React.createElement("span", null, `48h eval ${formatCount(cohort?.h48?.evaluated_count)}`)
+            ),
+            React.createElement(
+              "div",
+              { className: "report-compact-grid" },
+              React.createElement("div", { className: "report-compact-stat" },
+                React.createElement("span", null, "24h beat hold"),
+                React.createElement("strong", null, formatPct(cohort?.h24?.beat_hold_rate_pct))
+              ),
+              React.createElement("div", { className: "report-compact-stat" },
+                React.createElement("span", null, "24h avg delta"),
+                React.createElement("strong", { className: calibrationDeltaBadgeClass(cohort?.h24?.average_delta_usd) }, formatUsdValue(cohort?.h24?.average_delta_usd, { signed: true }))
+              ),
+              React.createElement("div", { className: "report-compact-stat" },
+                React.createElement("span", null, "24h evaluated"),
+                React.createElement("strong", null, formatCount(cohort?.h24?.evaluated_count))
+              ),
+              React.createElement("div", { className: "report-compact-stat" },
+                React.createElement("span", null, "48h beat hold"),
+                React.createElement("strong", null, formatPct(cohort?.h48?.beat_hold_rate_pct))
+              ),
+              React.createElement("div", { className: "report-compact-stat" },
+                React.createElement("span", null, "48h avg delta"),
+                React.createElement("strong", { className: calibrationDeltaBadgeClass(cohort?.h48?.average_delta_usd) }, formatUsdValue(cohort?.h48?.average_delta_usd, { signed: true }))
+              ),
+              React.createElement("div", { className: "report-compact-stat" },
+                React.createElement("span", null, "48h evaluated"),
+                React.createElement("strong", null, formatCount(cohort?.h48?.evaluated_count))
+              )
+            )
+          );
+        })
+      )
+    ) : null
   );
 }
 
@@ -1950,6 +2083,9 @@ function App() {
   const [reports, setReports] = useState([]);
   const [reportsLoading, setReportsLoading] = useState(false);
   const [reportsError, setReportsError] = useState(null);
+  const [calibrationReports, setCalibrationReports] = useState([]);
+  const [calibrationReportsLoading, setCalibrationReportsLoading] = useState(false);
+  const [calibrationReportsError, setCalibrationReportsError] = useState(null);
   const [expandedReportId, setExpandedReportId] = useState(null);
   const [reportDetails, setReportDetails] = useState({});
   const [reportDetailLoading, setReportDetailLoading] = useState(null);
@@ -2057,6 +2193,21 @@ function App() {
       setReportsError(err.message);
     } finally {
       setReportsLoading(false);
+    }
+  }
+
+  async function loadCalibrationReports() {
+    try {
+      setCalibrationReportsLoading(true);
+      setCalibrationReportsError(null);
+      const res = await fetch("/api/profit-take-calibration/reports");
+      const data = await res.json().catch(() => []);
+      if (!res.ok) throw new Error(data?.error || data?.message || `HTTP ${res.status}`);
+      setCalibrationReports(Array.isArray(data) ? data : []);
+    } catch (err) {
+      setCalibrationReportsError(err.message);
+    } finally {
+      setCalibrationReportsLoading(false);
     }
   }
 
@@ -2249,6 +2400,7 @@ function App() {
   useEffect(() => {
     if (page === "reports") {
       loadReports();
+      loadCalibrationReports();
     }
   }, [page]);
 
@@ -2616,67 +2768,75 @@ function App() {
   );
 
   const reportsPage = React.createElement(
-    "div",
-    { className: "card panel reports-panel" },
+    React.Fragment,
+    null,
+    React.createElement(ProfitTakeCalibrationReportSection, {
+      report: calibrationReports[0] || null,
+      loading: calibrationReportsLoading,
+      error: calibrationReportsError
+    }),
     React.createElement(
       "div",
-      { className: "panel-head" },
-      React.createElement("h2", null, "Reports"),
-      React.createElement("span", { className: "panel-note" }, "Deterministic manager reports for completed cycles")
-    ),
-    reportsError ? React.createElement("div", { className: "card error" }, reportsError) : null,
-    reportsLoading && reports.length === 0 ? React.createElement("div", { className: "empty-state" }, "Loading reports…") : null,
-    !reportsLoading && reports.length === 0 ? React.createElement("div", { className: "empty-state" }, "No reports have been written yet.") : null,
-    React.createElement(
-      "div",
-      { className: "reports-list" },
-      reports.map((report) => {
-        const isExpanded = expandedReportId === report.report_id;
-        const detail = reportDetails[report.report_id] || null;
-        const rowScoutVisibility = report?.dashboard_visibility?.scout || {};
-        const rowHarvestVisibility = report?.dashboard_visibility?.harvest || {};
-        const toggle = async () => {
-          const nextExpanded = isExpanded ? null : report.report_id;
-          setExpandedReportId(nextExpanded);
-          if (nextExpanded) await loadReportDetail(report.report_id);
-        };
-        return React.createElement(
-          "div",
-          { className: cls("report-row", isExpanded && "is-expanded"), key: report.report_id },
-          React.createElement(
-            "button",
-            { type: "button", className: "report-row-head", onClick: toggle },
-            React.createElement("div", { className: "report-row-main" },
-              React.createElement("span", { className: badgeForGrade(report.overall_grade) }, report.overall_grade || "F"),
-              React.createElement("strong", null, `Cycle #${report.cycle_index ?? "—"}`),
-              React.createElement("span", null, prettyDateTime(report.generated_at)),
-              React.createElement("span", { className: badgeForRegime(report.market_regime) }, String(report.market_regime || "unknown").replace(/_/g, " ")),
-              React.createElement("span", null, `${report.warning_flags || 0} warnings`),
-              React.createElement("span", null, `${report.cycle_duration_seconds ?? "—"}s`),
-              rowScoutVisibility.latest_token_usage != null ? React.createElement("span", null, `Scout ${formatTokenUsage(rowScoutVisibility.latest_token_usage)} tok`) : null,
-              rowHarvestVisibility.latest_token_usage != null ? React.createElement("span", null, `Harvest ${formatTokenUsage(rowHarvestVisibility.latest_token_usage)} tok`) : null,
-              rowScoutVisibility.shortlist_candidate_count != null ? React.createElement("span", null, `Shortlist ${formatCount(rowScoutVisibility.shortlist_candidate_count)}`) : null
-            ),
-            React.createElement("span", { className: "report-row-action" }, isExpanded ? "▼" : "▶")
-          ),
-          isExpanded ? React.createElement(
+      { className: "card panel reports-panel" },
+      React.createElement(
+        "div",
+        { className: "panel-head" },
+        React.createElement("h2", null, "Reports"),
+        React.createElement("span", { className: "panel-note" }, "Deterministic manager reports for completed cycles")
+      ),
+      reportsError ? React.createElement("div", { className: "card error" }, reportsError) : null,
+      reportsLoading && reports.length === 0 ? React.createElement("div", { className: "empty-state" }, "Loading reports…") : null,
+      !reportsLoading && reports.length === 0 ? React.createElement("div", { className: "empty-state" }, "No reports have been written yet.") : null,
+      React.createElement(
+        "div",
+        { className: "reports-list" },
+        reports.map((report) => {
+          const isExpanded = expandedReportId === report.report_id;
+          const detail = reportDetails[report.report_id] || null;
+          const rowScoutVisibility = report?.dashboard_visibility?.scout || {};
+          const rowHarvestVisibility = report?.dashboard_visibility?.harvest || {};
+          const toggle = async () => {
+            const nextExpanded = isExpanded ? null : report.report_id;
+            setExpandedReportId(nextExpanded);
+            if (nextExpanded) await loadReportDetail(report.report_id);
+          };
+          return React.createElement(
             "div",
-            { className: "report-row-body" },
-            reportDetailLoading === report.report_id ? React.createElement("div", { className: "empty-state" }, "Loading report details…") : null,
-            reportDetailError ? React.createElement("div", { className: "card error" }, reportDetailError) : null,
-            detail ? React.createElement(
-              React.Fragment,
-              null,
-              (() => {
-                const visibility = detail?.dashboard_visibility || {};
-                const scoutVisibility = visibility?.scout || {};
-                const harvestVisibility = visibility?.harvest || {};
-                const candidateVisibility = detail?.candidate_visibility || {};
-                const scoutCandidateVisibility = candidateVisibility?.scout || {};
-                const harvestCandidateVisibility = candidateVisibility?.harvest || {};
-                return React.createElement(
-                  React.Fragment,
-                  null,
+            { className: cls("report-row", isExpanded && "is-expanded"), key: report.report_id },
+            React.createElement(
+              "button",
+              { type: "button", className: "report-row-head", onClick: toggle },
+              React.createElement("div", { className: "report-row-main" },
+                React.createElement("span", { className: badgeForGrade(report.overall_grade) }, report.overall_grade || "F"),
+                React.createElement("strong", null, `Cycle #${report.cycle_index ?? "—"}`),
+                React.createElement("span", null, prettyDateTime(report.generated_at)),
+                React.createElement("span", { className: badgeForRegime(report.market_regime) }, String(report.market_regime || "unknown").replace(/_/g, " ")),
+                React.createElement("span", null, `${report.warning_flags || 0} warnings`),
+                React.createElement("span", null, `${report.cycle_duration_seconds ?? "—"}s`),
+                rowScoutVisibility.latest_token_usage != null ? React.createElement("span", null, `Scout ${formatTokenUsage(rowScoutVisibility.latest_token_usage)} tok`) : null,
+                rowHarvestVisibility.latest_token_usage != null ? React.createElement("span", null, `Harvest ${formatTokenUsage(rowHarvestVisibility.latest_token_usage)} tok`) : null,
+                rowScoutVisibility.shortlist_candidate_count != null ? React.createElement("span", null, `Shortlist ${formatCount(rowScoutVisibility.shortlist_candidate_count)}`) : null
+              ),
+              React.createElement("span", { className: "report-row-action" }, isExpanded ? "▼" : "▶")
+            ),
+            isExpanded ? React.createElement(
+              "div",
+              { className: "report-row-body" },
+              reportDetailLoading === report.report_id ? React.createElement("div", { className: "empty-state" }, "Loading report details…") : null,
+              reportDetailError ? React.createElement("div", { className: "card error" }, reportDetailError) : null,
+              detail ? React.createElement(
+                React.Fragment,
+                null,
+                (() => {
+                  const visibility = detail?.dashboard_visibility || {};
+                  const scoutVisibility = visibility?.scout || {};
+                  const harvestVisibility = visibility?.harvest || {};
+                  const candidateVisibility = detail?.candidate_visibility || {};
+                  const scoutCandidateVisibility = candidateVisibility?.scout || {};
+                  const harvestCandidateVisibility = candidateVisibility?.harvest || {};
+                  return React.createElement(
+                    React.Fragment,
+                    null,
               React.createElement(
                 "div",
                 { className: "report-detail-head" },
@@ -2817,12 +2977,13 @@ function App() {
                     : React.createElement("div", { className: "intelligence-empty" }, "No Harvest evidence downgrades recorded.")
                 )
               )
-                );
-              })()
+                  );
+                })()
+              ) : null
             ) : null
-          ) : null
-        );
-      })
+          );
+        })
+      )
     )
   );
 
