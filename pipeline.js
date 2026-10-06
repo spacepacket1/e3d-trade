@@ -3872,15 +3872,13 @@ function buildCognitiveState(portfolio) {
     const addr = cleanAddress(s?.meta?.token_address || s?.primary_token || s?.address || "");
     if (!type || !addr) continue;
 
-    if (disqualifierTypes.has(type)) {
-      // Was s?.meta?.direction !== "deposits" - wrong field path (the real
-      // value lives at meta.exchange_flow.direction) AND wrong vocabulary
-      // (storyExchangeFlowShift.js emits "inflow"/"outflow", never
-      // "deposits"). s?.meta?.direction was always undefined, so this
-      // condition was always true and EXCHANGE_FLOW never disqualified
-      // anything, inflow or outflow, ever. Only inflow (sell-pressure risk
-      // per that generator's own subtitle text) should disqualify.
-      if (type === "EXCHANGE_FLOW" && s?.meta?.exchange_flow?.direction !== "inflow") continue;
+    // Exchange outflow (accumulation/cold storage, per storyExchangeFlowShift.js's
+    // own subtitle text) is the bullish mirror of inflow, not just "not a
+    // disqualifier" - treat it as buy-signal-contributing evidence below
+    // instead of discarding it.
+    const isExchangeOutflow = type === "EXCHANGE_FLOW" && s?.meta?.exchange_flow?.direction === "outflow";
+
+    if (disqualifierTypes.has(type) && !isExchangeOutflow) {
       disqualifiedAddresses.add(addr);
       continue;
     }
@@ -3889,11 +3887,11 @@ function buildCognitiveState(portfolio) {
       storySignals.get(addr).has_warning = true;
       continue;
     }
-    if (!buySignalTypes.has(type)) continue;
+    if (!buySignalTypes.has(type) && !isExchangeOutflow) continue;
 
     if (!storySignals.has(addr)) storySignals.set(addr, { types: new Set(), conviction: 0, summaries: [], ids: [], has_warning: false });
     const sig = storySignals.get(addr);
-    sig.types.add(type);
+    sig.types.add(isExchangeOutflow ? "EXCHANGE_FLOW_OUTFLOW" : type);
     sig.conviction = Math.max(sig.conviction, Number(s?.meta?.conviction_score || s?.conviction || 0));
     const blurb = compactText(s?.title || s?.subtitle || "", 80);
     if (blurb && sig.summaries.length < 2) sig.summaries.push(`${type}: ${blurb}`);
@@ -4537,7 +4535,14 @@ function buildHarvestStoryEvidence(story, storyType) {
     || story?.subtitle
     || ""
   ).trim();
-  const direction = HARVEST_HOLD_CONFIRM_TYPES.includes(type)
+  // EXCHANGE_FLOW is in HARVEST_EXIT_RISK_TYPES unconditionally (both
+  // directions), so it fell through to the "bearish" default below
+  // regardless of direction - an outflow/accumulation story on a position
+  // you already hold was being presented as sell-supporting evidence,
+  // exactly backwards from storyExchangeFlowShift.js's own intent.
+  const direction = type === "EXCHANGE_FLOW"
+    ? (story?.meta?.exchange_flow?.direction === "outflow" ? "bullish" : "bearish")
+    : HARVEST_HOLD_CONFIRM_TYPES.includes(type)
     ? "bullish"
     : HARVEST_PUMP_EXHAUSTION_TYPES.includes(type)
       ? "bearish"
@@ -5817,11 +5822,26 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
     }
   }
 
+  // EXCHANGE_FLOW mixes inflow (sell-pressure, disqualifying) and outflow
+  // (accumulation/cold storage, buy-signal-contributing per the generator's
+  // own subtitle text) under one type key - split them so the Scout prompt
+  // below doesn't show an outflow story under "disqualifying" and doesn't
+  // silently drop it instead of surfacing it as evidence.
+  if (Array.isArray(data.stories.EXCHANGE_FLOW)) {
+    const inflow = [];
+    const outflow = [];
+    for (const s of data.stories.EXCHANGE_FLOW) {
+      (s?.meta?.exchange_flow?.direction === "inflow" ? inflow : outflow).push(s);
+    }
+    data.stories.EXCHANGE_FLOW = inflow;
+    if (outflow.length) data.stories.EXCHANGE_FLOW_OUTFLOW = outflow;
+  }
+
   // Bucket stories into signal categories
   const disqualifierStories = Object.entries(data.stories).filter(([t]) => data.disqualifierTypes.has(t));
-  const buySignalStories = Object.entries(data.stories).filter(([t]) => data.buySignalTypes.has(t));
+  const buySignalStories = Object.entries(data.stories).filter(([t]) => data.buySignalTypes.has(t) || t === "EXCHANGE_FLOW_OUTFLOW");
   const lateSignalStories = Object.entries(data.stories).filter(([t]) => data.lateSignalTypes.has(t));
-  const secondaryStories = Object.entries(data.stories).filter(([t]) => data.secondaryTypes.has(t) || (!data.disqualifierTypes.has(t) && !data.buySignalTypes.has(t) && !data.lateSignalTypes.has(t)));
+  const secondaryStories = Object.entries(data.stories).filter(([t]) => data.secondaryTypes.has(t) || (!data.disqualifierTypes.has(t) && !data.buySignalTypes.has(t) && !data.lateSignalTypes.has(t) && t !== "EXCHANGE_FLOW_OUTFLOW"));
 
   // Collect addresses covered by any buy-signal story or thesis story.
   // Used below to gate momentum tokens — price move alone is not enough.
