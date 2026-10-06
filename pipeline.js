@@ -133,9 +133,9 @@ const SETTINGS_DEFAULTS = {
   min_trade_usd: 1000,
   stub_flatten_usd: 150,               // flatten dust remnants; do not "manage" $50 leftovers
   min_partial_sell_usd: 150,           // below this, a partial-target leg pays fee/slippage as if full-size; take it all instead
-  max_buys_per_cycle: 1,
-  max_new_positions_per_day: 1,
-  max_rotations_per_cycle: 1,  // was 0 (effectively dead code - regimePolicy/buildRegimeSentinelPolicy hardcoded rotation off regardless of this value until fixed)
+  max_buys_per_cycle: 5,  // was 1
+  max_new_positions_per_day: 5,  // was 1 - raised alongside max_buys_per_cycle so it doesn't silently re-throttle new positions back down to 1/day
+  max_rotations_per_cycle: 5,  // was 0, then 1 (evaluateRotationActions was hardcoded to one pair regardless of this value - extended to evaluate up to this many candidate/weak-position pairs)
   rotation_threshold: 10,
   rotation_sell_fraction: 1.0,
   cooldown_hours_after_exit: 24,
@@ -8775,22 +8775,39 @@ function evaluateRotationActions(portfolio, approved) {
 
   if (!rankedCandidates.length || !rankedHeld.length) return actions;
 
-  const bestCandidate = rankedCandidates[0];
-  const weakestHeld = rankedHeld[rankedHeld.length - 1];
-  const delta = bestCandidate._score - weakestHeld._score;
+  // Pair the Nth-best candidate against the Nth-weakest held position
+  // (best-vs-weakest, 2nd-best-vs-2nd-weakest, ...) instead of only ever
+  // comparing the single best against the single weakest - that meant
+  // max_rotations_per_cycle above 1 was dead code, since nothing beyond
+  // the first pair was ever generated for the cap to apply to. Each list
+  // index is used at most once, so no held position or candidate is ever
+  // proposed for more than one rotation in the same cycle.
+  const maxPairs = Math.min(
+    rankedCandidates.length,
+    rankedHeld.length,
+    Math.max(0, Math.trunc(toNum(settings.max_rotations_per_cycle, 1)))
+  );
 
-  if (delta < settings.rotation_threshold) return actions;
+  for (let i = 0; i < maxPairs; i++) {
+    const candidate = rankedCandidates[i];
+    const weakestHeld = rankedHeld[rankedHeld.length - 1 - i];
+    const delta = candidate._score - weakestHeld._score;
+    // Candidate scores are sorted descending and the held side moves from
+    // weakest upward as i grows, so delta is monotonically non-increasing -
+    // once one pair misses the threshold, every later (weaker) pair would too.
+    if (delta < settings.rotation_threshold) break;
 
-  actions.push({
-    type: "rotate",
-    from_symbol: weakestHeld.symbol,
-    to_candidate: bestCandidate,
-    sell_fraction: settings.rotation_sell_fraction,
-    reason: "better_opportunity",
-    score_delta: delta
-  });
+    actions.push({
+      type: "rotate",
+      from_symbol: weakestHeld.symbol,
+      to_candidate: candidate,
+      sell_fraction: settings.rotation_sell_fraction,
+      reason: "better_opportunity",
+      score_delta: delta
+    });
+  }
 
-  return actions.slice(0, settings.max_rotations_per_cycle);
+  return actions;
 }
 
 function executeRotation(portfolio, action, review = null) {

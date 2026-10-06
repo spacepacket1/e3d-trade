@@ -627,6 +627,64 @@ try {
   assert.equal(rotationActions.length, 1);
   assert.equal(rotationActions[0].to_candidate.token.symbol, "NOVA");
 
+  // max_rotations_per_cycle > 1 used to be dead code - evaluateRotationActions
+  // only ever compared the single best candidate against the single weakest
+  // held position. Verify it now pairs multiple candidates against multiple
+  // held positions (best-vs-weakest, 2nd-best-vs-2nd-weakest), respects the
+  // cap even when more qualifying pairs exist, and stops once a pair misses
+  // rotation_threshold rather than skipping ahead to a later, weaker one.
+  // computePositionScore has no "score" input - it derives from pnl_pct
+  // (market_value_usd vs cost_basis_usd) plus a baseline shared by all three
+  // positions here, so driving pnl_pct apart is what actually separates
+  // WEAK < MID < STRONG (a -90%/0%/+200% spread, unambiguous regardless of
+  // the shared baseline's exact value).
+  const multiRotationPortfolio = buildPortfolio({
+    cash_usd: 25000,
+    positions: {
+      WEAK: buildHeldPosition("WEAK", "0xweak", {
+        quantity: 100, current_price: 1, cost_basis_usd: 100, market_value_usd: 10
+      }),
+      MID: buildHeldPosition("MID", "0xmid", {
+        quantity: 100, current_price: 1, cost_basis_usd: 100, market_value_usd: 100
+      }),
+      STRONG: buildHeldPosition("STRONG", "0xstrong", {
+        quantity: 100, current_price: 1, cost_basis_usd: 100, market_value_usd: 300
+      })
+    },
+    settings: { rotation_threshold: 0, max_rotations_per_cycle: 2 }
+  });
+  const multiRotationActions = evaluateRotationActions(multiRotationPortfolio, [
+    buildCandidate({ symbol: "BEST", address: "0xbest", _score: 1000 }),
+    buildCandidate({ symbol: "BETTER", address: "0xbetter", _score: 500 }),
+    buildCandidate({ symbol: "GOOD", address: "0xgood", _score: 100 })
+  ]);
+  assert.equal(multiRotationActions.length, 2, "capped at max_rotations_per_cycle despite 3 qualifying pairs");
+  assert.equal(multiRotationActions[0].from_symbol, "WEAK");
+  assert.equal(multiRotationActions[0].to_candidate.token.symbol, "BEST");
+  assert.equal(multiRotationActions[1].from_symbol, "MID");
+  assert.equal(multiRotationActions[1].to_candidate.token.symbol, "BETTER");
+
+  const thresholdStopPortfolio = buildPortfolio({
+    cash_usd: 25000,
+    positions: {
+      WEAK: buildHeldPosition("WEAK", "0xweak", {
+        quantity: 100, current_price: 1, cost_basis_usd: 100, market_value_usd: 10
+      }),
+      MID: buildHeldPosition("MID", "0xmid", {
+        quantity: 100, current_price: 1, cost_basis_usd: 100, market_value_usd: 100
+      })
+    },
+    // WEAK vs BEST clears a threshold of 50; MID vs GOOD does not (both
+    // share the same pnl-free baseline as MID, so their delta is ~0).
+    settings: { rotation_threshold: 50, max_rotations_per_cycle: 5 }
+  });
+  const thresholdStopActions = evaluateRotationActions(thresholdStopPortfolio, [
+    buildCandidate({ symbol: "BEST", address: "0xbest", _score: 1000 }),
+    buildCandidate({ symbol: "GOOD", address: "0xgood", _score: 0 })
+  ]);
+  assert.equal(thresholdStopActions.length, 1, "stops at the first pair under threshold instead of proposing a weaker one anyway");
+  assert.equal(thresholdStopActions[0].from_symbol, "WEAK");
+
   const buyPortfolio = buildPortfolio({
     cash_usd: 30000,
     positions: {
