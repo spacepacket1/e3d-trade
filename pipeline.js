@@ -135,7 +135,7 @@ const SETTINGS_DEFAULTS = {
   min_partial_sell_usd: 150,           // below this, a partial-target leg pays fee/slippage as if full-size; take it all instead
   max_buys_per_cycle: 1,
   max_new_positions_per_day: 1,
-  max_rotations_per_cycle: 0,
+  max_rotations_per_cycle: 1,  // was 0 (effectively dead code - regimePolicy/buildRegimeSentinelPolicy hardcoded rotation off regardless of this value until fixed)
   rotation_threshold: 10,
   rotation_sell_fraction: 1.0,
   cooldown_hours_after_exit: 24,
@@ -147,7 +147,7 @@ const SETTINGS_DEFAULTS = {
   age_decay_per_day: 0,                // age is not a reason to rotate a working thesis
   recent_performance_window_hours: 24,
   throttle_min_hold_hours: 24,         // ignore dust clips when throttling size
-  scout_max_candidates: 1,
+  scout_max_candidates: 6,  // was 1 - cutting the shortlist (often 60-100 real candidates) to just the top 1 before evidence/risk ever see the rest
   min_liquidity_usd: 100000,
   late_move_skip_24h_pct: 15,
   late_move_min_liquidity_usd: 250000,
@@ -157,7 +157,7 @@ const SETTINGS_DEFAULTS = {
   min_stop_distance_pct: 0.15,         // never tighter than 15% below entry
   default_stop_distance_pct: 0.20,     // 20% structural default
   harvest_discretionary_exits_enabled: false,
-  harvest_allow_trims: false,
+  harvest_allow_trims: true,  // was false - no automatic trim path for a winner outgrowing max_position_pct; QNT needed a manual rescue at its peak because of this
   harvest_freeze_until: "2026-08-30T23:59:59-07:00",
   fee_bps_per_side: 12.5,
   max_mark_deviation_ratio: 5,         // reject a position mark that deviates >5x from the e3d anchor
@@ -1497,8 +1497,20 @@ function isTrendSleevePosition(position) {
   return String(position?.sleeve || "") === "trend_overlay";
 }
 
+// Cash parking (e.g. EURC/EURCV held as a dry-powder/FX hedge, not a directional
+// bet) was silently counting against max_thesis_positions alongside real theses -
+// the two stablecoin slots alone were enough to fill the cap and silently block
+// every new candidate Scout/Risk approved (ENA, ANYONE, NVDAON all qualified with
+// zero blockers and were never bought - confirmed by direct computation against
+// the live portfolio, not inferred). Same exclusion shape as isTrendSleevePosition.
+function isCashEquivalentPosition(position) {
+  return String(position?.sleeve || "") === "cash_equivalent";
+}
+
 function countThesisPositions(portfolio) {
-  return Object.values(portfolio?.positions || {}).filter((pos) => !isTrendSleevePosition(pos)).length;
+  return Object.values(portfolio?.positions || {}).filter(
+    (pos) => !isTrendSleevePosition(pos) && !isCashEquivalentPosition(pos)
+  ).length;
 }
 
 function deriveLiquidityQuality(candidate) {
@@ -1674,15 +1686,21 @@ function computeMarketRegime(scoutPayload, approved, portfolio) {
 
 function regimePolicy(regime, settings = SETTINGS_DEFAULTS) {
   const normalizedRegime = String(regime || "neutral").toLowerCase();
+  // max_rotations_per_cycle was hardcoded to 0 (allow_rotations: false) in every
+  // branch here regardless of settings.max_rotations_per_cycle - rotation was
+  // structurally disabled in code, not actually gated by the setting at all.
+  // Now derived from the real setting; risk_off still forces it to 0 below,
+  // that part is a deliberate safety behavior, not the bug.
+  const configuredMaxRotations = Math.max(0, Math.trunc(toNum(settings.max_rotations_per_cycle, 0)));
 
   if (normalizedRegime === "risk_on") {
     return {
       regime: normalizedRegime,
       allow_buys: true,
-      allow_rotations: false,
+      allow_rotations: configuredMaxRotations > 0,
       allocation_multiplier: 1.35,
       max_buys_per_cycle: Math.max(1, toNum(settings.max_buys_per_cycle, 1)),
-      max_rotations_per_cycle: 0
+      max_rotations_per_cycle: configuredMaxRotations
     };
   }
 
@@ -1700,10 +1718,10 @@ function regimePolicy(regime, settings = SETTINGS_DEFAULTS) {
   return {
     regime: "neutral",
     allow_buys: true,
-    allow_rotations: false,
+    allow_rotations: configuredMaxRotations > 0,
     allocation_multiplier: 1,
     max_buys_per_cycle: Math.max(1, toNum(settings.max_buys_per_cycle, 1)),
-    max_rotations_per_cycle: 0
+    max_rotations_per_cycle: configuredMaxRotations
   };
 }
 
@@ -1988,9 +2006,14 @@ function buildRegimeSentinelPolicy(portfolio, quantContext) {
   const reasonCodes = [];
   let allocationMultiplier = toNum(base.allocation_multiplier, 1);
   let allowBuys = Boolean(base.allow_buys);
-  let allowRotations = false;
+  // Inherit from base (regimePolicy) rather than hardcoding off - base already
+  // derives these from settings.max_rotations_per_cycle and correctly forces
+  // them to false/0 under risk_off below; this function's final `return`
+  // used to re-hardcode allow_rotations:false / max_rotations_per_cycle:0
+  // unconditionally, discarding whatever this variable computed.
+  let allowRotations = Boolean(base.allow_rotations);
   let maxBuys = toNum(base.max_buys_per_cycle, settings.max_buys_per_cycle);
-  let maxRotations = 0;
+  let maxRotations = toNum(base.max_rotations_per_cycle, 0);
   const equity = equityUsd(portfolio);
   const hasSufficientSample = toNum(perf24.closed_trade_count, 0) >= 10;
   const hasMaterialLoss = toNum(perf24.realized_pnl_usd, 0) <= (-0.005 * equity);
@@ -2039,10 +2062,10 @@ function buildRegimeSentinelPolicy(portfolio, quantContext) {
     confidence: Math.min(0.95, 0.55 + reasonCodes.length * 0.08),
     allow_new_buys: allowBuys,
     allow_buys: allowBuys,
-    allow_rotations: false,
+    allow_rotations: allowRotations,
     allow_harvest_exits: harvestPolicy.allow_exits,
     max_buys_per_cycle: maxBuys,
-    max_rotations_per_cycle: 0,
+    max_rotations_per_cycle: maxRotations,
     allocation_multiplier: allocationMultiplier,
     tighten_stops: Boolean(macro.tighten_stops),
     reason_codes: reasonCodes,
@@ -7939,9 +7962,13 @@ function applySizingToBuyAction(action, sizing) {
   };
 }
 
-function applySizingToExitAction(action, sizing) {
+function applySizingToExitAction(action, sizing, settings = SETTINGS_DEFAULTS) {
   if (sizing.blocker_list?.includes("fraud_risk_blocker")) return null;
-  const allowTrims = SETTINGS_DEFAULTS.harvest_allow_trims === true;
+  // Was reading SETTINGS_DEFAULTS.harvest_allow_trims unconditionally, ignoring
+  // whatever the live portfolio's settings actually said - a live settings
+  // change could never have enabled trims through this call path. settings is
+  // now threaded through from the call site, same as getHarvestExitPolicy.
+  const allowTrims = settings?.harvest_allow_trims === true;
   return {
     ...action,
     suggested_exit_fraction: allowTrims
@@ -10254,7 +10281,7 @@ async function runCycle(runContext = {}) {
     if (harvestRejected.length) log("harvest_rejected", harvestRejected);
 
     const sizedHarvestApproved = harvestApproved
-      .map((action) => applySizingToExitAction(action, buildPositionSizingDecision(action, portfolio, "exit")))
+      .map((action) => applySizingToExitAction(action, buildPositionSizingDecision(action, portfolio, "exit"), portfolio.settings))
       .filter(Boolean);
     const harvestReviews = runExecutorForActions(sizedHarvestApproved, portfolio, "exit");
     if (harvestReviews.length) {
