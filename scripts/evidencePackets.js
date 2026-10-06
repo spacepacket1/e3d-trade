@@ -28,7 +28,13 @@ export const DISQUALIFIER_STORY_TYPES = new Set([
 export const BUY_SIGNAL_STORY_TYPES = new Set([
   "STAGING", "CLUSTER", "FUNNEL", "NEW_WALLETS", "WHALE", "ACCUMULATION", "SMART_MONEY",
   "SMART_MONEY_LEADER", "STEALTH_ACCUMULATION", "DEEP_DIVE", "THESIS", "BREAKOUT_CONFIRMED",
-  "FLOW", "HOTLINKS", "DISCOVERY", "DELEGATE_SURGE"
+  "FLOW", "HOTLINKS", "DISCOVERY", "DELEGATE_SURGE",
+  // New 2026-10-06: storyBinanceListing.js (e3d/buildDB) - "listing pump" is
+  // one of the highest-conviction catalysts in crypto; a story of this type
+  // may have no primary_token (unresolved on-chain match) and is simply not
+  // actionable as a candidate in that case, same as any other story missing
+  // an address - not a special case to handle here.
+  "CEX_LISTING"
 ]);
 
 const SOURCE_TYPES = new Set([
