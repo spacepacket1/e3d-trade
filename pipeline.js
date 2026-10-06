@@ -3873,7 +3873,14 @@ function buildCognitiveState(portfolio) {
     if (!type || !addr) continue;
 
     if (disqualifierTypes.has(type)) {
-      if (type === "EXCHANGE_FLOW" && s?.meta?.direction !== "deposits") continue;
+      // Was s?.meta?.direction !== "deposits" - wrong field path (the real
+      // value lives at meta.exchange_flow.direction) AND wrong vocabulary
+      // (storyExchangeFlowShift.js emits "inflow"/"outflow", never
+      // "deposits"). s?.meta?.direction was always undefined, so this
+      // condition was always true and EXCHANGE_FLOW never disqualified
+      // anything, inflow or outflow, ever. Only inflow (sell-pressure risk
+      // per that generator's own subtitle text) should disqualify.
+      if (type === "EXCHANGE_FLOW" && s?.meta?.exchange_flow?.direction !== "inflow") continue;
       disqualifiedAddresses.add(addr);
       continue;
     }
@@ -5803,7 +5810,10 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
     for (const s of (items || [])) {
       const addr = cleanAddress(s?.meta?.token_address || s?.primary_token || s?.token_address || s?.address || "");
       if (addr) disqualifiedAddresses.add(addr);
-      if (type === "EXCHANGE_FLOW" && s?.meta?.direction !== "deposits") disqualifiedAddresses.delete(addr);
+      // Same fix as the E3D-candidate pool builder above: wrong field path
+      // and vocabulary meant this unconditionally deleted every EXCHANGE_FLOW
+      // disqualification right back out regardless of direction.
+      if (type === "EXCHANGE_FLOW" && s?.meta?.exchange_flow?.direction !== "inflow") disqualifiedAddresses.delete(addr);
     }
   }
 
