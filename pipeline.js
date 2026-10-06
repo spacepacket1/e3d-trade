@@ -3703,7 +3703,14 @@ const DRILL_DOWN_MAX_ROUNDS = 4;
 // Stripping wrapper prefixes (Aave V2/V3, Compound, Spark, Yearn) catches aEthUSDC,
 // aUSDC, cUSDC, sDAI, yvUSDC, etc. — previously these slipped past an anchored regex
 // and one (aEthUSDC) cost us $950 on 2026-05-19.
-const NONTRADEABLE_BASE_RE = /^(USDC?|USDT|DAI|USDS|BUSD|TUSD|FRAX|LUSD|SUSD|GUSD|PYUSD|FDUSD|USDE|SUSDE|USDY|USDP|HUSD|MUSD|CRVUSD|GHO|RLUSD|USDX|USDK|USDM|XAUt|PAXG|CACHE|XAUT|WETH|WBTC|cbBTC|rETH|stETH|wstETH|cbETH|ankrETH|BETH|sETH2|ETH2x|STETH|ETH|TBTC|E3D)$/i;
+// EUR-pegged stables (EUR/EURC/EURCV/EURS/EURT/EUROC/AGEUR) had zero coverage
+// here despite the USD side having 20+ variants - Scout proposed buying EURC
+// as a fresh "opportunity" (2026-10-05) purely because nothing excluded it,
+// the same class of bug this whole regex exists to prevent. Moved here from
+// the softer PEG_SENSITIVE_SYMBOL_RE list below (tight divergence band, not
+// full exclusion) since there's no principled reason a EUR stable is more of
+// a real trading opportunity than a USD one.
+const NONTRADEABLE_BASE_RE = /^(USDC?|USDT|DAI|USDS|BUSD|TUSD|FRAX|LUSD|SUSD|GUSD|PYUSD|FDUSD|USDE|SUSDE|USDY|USDP|HUSD|MUSD|CRVUSD|GHO|RLUSD|USDX|USDK|USDM|EUR|EURC|EURCV|EURS|EURT|EUROC|AGEUR|XAUt|PAXG|CACHE|XAUT|WETH|WBTC|cbBTC|rETH|stETH|wstETH|cbETH|ankrETH|BETH|sETH2|ETH2x|STETH|ETH|TBTC|E3D)$/i;
 // Longest first so aeth/apol/etc. aren't partial-matched by the bare `a`.
 const NONTRADEABLE_WRAPPER_PREFIXES = ["aeth","apol","aarb","aavax","aopt","abas","abase","aop","yv","cm","a","c","sd","s"];
 function isNonTradeable(sym) {
@@ -8260,8 +8267,11 @@ function updateTrailingStops(portfolio) {
 // source disagreement is a bad feed rather than a trade: RAI was bought at $10.50 vs a real
 // ~$3 (3.5x), which sailed under the old 5x band and stop-lossed for -$190. Hold them to a
 // far tighter divergence band and refuse to trade them without independent corroboration.
-// Extend this list as new soft-pegged offenders are found.
-const PEG_SENSITIVE_SYMBOL_RE = /^(RAI|FLOAT|FPI|MIM|USTC|VAI|DOLA|MAI|ALUSD|DUSD|EURS|EURT|EUROC|AGEUR|XSGD|CADC|BIDR|IDRT)$/i;
+// Extend this list as new soft-pegged offenders are found. EURS/EURT/EUROC/AGEUR
+// moved to the hard NONTRADEABLE_BASE_RE list above (2026-10-06) - fully excluded
+// now, not just divergence-limited, so they're gone from here to avoid a dead/
+// redundant entry (NONTRADEABLE_RE already filters them out before this ever runs).
+const PEG_SENSITIVE_SYMBOL_RE = /^(RAI|FLOAT|FPI|MIM|USTC|VAI|DOLA|MAI|ALUSD|DUSD|XSGD|CADC|BIDR|IDRT)$/i;
 function isPegSensitive(symbol, category) {
   if (/stable|peg|fiat|forex|\bfx\b/i.test(String(category || ""))) return true;
   return PEG_SENSITIVE_SYMBOL_RE.test(String(symbol || "").trim());
@@ -8481,6 +8491,12 @@ function evaluateSellActions(portfolio) {
     if (!(price > 0)) continue;
 
     if (isTrendSleevePosition(pos)) continue;
+    // EURC/EURCV are deliberately held here (sleeve: cash_equivalent, a dry-powder/
+    // FX hedge, not a thesis) - NONTRADEABLE_BASE_RE now excludes EUR stables from
+    // new buy candidates, same as USD stables, but that must not force-sell a
+    // position someone chose to hold on purpose. isTrendSleevePosition above is
+    // the same kind of deliberate-holding exemption for a different sleeve.
+    if (isCashEquivalentPosition(pos)) continue;
 
     // Force-exit stablecoins and wrapped/base assets that slipped into the portfolio.
     // These provide no trading alpha and consume position slots.
