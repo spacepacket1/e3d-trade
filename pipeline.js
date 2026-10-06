@@ -20,6 +20,8 @@ import {
 import {
   buildHarvestEvidencePacket,
   buildScoutEvidencePacket,
+  BUY_SIGNAL_STORY_TYPES,
+  DISQUALIFIER_STORY_TYPES,
   LATE_SIGNAL_STORY_TYPES,
   rankScoutPacket,
   SCOUT_EVIDENCE_SHORTLIST_DEFAULT_LIMIT,
@@ -3854,12 +3856,12 @@ function buildCognitiveState(portfolio) {
   }
   _activeTokensCache = activeTokens; // share with tool handler for /token-info fallback
 
-  // Classify story types
-  const disqualifierTypes = new Set(["WASH_TRADE", "LOOP", "LIQUIDITY_DRAIN", "SPREAD_WIDENING",
-    "EXCHANGE_FLOW", "SECURITY_RISK", "RUG_LIQUIDITY_PULL", "TREASURY_DISTRIBUTION"]);
-  const buySignalTypes = new Set(["STAGING", "CLUSTER", "FUNNEL", "NEW_WALLETS", "ACCUMULATION",
-    "SMART_MONEY", "SMART_MONEY_LEADER", "STEALTH_ACCUMULATION", "THESIS",
-    "BREAKOUT_CONFIRMED", "FLOW", "HOTLINKS", "DISCOVERY", "WHALE"]);
+  // Classify story types - shared constants (scripts/evidencePackets.js), not a
+  // locally-declared copy. This and fetchScoutData() used to each carry their
+  // own Set that had drifted out of sync with each other; see that file for
+  // the 2026-10-06 reconciliation.
+  const disqualifierTypes = DISQUALIFIER_STORY_TYPES;
+  const buySignalTypes = BUY_SIGNAL_STORY_TYPES;
 
   // Build disqualified address set and story signal map in one pass
   const disqualifiedAddresses = new Set();
@@ -4107,15 +4109,13 @@ let _cycleScoutToolCalls = [];
 let _scoutCycleIndex = 0;
 
 function fetchScoutData() {
-  // Story type categorisation — used to label whatever the API returns
-  const disqualifierTypes = new Set(["WASH_TRADE", "LOOP", "LIQUIDITY_DRAIN", "SPREAD_WIDENING",
-    "MOMENTUM_DIVERGENCE", "EXCHANGE_FLOW", "SECURITY_RISK", "RUG_LIQUIDITY_PULL", "AIRDROP",
-    "TREASURY_DISTRIBUTION"]);
+  // Story type categorisation — shared constants (scripts/evidencePackets.js),
+  // reconciled 2026-10-06 after this copy and the one in the E3D-candidate
+  // pool builder above had drifted apart (this one was missing HONEYPOT/
+  // SANCTIONS_EXPOSURE from the disqualifier side entirely, among other gaps).
+  const disqualifierTypes = DISQUALIFIER_STORY_TYPES;
   // PRE-PUMP early signals — fire before price moves, this is the alpha window
-  const buySignalTypes = new Set(["STAGING", "CLUSTER", "FUNNEL", "NEW_WALLETS", "WHALE",
-    "ACCUMULATION", "SMART_MONEY", "STEALTH_ACCUMULATION", "DEEP_DIVE", "THESIS",
-    "BREAKOUT_CONFIRMED", "FLOW", "HOTLINKS", "DISCOVERY", "DELEGATE_SURGE",
-    "SMART_MONEY_LEADER"]);
+  const buySignalTypes = BUY_SIGNAL_STORY_TYPES;
   // POST-PUMP late signals — move already happened, NOT a buy trigger on its own
   const lateSignalTypes = LATE_SIGNAL_STORY_TYPES;
   const secondaryTypes = new Set(["CONCENTRATION_SHIFT", "INSIDER_TIMING", "TOKEN_QUALITY_SCORE",

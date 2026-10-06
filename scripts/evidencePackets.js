@@ -11,6 +11,26 @@ export const SCOUT_FLOW_ONLY_MIN_VOLUME_24H_USD = 75000;
 export const SCOUT_FLOW_ONLY_MIN_MARKET_CAP_USD = 5000000;
 export const LATE_SIGNAL_STORY_TYPES = new Set(["MOVER", "SURGE"]);
 
+// Single source of truth for story-type classification - pipeline.js used to
+// carry two separately-declared copies of each of these sets (one in the
+// E3D-candidate pool builder, one in fetchScoutData()) that had drifted apart:
+// DEEP_DIVE/DELEGATE_SURGE were buy signals in one and not the other,
+// MOMENTUM_DIVERGENCE/AIRDROP were disqualifiers in one and not the other.
+// Merged to the union of both (2026-10-06), plus HONEYPOT and
+// SANCTIONS_EXPOSURE, which storyHoneypotDetect.js/storySanctionsExposure.js
+// already generate but neither copy ever referenced at all - a token flagged
+// as a honeypot or under sanctions exposure was not blocked from being bought.
+export const DISQUALIFIER_STORY_TYPES = new Set([
+  "WASH_TRADE", "LOOP", "LIQUIDITY_DRAIN", "SPREAD_WIDENING", "MOMENTUM_DIVERGENCE",
+  "EXCHANGE_FLOW", "SECURITY_RISK", "RUG_LIQUIDITY_PULL", "AIRDROP", "TREASURY_DISTRIBUTION",
+  "HONEYPOT", "SANCTIONS_EXPOSURE"
+]);
+export const BUY_SIGNAL_STORY_TYPES = new Set([
+  "STAGING", "CLUSTER", "FUNNEL", "NEW_WALLETS", "WHALE", "ACCUMULATION", "SMART_MONEY",
+  "SMART_MONEY_LEADER", "STEALTH_ACCUMULATION", "DEEP_DIVE", "THESIS", "BREAKOUT_CONFIRMED",
+  "FLOW", "HOTLINKS", "DISCOVERY", "DELEGATE_SURGE"
+]);
+
 const SOURCE_TYPES = new Set([
   "story",
   "market_data",
