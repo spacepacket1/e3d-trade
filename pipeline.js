@@ -11,6 +11,7 @@ import { buildTokenRiskScan, buildTokenRiskScanRef } from "./scripts/tokenRiskSc
 import { buildLiquidityExecutionControls, inferLiquidityBucket } from "./scripts/liquidityExecutionControls.js";
 import { buildMarketDataQuality, buildMarketDataQualityRef } from "./scripts/marketDataQuality.js";
 import { recordOperatorAction } from "./scripts/auditTrail.js";
+import { shouldUseLiveExecution, buildLiveFillExecution, getLiveDeps } from "./scripts/liveFill.js";
 import { externalizeTradeEvidence, resolveTradeEvidence } from "./scripts/tradeEvidence.js";
 import {
   buildEvidenceDiagnosticsEvent,
@@ -8592,7 +8593,7 @@ function evaluateSellActions(portfolio) {
   return actions;
 }
 
-function executeSell(portfolio, action) {
+async function executeSell(portfolio, action) {
   const pos = portfolio.positions[action.symbol];
   if (!pos) return null;
 
@@ -8601,18 +8602,24 @@ function executeSell(portfolio, action) {
   const qty = pos.quantity * fraction;
   if (!(qty > 0)) return null;
 
-  const execution = buildPaperFillExecution({
-    side: "sell",
-    price: pos.current_price,
-    quoted_price: pos.current_price,
-    quantity: qty,
-    // Current liquidity, not just whatever execution_data (if any) was attached
-    // at entry -- a forced exit (stop-loss, fraud breach) should price against
-    // today's liquidity, not a stale snapshot from whenever the position opened.
-    liquidity_usd: toNum(pos.liquidity_usd, toNum(pos?.last_market_snapshot?.liquidity_data?.liquidity_usd, 0)),
-    execution_data: action?.execution_data || pos?.last_market_snapshot?.execution_data || null,
-    settings: portfolio?.settings || SETTINGS_DEFAULTS
-  });
+  const execution = shouldUseLiveExecution(portfolio)
+    ? await buildLiveFillExecution({ side: "sell", tokenAddress: pos.contract_address, humanQuantity: qty }, await getLiveDeps())
+    : buildPaperFillExecution({
+      side: "sell",
+      price: pos.current_price,
+      quoted_price: pos.current_price,
+      quantity: qty,
+      // Current liquidity, not just whatever execution_data (if any) was attached
+      // at entry -- a forced exit (stop-loss, fraud breach) should price against
+      // today's liquidity, not a stale snapshot from whenever the position opened.
+      liquidity_usd: toNum(pos.liquidity_usd, toNum(pos?.last_market_snapshot?.liquidity_data?.liquidity_usd, 0)),
+      execution_data: action?.execution_data || pos?.last_market_snapshot?.execution_data || null,
+      settings: portfolio?.settings || SETTINGS_DEFAULTS
+    });
+  // A rejected live fill must stop here -- filled_notional_usd/quantity below
+  // default to a mark-to-market estimate when absent, which would otherwise
+  // record phantom proceeds for a sell that never happened on-chain.
+  if (execution?.decision === "rejected") return null;
   const grossProceeds = toNum(execution?.filled_notional_usd, qty * pos.current_price);
   const proceeds = Math.max(0, grossProceeds - toNum(execution?.fee_usd, 0));
   const costPortion = pos.cost_basis_usd * fraction;
@@ -8650,6 +8657,9 @@ function executeSell(portfolio, action) {
     avg_entry_price: pos.avg_entry_price || null,
     candidate_id: pos.training_candidate_id || null,
     position_id: pos.training_position_id || null,
+    execution_source: execution?.execution_source || "paper",
+    tx_hash: execution?.tx_hash || null,
+    approval_tx_hash: execution?.approval_tx_hash || null,
     trade_id: null
   };
 
@@ -8712,7 +8722,7 @@ function loadPendingManualActions() {
   }
 }
 
-function applyPendingManualActions(portfolio) {
+async function applyPendingManualActions(portfolio) {
   const pending = loadPendingManualActions();
   if (!pending.length) return [];
 
@@ -8731,7 +8741,7 @@ function applyPendingManualActions(portfolio) {
       if (!portfolio.positions[request.symbol]) {
         throw new Error(`no open position for symbol: ${request.symbol}`);
       }
-      const trade = executeSell(portfolio, {
+      const trade = await executeSell(portfolio, {
         symbol: request.symbol,
         fraction,
         reason: request.reason || "manual_operator_action"
@@ -8840,11 +8850,11 @@ function evaluateRotationActions(portfolio, approved) {
   return actions;
 }
 
-function executeRotation(portfolio, action, review = null) {
+async function executeRotation(portfolio, action, review = null) {
   const from = portfolio.positions[action.from_symbol];
   if (!from) return null;
 
-  const sellTrade = executeSell(portfolio, {
+  const sellTrade = await executeSell(portfolio, {
     type: "sell",
     symbol: from.symbol,
     fraction: action.sell_fraction,
@@ -8934,7 +8944,7 @@ function executeRotation(portfolio, action, review = null) {
   rotationTicket.rotation_from_symbol = action.from_symbol;
   rotationTicket.rotation_score_delta = toNum(action.score_delta, 0);
 
-  const buyTrade = openPosition(portfolio, candidate, allocationUsd, `rotation_in:${action.reason}`, {
+  const buyTrade = await openPosition(portfolio, candidate, allocationUsd, `rotation_in:${action.reason}`, {
     strategyVersion: PAPER_ORDER_STRATEGY_VERSION,
     paperTradeTicket: rotationTicket,
     riskDecision: rotationRiskDecision,
@@ -8953,21 +8963,24 @@ function executeRotation(portfolio, action, review = null) {
   return { sellTrade, buyTrade };
 }
 
-function openPosition(portfolio, candidate, allocationUsd, reason = "buy", options = {}) {
+async function openPosition(portfolio, candidate, allocationUsd, reason = "buy", options = {}) {
   const price = toNum(candidate?.market_data?.current_price, 0);
   if (!(price > 0)) return null;
   if (allocationUsd < portfolio.settings.min_trade_usd) return null;
 
-  const execution = buildPaperFillExecution({
-    side: "buy",
-    price,
-    quoted_price: price,
-    cost_usd: allocationUsd,
-    paper_trade_ticket: options.paperTradeTicket || null,
-    liquidity_usd: toNum(candidate?.liquidity_data?.liquidity_usd, toNum(candidate?.liquidity_usd, 0)),
-    execution_data: candidate?.execution_data || null,
-    settings: portfolio?.settings || SETTINGS_DEFAULTS
-  });
+  const execution = shouldUseLiveExecution(portfolio)
+    ? await buildLiveFillExecution({ side: "buy", tokenAddress: candidate?.token?.contract_address, notionalUsd: allocationUsd }, await getLiveDeps())
+    : buildPaperFillExecution({
+      side: "buy",
+      price,
+      quoted_price: price,
+      cost_usd: allocationUsd,
+      paper_trade_ticket: options.paperTradeTicket || null,
+      liquidity_usd: toNum(candidate?.liquidity_data?.liquidity_usd, toNum(candidate?.liquidity_usd, 0)),
+      execution_data: candidate?.execution_data || null,
+      settings: portfolio?.settings || SETTINGS_DEFAULTS
+    });
+  if (execution?.decision === "rejected") return null;
   const quantity = toNum(execution?.quantity, 0);
   const grossCostUsd = toNum(execution?.filled_notional_usd, allocationUsd);
   const feeUsd = toNum(execution?.fee_usd, 0);
@@ -9123,6 +9136,9 @@ function openPosition(portfolio, candidate, allocationUsd, reason = "buy", optio
     strategy_version: strategyVersion,
     candidate_id: training.candidate_id,
     position_id: training.position_id,
+    execution_source: execution?.execution_source || "paper",
+    tx_hash: execution?.tx_hash || null,
+    approval_tx_hash: execution?.approval_tx_hash || null,
     trade_id: null
   };
 
@@ -9268,7 +9284,7 @@ function buildTrendSleeveCandidate(vehicle, priceUsd) {
   return candidate;
 }
 
-function executeTrendSleeve(portfolio, quantContext) {
+async function executeTrendSleeve(portfolio, quantContext) {
   const settings = portfolio?.settings || SETTINGS_DEFAULTS;
   if (settings.trend_sleeve_enabled === false) return { buys: [], sells: [] };
   const bookRegime = quantContext?.macro?.book_regime || portfolio?.stats?.market_regime || "neutral";
@@ -9281,7 +9297,7 @@ function executeTrendSleeve(portfolio, quantContext) {
     for (const vehicle of TREND_SLEEVE_VEHICLES) {
       const pos = portfolio.positions[vehicle.symbol];
       if (!pos || !isTrendSleevePosition(pos)) continue;
-      const trade = executeSell(portfolio, {
+      const trade = await executeSell(portfolio, {
         type: "sell",
         symbol: vehicle.symbol,
         fraction: 1,
@@ -9337,7 +9353,7 @@ function executeTrendSleeve(portfolio, quantContext) {
         candidate.mandate_trace = _cycleActiveCapitalMandateTrace;
       }
     }
-    const trade = openPosition(portfolio, candidate, allocationUsd, "trend_overlay:risk_on", {
+    const trade = await openPosition(portfolio, candidate, allocationUsd, "trend_overlay:risk_on", {
       sleeve: "trend_overlay",
       strategyVersion: PAPER_ORDER_STRATEGY_VERSION
     });
@@ -10148,7 +10164,7 @@ async function runCycle(runContext = {}) {
   _cycleActiveCapitalMandateTrace = activeMandateTrace;
   if (activeMandateTrace) log("capital_mandate_active", activeMandateTrace);
   pruneCooldowns(portfolio);
-  applyPendingManualActions(portfolio);
+  await applyPendingManualActions(portfolio);
   const trainingContext = {
     pipeline_run_id: runContext.pipeline_run_id || crypto.randomUUID(),
     cycle_id: runContext.cycle_id || crypto.randomUUID(),
@@ -10198,7 +10214,7 @@ async function runCycle(runContext = {}) {
   if (_cycleQuantContext?.macro?.book_regime) {
     portfolio.stats.market_regime = _cycleQuantContext.macro.book_regime;
   }
-  const earlyTrend = executeTrendSleeve(portfolio, _cycleQuantContext);
+  const earlyTrend = await executeTrendSleeve(portfolio, _cycleQuantContext);
   if (earlyTrend.buys.length || earlyTrend.sells.length) {
     computePortfolioStats(portfolio);
     savePortfolio(portfolio);
@@ -10290,7 +10306,7 @@ async function runCycle(runContext = {}) {
     const sellActions = evaluateSellActions(portfolio);
     const sellTrades = [];
     for (const action of sellActions) {
-      const trade = executeSell(portfolio, action);
+      const trade = await executeSell(portfolio, action);
       if (trade) {
         try {
           externalizeTradeEvidence(trade);
@@ -10363,7 +10379,7 @@ async function runCycle(runContext = {}) {
       if (fraction <= 0) continue;
 
       const symbol = item.action.symbol || item.action.token?.symbol;
-      const trade = executeSell(portfolio, {
+      const trade = await executeSell(portfolio, {
         type: "sell",
         symbol,
         fraction,
@@ -10442,7 +10458,7 @@ async function runCycle(runContext = {}) {
     for (const item of rotationReviews) {
       if (!executorAllowsTrade(item.review)) continue;
 
-      const result = executeRotation(portfolio, item.action, item.review);
+      const result = await executeRotation(portfolio, item.action, item.review);
       if (result) rotationResults.push({
         from_symbol: item.action.from_symbol,
         to_symbol: item.action.to_candidate.token.symbol,
@@ -10527,7 +10543,7 @@ async function runCycle(runContext = {}) {
         item.action.reason
       );
 
-      const trade = openPosition(
+      const trade = await openPosition(
         portfolio,
         item.action.candidate,
         allocationUsd,
@@ -10553,7 +10569,7 @@ async function runCycle(runContext = {}) {
     if (buyTrades.length) log("buy_trades", buyTrades);
     for (const trade of buyTrades) sendTradeEmail(trade);
 
-    const trendResult = executeTrendSleeve(portfolio, _cycleQuantContext);
+    const trendResult = await executeTrendSleeve(portfolio, _cycleQuantContext);
     if (trendResult.sells.length) {
       sellTrades.push(...trendResult.sells);
       for (const trade of trendResult.sells) sendTradeEmail(trade);
@@ -10763,7 +10779,7 @@ async function main() {
       btc_trend: _cycleQuantContext?.macro?.btc_trend || null,
       eth_trend: _cycleQuantContext?.macro?.eth_trend || null
     });
-    const trendResult = executeTrendSleeve(portfolio, _cycleQuantContext);
+    const trendResult = await executeTrendSleeve(portfolio, _cycleQuantContext);
     maybeRecordHorizonMarks(portfolio);
     const stats = computePortfolioStats(portfolio);
     savePortfolio(portfolio);

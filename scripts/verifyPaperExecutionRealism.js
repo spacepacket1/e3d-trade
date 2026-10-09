@@ -76,7 +76,7 @@ try {
     invalidation_price: 0.9
   };
 
-  const buyTrade = openPosition(portfolio, candidate, 100, "buy");
+  const buyTrade = await openPosition(portfolio, candidate, 100, "buy");
   assert.ok(buyTrade);
   assert.equal(buyTrade.quoted_price, 1);
   assert.equal(buyTrade.fill_price, 1.005);
@@ -94,7 +94,7 @@ try {
     }
   };
 
-  const sellTrade = executeSell(portfolio, {
+  const sellTrade = await executeSell(portfolio, {
     symbol: "ASTRO",
     fraction: 1,
     reason: "target_hit"

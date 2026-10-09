@@ -20,7 +20,7 @@ const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "live-executor-fork-"));
 const statePath = path.join(scratch, "live-state.json");
 
 let anvilLog = "";
-const anvil = spawn("anvil", ["--fork-url", upstream, "--port", String(FORK_PORT)], { stdio: ["ignore", "pipe", "pipe"] });
+const anvil = spawn("anvil", ["--fork-url", upstream, "--port", String(FORK_PORT), "--accounts", "1", "--compute-units-per-second", "50", "--fork-retry-backoff", "2000"], { stdio: ["ignore", "pipe", "pipe"] });
 anvil.stdout.on("data", (d) => { anvilLog += d; });
 anvil.stderr.on("data", (d) => { anvilLog += d; });
 anvil.on("error", (e) => { anvilLog += String(e); });
@@ -55,33 +55,34 @@ try {
 
   writeState({ day: new Date().toISOString().slice(0, 10), daily_buy_usd: 0, consecutive_failures: 0 }, statePath);
 
-  const disabled = await executeBuy({ buyToken: USDC, sellAmountWei: parseEther("0.01") }, { ...deps, env: { ...process.env, LIVE_EXECUTION_ENABLED: "" } });
+  const disabled = await executeBuy({ buyToken: USDC, notionalUsd: 27 }, { ...deps, env: { ...process.env, LIVE_EXECUTION_ENABLED: "" } });
   assert.equal(disabled.rejection_reason, "live_execution_not_enabled");
   assert.equal(await provider.getTransactionCount(wallet.address, "latest"), nonceBefore, "disabled executor must send nothing");
   report("executor refuses to run without LIVE_EXECUTION_ENABLED=1, with no transaction");
 
-  const halted = await executeBuy({ buyToken: USDC, sellAmountWei: parseEther("0.01") }, { ...deps, env: { ...deps.env, LIVE_TRADING_HALT: "1" } });
+  const halted = await executeBuy({ buyToken: USDC, notionalUsd: 27 }, { ...deps, env: { ...deps.env, LIVE_TRADING_HALT: "1" } });
   assert.equal(halted.rejection_reason, "halted");
   assert.equal(await provider.getTransactionCount(wallet.address, "latest"), nonceBefore, "halt must send nothing");
   report("halt flag blocks a buy with no transaction");
 
-  const tooBig = await executeBuy({ buyToken: USDC, sellAmountWei: parseEther("0.1") }, deps);
+  const tooBig = await executeBuy({ buyToken: USDC, notionalUsd: 270 }, deps);
   assert.equal(tooBig.rejection_reason, "cap_exceeded_per_trade");
   assert.equal(await provider.getTransactionCount(wallet.address, "latest"), nonceBefore, "cap breach must send nothing");
   report("per-trade cap blocks an oversized buy with no transaction");
 
   const buyWethBefore = await weth.balanceOf(wallet.address);
   const buyUsdcBefore = await usdc.balanceOf(wallet.address);
-  const buy = await executeBuy({ buyToken: USDC, sellAmountWei: parseEther("0.01") }, deps);
+  const buy = await executeBuy({ buyToken: USDC, notionalUsd: 27 }, deps);
   assert.equal(buy.decision, "filled", `buy should fill, got ${JSON.stringify(buy)}`);
   assert(buy.approval_tx_hash, "first buy needs an ERC-20 approval to AllowanceHolder");
   assert(buy.tx_hash, "swap tx hash recorded");
   const usdcGained = (await usdc.balanceOf(wallet.address)) - buyUsdcBefore;
   const wethSpent = buyWethBefore - (await weth.balanceOf(wallet.address));
   assert(usdcGained > 0n, "USDC received");
-  assert.equal(wethSpent, parseEther("0.01"), "exactly the sell amount spent");
+  assert(wethSpent > 0n, "WETH spent to fund the $27 buy");
+  assert(Math.abs(buy.filled_notional_usd - 27) < 2, `filled_notional_usd should track the $27 request, got ${buy.filled_notional_usd}`);
   assert(buy.filled_notional_usd > 0 && buy.quantity > 0, "fill reconciled from balances");
-  report(`buy 0.01 WETH -> USDC filled after approval (${buy.quantity.toFixed(2)} USDC, fill $${buy.filled_notional_usd.toFixed(2)})`);
+  report(`buy $27 of USDC filled after approval (${buy.quantity.toFixed(2)} USDC, fill $${buy.filled_notional_usd.toFixed(2)})`);
 
   const sellUsdc = usdcGained / 2n;
   const sellWethBefore = await weth.balanceOf(wallet.address);
@@ -92,13 +93,13 @@ try {
 
   const st = readState(statePath);
   writeState({ ...st, consecutive_failures: 3 }, statePath);
-  const breaker = await executeBuy({ buyToken: USDC, sellAmountWei: parseEther("0.01") }, deps);
+  const breaker = await executeBuy({ buyToken: USDC, notionalUsd: 27 }, deps);
   assert.equal(breaker.rejection_reason, "circuit_breaker_open");
   writeState({ ...st, consecutive_failures: 0 }, statePath);
   report("circuit breaker blocks buys after repeated failures");
 
   writeState({ ...readState(statePath), daily_buy_usd: 290 }, statePath);
-  const daily = await executeBuy({ buyToken: USDC, sellAmountWei: parseEther("0.01") }, deps);
+  const daily = await executeBuy({ buyToken: USDC, notionalUsd: 27 }, deps);
   assert.equal(daily.rejection_reason, "cap_exceeded_per_day");
   report("daily cap blocks buys past $300");
 

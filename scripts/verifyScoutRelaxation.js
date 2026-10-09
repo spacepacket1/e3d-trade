@@ -332,7 +332,7 @@ try {
     targets: { target_1: 1.2, target_2: 1.4, target_3: 1.6 },
     _score: 140
   });
-  const initialTrade = openPosition(basePortfolio, initialCandidate, 1000, "new_position");
+  const initialTrade = await openPosition(basePortfolio, initialCandidate, 1000, "new_position");
   assert.ok(initialTrade);
   assert.equal(Object.values(basePortfolio.cooldowns).some((entry) => entry?.reason === "pyramid_add"), false);
 
@@ -357,7 +357,7 @@ try {
   });
 
   const addStartMs = Date.now();
-  const addTrade = openPosition(basePortfolio, addCandidate, 500, "pyramid_add");
+  const addTrade = await openPosition(basePortfolio, addCandidate, 500, "pyramid_add");
   const addEndMs = Date.now();
   assert.ok(addTrade);
   assert.equal(Object.keys(basePortfolio.positions).length, 1);
@@ -397,7 +397,7 @@ try {
     position: structuredClone(basePortfolio.positions.ASTRO),
     cooldowns: structuredClone(basePortfolio.cooldowns)
   };
-  const blockedAdd = openPosition(basePortfolio, buildCandidate({
+  const blockedAdd = await openPosition(basePortfolio, buildCandidate({
     symbol: "ASTRO",
     address: "0xastro",
     price: 1.12,
@@ -416,14 +416,14 @@ try {
       WETH: buildHeldPosition("WETH", "0xweth", { sleeve: "trend_overlay" })
     }
   });
-  const trendOverlayAdd = openPosition(trendOverlayPortfolio, buildCandidate({
+  const trendOverlayAdd = await openPosition(trendOverlayPortfolio, buildCandidate({
     symbol: "WETH",
     address: "0xweth",
     price: 1.05
   }), 500, "trend_overlay_topup", { sleeve: "trend_overlay" });
   assert.ok(trendOverlayAdd, "a trend-overlay top-up on an existing position must still succeed");
   assert.equal(trendOverlayPortfolio.cooldowns.WETH, undefined, "a trend-overlay top-up must not create a pyramid_add cooldown that would block the next top-up");
-  const secondTrendOverlayAdd = openPosition(trendOverlayPortfolio, buildCandidate({
+  const secondTrendOverlayAdd = await openPosition(trendOverlayPortfolio, buildCandidate({
     symbol: "WETH",
     address: "0xweth",
     price: 1.06
@@ -441,7 +441,7 @@ try {
     positions: structuredClone(conflictPortfolio.positions),
     action_history_length: conflictPortfolio.action_history.length
   };
-  const conflictingAdd = openPosition(conflictPortfolio, buildCandidate({
+  const conflictingAdd = await openPosition(conflictPortfolio, buildCandidate({
     symbol: "NOVA",
     address: "0xnova-different",
     price: 2
@@ -831,7 +831,7 @@ try {
     },
     cooldowns: {}
   });
-  const failedAdd = openPosition(failedAddPortfolio, buildCandidate({
+  const failedAdd = await openPosition(failedAddPortfolio, buildCandidate({
     symbol: "ASTRO",
     address: "0xastro",
     price: 0
@@ -848,7 +848,7 @@ try {
       OTHER: { until: new Date(Date.now() + 60 * 60 * 1000).toISOString(), reason: "legacy" }
     }
   });
-  const betaTrade = openPosition(newPositionPortfolio, buildCandidate({
+  const betaTrade = await openPosition(newPositionPortfolio, buildCandidate({
     symbol: "BETA",
     address: "0xbeta",
     price: 2,

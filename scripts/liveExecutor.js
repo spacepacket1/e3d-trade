@@ -152,16 +152,18 @@ function liveExecutionEnabled(env) {
   return String(env.LIVE_EXECUTION_ENABLED || "").trim() === "1";
 }
 
-export async function executeBuy({ buyToken, sellAmountWei }, deps) {
+export async function executeBuy({ buyToken, notionalUsd }, deps) {
   const { wallet, submitProvider, env = process.env, statePath = DEFAULT_STATE_PATH, receiptTimeoutMs = DEFAULT_RECEIPT_TIMEOUT_MS } = deps;
   if (!liveExecutionEnabled(env)) return rejected("live_execution_not_enabled");
   const state = readState(statePath);
   if (isLiveHalted(env)) return rejected("halted");
   if (shouldTripBreaker(state.consecutive_failures)) return rejected("circuit_breaker_open");
-  if (!(sellAmountWei > 0n)) return rejected("invalid_notional");
+  if (!(notionalUsd > 0)) return rejected("invalid_notional");
 
   const quoteFn = makeQuoteFn(env, deps.quote);
   const ethUsd = await ethUsdPrice(quoteFn, wallet.address);
+  const sellAmountWei = BigInt(Math.round((notionalUsd / ethUsd) * 1e18));
+  if (!(sellAmountWei > 0n)) return rejected("invalid_notional");
   const quote = await quoteFn({ sellToken: WETH, buyToken, sellAmountWei, taker: wallet.address });
   if (!quote.liquidity_available) return rejected("insufficient_liquidity");
 
@@ -174,7 +176,6 @@ export async function executeBuy({ buyToken, sellAmountWei }, deps) {
   const feeWei = BigInt(feeData.maxFeePerGas ?? feeData.gasPrice ?? 0n);
   const allowance = await weth.allowance(wallet.address, quote.approval_target);
   const gasUnits = BigInt(quote.transaction.gas) + (allowance < sellAmountWei ? APPROVAL_GAS_ESTIMATE : 0n);
-  const notionalUsd = toUsd(sellAmountWei);
 
   const check = checkBuy({
     halted: false,
