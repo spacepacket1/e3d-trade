@@ -57,7 +57,9 @@ try {
 
 const LOG_DIR = path.join(__dirname, "logs");
 const REPORTS_DIR = path.join(__dirname, "reports");
-const PORTFOLIO_FILE = path.join(__dirname, "portfolio.json");
+const PORTFOLIO_FILE = process.env.PORTFOLIO_FILE_PATH
+  ? path.resolve(__dirname, process.env.PORTFOLIO_FILE_PATH)
+  : path.join(__dirname, "portfolio.json");
 const OPERATOR_ACTIONS_DIR = path.join(__dirname, "operator-actions");
 const PENDING_MANUAL_ACTIONS_FILE = path.join(OPERATOR_ACTIONS_DIR, "pending-manual-actions.json");
 const MANUAL_ACTIONS_HISTORY_LOG = path.join(OPERATOR_ACTIONS_DIR, "manual-actions-history.jsonl");
@@ -10744,6 +10746,14 @@ async function runCycle(runContext = {}) {
 }
 
 async function main() {
+  if (process.env.LIVE_PIPELINE_LOCK_PATH) {
+    const { acquireLock, releaseLockOnExit } = await import("./scripts/liveProcessLock.js");
+    if (!acquireLock(process.env.LIVE_PIPELINE_LOCK_PATH)) {
+      console.error(`live pipeline lock held at ${process.env.LIVE_PIPELINE_LOCK_PATH}; refusing to start a second instance`);
+      process.exit(1);
+    }
+    releaseLockOnExit(process.env.LIVE_PIPELINE_LOCK_PATH);
+  }
   const cli = parseCliArgs(process.argv.slice(2));
   const pipelineRunId = crypto.randomUUID();
   const debugMode = Boolean(cli.debug);
