@@ -134,7 +134,8 @@ const SETTINGS_DEFAULTS = {
   atr_stop_multiple: 2.5,
   max_stop_distance_pct: 0.40,
   trend_sleeve_enabled: true,
-  trend_sleeve_target_pct: 0.12,       // 12% each WETH/WBTC when BTC 20d trend is long
+  trend_sleeve_target_pct: 0.12,       // 12% WETH when the book regime is risk_on
+  trend_sleeve_persistence_cycles: 3,  // consecutive cycles a regime flip must hold before the sleeve enters or exits (1 = react immediately)
   min_trade_usd: 1000,
   stub_flatten_usd: 150,               // flatten dust remnants; do not "manage" $50 leftovers
   min_partial_sell_usd: 150,           // below this, a partial-target leg pays fee/slippage as if full-size; take it all instead
@@ -196,14 +197,9 @@ const TREND_SLEEVE_VEHICLES = [
     name: "Wrapped Ether",
     contract_address: "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
     cg_key: "eth"
-  },
-  {
-    symbol: "WBTC",
-    name: "Wrapped Bitcoin",
-    contract_address: "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",
-    cg_key: "btc"
   }
 ];
+// WBTC was dropped: its 12 round trips since 2026-08 lost ~$40 each to friction with no edge.
 
 function nowIso() {
   const date = new Date();
@@ -9704,10 +9700,53 @@ function buildTrendSleeveCandidate(vehicle, priceUsd) {
   return candidate;
 }
 
+// Debounce regime flips: the sleeve only changes state after the raw regime has
+// disagreed with the confirmed state for `persistenceCycles` consecutive cycles,
+// so a one-cycle blip does not pay the ~1.25% round-trip friction.
+function advanceTrendSleevePersistence(stats, rawRegime, persistenceCycles, holdsPosition) {
+  const need = Math.max(1, Math.trunc(toNum(persistenceCycles, SETTINGS_DEFAULTS.trend_sleeve_persistence_cycles)));
+  const prior = stats?.trend_sleeve_persistence;
+  const raw = rawRegime === "risk_on" ? "on" : "off";
+  const confirmed = prior?.confirmed === "on" || prior?.confirmed === "off"
+    ? prior.confirmed
+    : (holdsPosition ? "on" : "off");
+  let streak = Math.max(0, Math.trunc(toNum(prior?.streak, 0)));
+  let next = confirmed;
+  if (raw === confirmed) {
+    streak = 0;
+  } else {
+    streak += 1;
+    if (streak >= need) {
+      next = raw;
+      streak = 0;
+    }
+  }
+  return { confirmed: next, streak, raw, changed: next !== confirmed };
+}
+
+let _trendPersistenceQuantContext = null;
+
 async function executeTrendSleeve(portfolio, quantContext) {
   const settings = portfolio?.settings || SETTINGS_DEFAULTS;
   if (settings.trend_sleeve_enabled === false) return { buys: [], sells: [] };
-  const bookRegime = quantContext?.macro?.book_regime || portfolio?.stats?.market_regime || "neutral";
+  const rawRegime = quantContext?.macro?.book_regime || portfolio?.stats?.market_regime || "neutral";
+  portfolio.stats = portfolio.stats || {};
+  // executeTrendSleeve runs up to three times per cycle; advance the streak once per cycle.
+  if (quantContext !== _trendPersistenceQuantContext || !portfolio.stats.trend_sleeve_persistence) {
+    const holdsPosition = TREND_SLEEVE_VEHICLES.some((vehicle) => isTrendSleevePosition(portfolio.positions?.[vehicle.symbol]));
+    const advanced = advanceTrendSleevePersistence(
+      portfolio.stats,
+      rawRegime,
+      settings.trend_sleeve_persistence_cycles,
+      holdsPosition
+    );
+    portfolio.stats.trend_sleeve_persistence = { confirmed: advanced.confirmed, streak: advanced.streak };
+    _trendPersistenceQuantContext = quantContext;
+    if (advanced.changed || advanced.streak > 0) {
+      log("trend_sleeve_persistence", { raw_regime: rawRegime, confirmed: advanced.confirmed, streak: advanced.streak, changed: advanced.changed });
+    }
+  }
+  const bookRegime = portfolio.stats.trend_sleeve_persistence.confirmed === "on" ? "risk_on" : "risk_off_confirmed";
   const targetPct = toNum(settings.trend_sleeve_target_pct, 0.12);
   const equity = equityUsd(portfolio);
   const buys = [];
@@ -11343,6 +11382,7 @@ export {
   evaluateRotationActions,
   evaluateRotationBuyFeasibility,
   evaluateRotationGuard,
+  advanceTrendSleevePersistence,
   resolveRotationAllocationUsd,
   evaluateSellActions,
   executeSell,
