@@ -1,35 +1,32 @@
 # Phase 1 Summary
 
 - Phase: 1
-- Title: Calibration Ledger, Summary, Scheduling, and Regression Coverage
+- Title: Shared Rotation Allocation Helper
 - Provider: codex
 - Model: gpt-5.4
-- Completed: 2026-10-02T08:42:01-0700
+- Completed: 2026-10-11T21:22:50-0700
 - Exit status: 0
 
 ## Implementation Handoff
 
-- Phase implemented: Calibration Ledger, Summary, Scheduling, and Regression Coverage.
-- Added `scripts/profitTakeCalibration.js` with exported `classifyExitCohort(reason)` and `runProfitTakeCalibration(options)`, production defaults, CLI entrypoint, local E3D token-info price fetch duplication, append-only JSONL ledger handling, independent 24h/48h horizon filling, and cumulative report generation.
-- Cohort mapping is case-sensitive and limited to `stop_loss`, `target_1|2|3`, and `manual_operator*`; unsupported reasons are skipped with concise stderr warnings.
-- New snapshots normalize sell-side closed trades from `portfolio.json`, preserve field order, never write to the portfolio file, and avoid duplicate initial snapshots across duplicate rows and reruns.
-- Existing ledger snapshots now load as last-valid-per-`trade_id`; malformed or non-object ledger rows are ignored with warnings, while valid history remains intact.
-- Reports summarize the full post-run current ledger state, compute beat-hold counts/rates plus average and median deltas without rounding, and only write when at least one ledger line was appended.
-- Added hourly cron helpers `scripts/installProfitTakeCalibrationCron.sh` and `scripts/removeProfitTakeCalibrationCron.sh` with `--help`, `--dry-run`, install/remove idempotency, env overrides, and installer `--print` support without touching crontab.
-- Updated `package.json` with calibration run/cron scripts and extended `check` with syntax checks, shell validation, and `scripts/verifyProfitTakeCalibration.js`.
-- Added `scripts/verifyProfitTakeCalibration.js` coverage for cohort inclusion/exclusion, normalization rules, duplicate suppression, horizon gating, failed-fetch retry behavior, strict beat-hold semantics, malformed ledger tolerance, no-op runs, full-state reports, cron `--print`, and portfolio immutability guards.
-- Tests run: `node --check scripts/profitTakeCalibration.js`, `node --check scripts/verifyProfitTakeCalibration.js`, `bash -n scripts/installProfitTakeCalibrationCron.sh`, `bash -n scripts/removeProfitTakeCalibrationCron.sh`, `node scripts/verifyProfitTakeCalibration.js`, `npm install`, `npm run check`.
-- Decisions: kept the implementation scoped to Phase 1 files only; report/ledger directories are created only on append paths; no crontab install/remove was performed during verification.
-- Unresolved follow-ups: none in Phase 1 scope.
+- Phase implemented: Shared Rotation Allocation Helper.
+- Added exported `resolveRotationAllocationUsd(postSellPortfolio, candidate, expectedNetProceedsUsd, review = null, positionSizing = null)` in `pipeline.js`.
+- The helper sizes rotation buys from post-sell equity via `equityUsd()`, applies `_risk.approved_size_pct` or `risk_per_trade_pct`, caps with executor review when present, caps by `max_position_pct`, post-sell cash, expected net proceeds, optional `position_sizing.max_allocation_usd`, and positive category headroom.
+- The helper then re-prices the proposed rotation buy through `buildPaperFillExecution()` and scales the notional down so buy debit plus fees fits post-sell cash.
+- Refactored `executeRotation()` to use the shared helper for rotation allocation only; ordinary buy sizing and non-rotation sell behavior were left unchanged.
+- Preserved the existing `executeRotation()` category-headroom short-circuit and minimum-trade guard so this phase stays scoped to shared sizing logic.
+- Added `scripts/verifyRotationFrictionGuard.js` with focused assertions for equity-based percent sizing, `max_position_pct`, post-sell cash fee-fit, expected net proceeds, category headroom, optional sizing cap, and no filesystem writes after `pipeline.js` import side effects.
+- Updated `package.json` `check` to include syntax checking and execution of `scripts/verifyRotationFrictionGuard.js` at the end, without reordering existing checks.
+- Tests run during iteration: `node scripts/verifyRotationFrictionGuard.js`.
+- Final verification run: `npm install && npm run check`.
+- Unresolved follow-ups: later phases still need the buy-leg feasibility helper and friction guard; they were intentionally not implemented here.
 
 ## Verification
 - passed: `npm install && npm run check`
 
 ## Worktree Snapshot
-- ` M .codex-spec-runner/manifest.tsv`
-- ` M .codex-spec-runner/summaries/phase-1.md`
+- ` M .spec2code/manifest.tsv`
+- ` M .spec2code/summaries/phase-1.md`
 - ` M package.json`
-- `?? scripts/installProfitTakeCalibrationCron.sh`
-- `?? scripts/profitTakeCalibration.js`
-- `?? scripts/removeProfitTakeCalibrationCron.sh`
-- `?? scripts/verifyProfitTakeCalibration.js`
+- ` M pipeline.js`
+- `?? scripts/verifyRotationFrictionGuard.js`
