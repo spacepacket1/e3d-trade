@@ -1,38 +1,35 @@
 # Phase 2 Summary
 
 - Phase: 2
-- Title: Report API and Reports-Tab Panel
+- Title: Rotation Buy-Leg Feasibility Helper
 - Provider: codex
 - Model: gpt-5.4
-- Completed: 2026-10-02T08:47:24-0700
+- Completed: 2026-10-11T21:25:31-0700
 - Exit status: 0
 
 ## Implementation Handoff
 
-- Phase implemented: Phase 2 - Report API and Reports-tab panel for profit-take calibration.
-- `server.js` now discovers runtime reports from `reports/profit-take-calibration` with a dedicated listing path, filename validation, `readReportFile()` parsing, strict `report_type === "profit_take_calibration"` filtering, newest-first sorting by `generated_at` then filename, and empty-list fallback on directory or parse failures.
-- Added a narrow summary mapper that returns only `report_id`, `generated_at`, `trade_count`, `with_24h_count`, `with_48h_count`, `with_both_count`, and cohort `trade_count` / `with_both_count` / `h24` / `h48`.
-- Added `GET /api/profit-take-calibration/reports`, capped to the newest 30 summaries and returning `[]` when the report directory is missing, unreadable, empty, or malformed.
-- `dashboard/app.js` now keeps a separate reports-tab loader, data state, and error state for calibration reports and fetches them only when `page === "reports"` alongside the existing reports fetch.
-- Added a dedicated Reports-tab section using existing panel/card/grid/badge/loading/error/empty-state patterns and rendering the latest calibration report only.
-- The panel shows generated time, total trades, 24h/48h/both counts, and ordered cohort rows for Stop Loss, Target Hit, and Manual Action with evaluated counts, beat-hold percentages, and USD deltas for both horizons.
-- Null rates and deltas render as `—`; numeric zero stays visible as zero; positive and negative deltas remain visually distinct through existing badge styling.
-- Existing attribution report discovery, existing reports-tab content, and other dashboard loaders were left unchanged.
-- Tests run: `node --check server.js`, `node --check dashboard/app.js`, `npm install`, `npm run check`.
+- Phase implemented: Rotation Buy-Leg Feasibility Helper.
+- Added exported `evaluateRotationBuyFeasibility(portfolio, action, review = null, positionSizing = null, nowMs = Date.now())` in `pipeline.js`.
+- The helper is pure: it deep-clones the input portfolio, performs an in-memory paper sell simulation, never logs, never records training/risk events, never calls live execution, and never mutates the caller.
+- The simulated sell mirrors `executeSell()` economics for paper mode: fraction-based quantity reduction, paper fill pricing/fees, cash increase by net proceeds, cost basis and market value reduction, close-on-dust removal, and a simulated sell entry appended to both `closed_trades` and `action_history`.
+- Simulated sell records now carry a real ISO `ts` derived from injected `nowMs`, plus the sell fields the risk engine reads (`side`, `symbol`, `pnl_usd`, `proceeds_usd`, `gross_proceeds_usd`, `ts`).
+- Feasibility returns `{ feasible, reason_codes, allocation_usd }` and currently implements Phase 2 blocker codes only: `missing_or_invalid_price`, `candidate_identity_conflict`, `sell_leg_unavailable`, `category_exposure_cap_reached`, `below_min_trade_usd`, and `position_slot_unavailable`.
+- Category and slot checks run against the simulated post-sell book, so a full book can rotate when the sell closes the outgoing position.
+- Reused the existing exported `resolveRotationAllocationUsd()` helper for post-sell rotation sizing; ordinary buy sizing remains unchanged.
+- Extended `scripts/verifyRotationFrictionGuard.js` to cover post-sell category-cap blocking, below-min-trade blocking, invalid price blocking, partial-rotation slot blocking, full-close non-slot blocking, immutability of the input portfolio, and no filesystem writes beyond import side effects.
+- Tests run during iteration: `node scripts/verifyRotationFrictionGuard.js`.
+- Final verification run: `npm install && npm run check`.
 - Verification result: passed.
-- Unresolved follow-ups: none within this phase.
+- Unresolved follow-ups: Phase 3 still needs `thesis_cap_reached`, `risk_decision_block`, and the pre-sell feasibility gate wired into `executeRotation()`.
 
 ## Verification
 - passed: `npm install && npm run check`
 
 ## Worktree Snapshot
-- ` M .codex-spec-runner/manifest.tsv`
-- ` M .codex-spec-runner/summaries/phase-1.md`
-- ` M .codex-spec-runner/summaries/phase-2.md`
-- ` M dashboard/app.js`
+- ` M .spec2code/manifest.tsv`
+- ` M .spec2code/summaries/phase-1.md`
+- ` M .spec2code/summaries/phase-2.md`
 - ` M package.json`
-- ` M server.js`
-- `?? scripts/installProfitTakeCalibrationCron.sh`
-- `?? scripts/profitTakeCalibration.js`
-- `?? scripts/removeProfitTakeCalibrationCron.sh`
-- `?? scripts/verifyProfitTakeCalibration.js`
+- ` M pipeline.js`
+- `?? scripts/verifyRotationFrictionGuard.js`

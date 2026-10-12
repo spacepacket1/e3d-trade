@@ -143,6 +143,13 @@ const SETTINGS_DEFAULTS = {
   max_rotations_per_cycle: 5,  // was 0, then 1 (evaluateRotationActions was hardcoded to one pair regardless of this value - extended to evaluate up to this many candidate/weak-position pairs)
   rotation_threshold: 10,
   rotation_sell_fraction: 1.0,
+  rotation_friction_guard_mode: "shadow",
+  rotation_min_hold_hours: 48,
+  rotation_round_trip_cost_bps: 125,
+  rotation_margin_bps: 50,
+  rotation_score_edge_bps_per_point: 10,
+  rotation_hysteresis_bps_per_day: 5,
+  rotation_hysteresis_max_bps: 50,
   cooldown_hours_after_exit: 24,
   category_cap_pct: 0.70,              // most names are still category=unknown; 30% silently capped the whole book
   reject_fraud_risk_gte: 35,
@@ -8801,7 +8808,7 @@ function rankHeldPositions(portfolio) {
     .sort((a, b) => b._score - a._score);
 }
 
-function evaluateRotationActions(portfolio, approved) {
+function evaluateRotationActions(portfolio, approved, nowMs = Date.now()) {
   const actions = [];
   const settings = portfolio.settings;
   const rankedCandidates = rankApprovedCandidates(approved, portfolio)
@@ -8839,22 +8846,446 @@ function evaluateRotationActions(portfolio, approved) {
     // once one pair misses the threshold, every later (weaker) pair would too.
     if (delta < settings.rotation_threshold) break;
 
-    actions.push({
+    const action = {
       type: "rotate",
       from_symbol: weakestHeld.symbol,
       to_candidate: candidate,
       sell_fraction: settings.rotation_sell_fraction,
       reason: "better_opportunity",
       score_delta: delta
+    };
+
+    const buyFeasibility = evaluateRotationBuyFeasibility(portfolio, action, null, null, nowMs);
+    const rotationGuard = evaluateRotationGuard(
+      weakestHeld,
+      candidate,
+      delta,
+      settings,
+      nowMs,
+      buyFeasibility
+    );
+
+    if (!rotationGuard.allow) continue;
+
+    actions.push({
+      ...action,
+      rotation_guard: rotationGuard
     });
   }
 
   return actions;
 }
 
+function resolveRotationAllocationUsd(postSellPortfolio, candidate, expectedNetProceedsUsd, review = null, positionSizing = null) {
+  const settings = postSellPortfolio?.settings || SETTINGS_DEFAULTS;
+  const price = toNum(candidate?.market_data?.current_price, 0);
+  if (!(price > 0)) return 0;
+
+  const approvedPct = toNum(candidate?._risk?.approved_size_pct, 0) / 100;
+  let desiredPct = approvedPct > 0 ? approvedPct : toNum(settings.risk_per_trade_pct, 0);
+
+  const executorApprovedPct = toNum(review?.approved_size_pct, 0) / 100;
+  if (executorApprovedPct > 0) {
+    desiredPct = Math.min(desiredPct, executorApprovedPct);
+  }
+
+  const allocPct = Math.max(0, Math.min(desiredPct, toNum(settings.max_position_pct, SETTINGS_DEFAULTS.max_position_pct)));
+  if (!(allocPct > 0)) return 0;
+
+  const equity = equityUsd(postSellPortfolio);
+  const cashUsd = Math.max(0, toNum(postSellPortfolio?.cash_usd, 0));
+  const proceedsUsd = Math.max(0, toNum(expectedNetProceedsUsd, 0));
+  let allocationUsd = Math.min(
+    cashUsd,
+    Math.max(0, equity * allocPct),
+    proceedsUsd
+  );
+
+  const maxAllocationUsd = toNum(positionSizing?.max_allocation_usd, NaN);
+  if (Number.isFinite(maxAllocationUsd)) {
+    allocationUsd = Math.min(allocationUsd, Math.max(0, maxAllocationUsd));
+  }
+
+  const category = candidate?.token?.category || "unknown";
+  const remainingCategoryHeadroom =
+    toNum(settings.category_cap_pct, SETTINGS_DEFAULTS.category_cap_pct) - categoryExposurePct(postSellPortfolio, category);
+  if (remainingCategoryHeadroom > 0) {
+    allocationUsd = Math.min(
+      allocationUsd,
+      Math.max(0, equity * remainingCategoryHeadroom)
+    );
+  }
+
+  if (!(allocationUsd > 0) || !(cashUsd > 0)) return 0;
+
+  const reduceToCashFit = (notionalUsd) => {
+    const execution = buildPaperFillExecution({
+      side: "buy",
+      price,
+      quoted_price: price,
+      cost_usd: notionalUsd,
+      liquidity_usd: toNum(candidate?.liquidity_data?.liquidity_usd, toNum(candidate?.liquidity_usd, 0)),
+      execution_data: candidate?.execution_data || null,
+      settings
+    });
+    const totalCashDebitUsd = toNum(execution?.filled_notional_usd, notionalUsd) + toNum(execution?.fee_usd, 0);
+    if (!(totalCashDebitUsd > 0) || totalCashDebitUsd <= cashUsd) {
+      return Math.max(0, notionalUsd);
+    }
+    return Math.max(0, notionalUsd * (cashUsd / totalCashDebitUsd));
+  };
+
+  allocationUsd = reduceToCashFit(allocationUsd);
+  allocationUsd = reduceToCashFit(allocationUsd);
+  return allocationUsd;
+}
+
+function evaluateRotationBuyFeasibility(portfolio, action, review = null, positionSizing = null, nowMs = Date.now()) {
+  const candidate = action?.to_candidate || action?.candidate || null;
+  const settings = portfolio?.settings || SETTINGS_DEFAULTS;
+  const effectiveNowMs = Number.isFinite(Number(nowMs)) ? Number(nowMs) : Date.now();
+  const evaluationTs = new Date(effectiveNowMs).toISOString();
+  const reasonCodes = [];
+  const simulatedPortfolio = deepClone(portfolio || {});
+  simulatedPortfolio.positions = simulatedPortfolio.positions || {};
+  simulatedPortfolio.closed_trades = Array.isArray(simulatedPortfolio.closed_trades) ? simulatedPortfolio.closed_trades : [];
+  simulatedPortfolio.action_history = Array.isArray(simulatedPortfolio.action_history) ? simulatedPortfolio.action_history : [];
+  simulatedPortfolio.cooldowns = simulatedPortfolio.cooldowns || {};
+  simulatedPortfolio.settings = simulatedPortfolio.settings || settings;
+
+  const price = toNum(candidate?.market_data?.current_price, 0);
+  if (!(price > 0)) {
+    reasonCodes.push("missing_or_invalid_price");
+  }
+
+  const sellPosition = simulatedPortfolio.positions?.[action?.from_symbol];
+  let expectedNetProceedsUsd = 0;
+  if (!sellPosition) {
+    reasonCodes.push("sell_leg_unavailable");
+  } else {
+    const fraction = Math.max(
+      0,
+      Math.min(1, toNum(action?.sell_fraction ?? action?.fraction ?? simulatedPortfolio.settings.rotation_sell_fraction, 0))
+    );
+    const quantity = toNum(sellPosition.quantity, 0) * fraction;
+    if (!(quantity > 0)) {
+      reasonCodes.push("sell_leg_unavailable");
+    } else {
+      const execution = buildPaperFillExecution({
+        side: "sell",
+        price: sellPosition.current_price,
+        quoted_price: sellPosition.current_price,
+        quantity,
+        liquidity_usd: toNum(
+          sellPosition.liquidity_usd,
+          toNum(sellPosition?.last_market_snapshot?.liquidity_data?.liquidity_usd, 0)
+        ),
+        execution_data: action?.execution_data || sellPosition?.last_market_snapshot?.execution_data || null,
+        settings: simulatedPortfolio.settings
+      });
+      const filledQuantity = toNum(execution?.quantity, quantity);
+      if (execution?.decision === "rejected" || !(filledQuantity > 0)) {
+        reasonCodes.push("sell_leg_unavailable");
+      } else {
+        const grossProceedsUsd = toNum(execution?.filled_notional_usd, quantity * sellPosition.current_price);
+        const netProceedsUsd = Math.max(0, grossProceedsUsd - toNum(execution?.fee_usd, 0));
+        const costPortionUsd = toNum(sellPosition.cost_basis_usd, 0) * fraction;
+        const pnlUsd = netProceedsUsd - costPortionUsd;
+
+        simulatedPortfolio.cash_usd = toNum(simulatedPortfolio.cash_usd, 0) + netProceedsUsd;
+        sellPosition.quantity = toNum(sellPosition.quantity, 0) - quantity;
+        sellPosition.cost_basis_usd = toNum(sellPosition.cost_basis_usd, 0) - costPortionUsd;
+        sellPosition.market_value_usd = toNum(sellPosition.quantity, 0) * toNum(sellPosition.current_price, 0);
+        sellPosition.last_updated_at = evaluationTs;
+        expectedNetProceedsUsd = netProceedsUsd;
+
+        const tradeLifecycle = sellPosition.quantity <= 1e-12 || sellPosition.market_value_usd < 1 ? "close" : "partial_sell";
+        const simulatedSellTrade = {
+          ts: evaluationTs,
+          side: "sell",
+          symbol: sellPosition.symbol,
+          contract_address: sellPosition.contract_address,
+          category: sellPosition.category || "unknown",
+          reason: `rotation_out:${action?.reason || "better_opportunity"}`,
+          quantity,
+          price: sellPosition.current_price,
+          quoted_price: toNum(execution?.quote_price, sellPosition.current_price),
+          fill_price: toNum(execution?.fill_price, sellPosition.current_price),
+          slippage_bps_applied: toNum(execution?.slippage_bps, 0),
+          fee_bps_applied: toNum(execution?.fee_bps, 0),
+          fee_usd: toNum(execution?.fee_usd, 0),
+          slippage_usd: toNum(execution?.slippage_usd, 0),
+          proceeds_usd: netProceedsUsd,
+          gross_proceeds_usd: grossProceedsUsd,
+          net_proceeds_usd: netProceedsUsd,
+          cost_portion_usd: costPortionUsd,
+          pnl_usd: pnlUsd,
+          fraction,
+          trade_lifecycle: tradeLifecycle,
+          opened_at: sellPosition.opened_at || null,
+          avg_entry_price: sellPosition.avg_entry_price || null,
+          candidate_id: sellPosition.training_candidate_id || null,
+          position_id: sellPosition.training_position_id || null,
+          execution_source: execution?.execution_source || "paper",
+          tx_hash: execution?.tx_hash || null,
+          approval_tx_hash: execution?.approval_tx_hash || null,
+          trade_id: null
+        };
+        simulatedPortfolio.closed_trades.push(simulatedSellTrade);
+        simulatedPortfolio.action_history.push(simulatedSellTrade);
+
+        if (tradeLifecycle === "close") {
+          delete simulatedPortfolio.positions[sellPosition.symbol];
+        }
+      }
+    }
+  }
+
+  const candidateIdentity = resolveExistingPositionKey(
+    simulatedPortfolio,
+    candidate?.token?.symbol || candidate?.symbol || "",
+    cleanAddress(candidate?.token?.contract_address || candidate?.contract_address || "")
+  );
+  if (candidateIdentity.conflict || (candidateIdentity.key && candidateIdentity.key !== action?.from_symbol)) {
+    reasonCodes.push("candidate_identity_conflict");
+  }
+
+  const sellLegAvailable = !reasonCodes.includes("sell_leg_unavailable");
+  if (sellLegAvailable) {
+    const category = candidate?.token?.category || "unknown";
+    const remainingCategoryHeadroom =
+      toNum(simulatedPortfolio.settings.category_cap_pct, SETTINGS_DEFAULTS.category_cap_pct)
+        - categoryExposurePct(simulatedPortfolio, category);
+    if (remainingCategoryHeadroom <= 0) {
+      reasonCodes.push("category_exposure_cap_reached");
+    }
+  }
+
+  let allocationUsd = 0;
+  if (sellLegAvailable && price > 0) {
+    allocationUsd = resolveRotationAllocationUsd(
+      simulatedPortfolio,
+      candidate,
+      expectedNetProceedsUsd,
+      review,
+      positionSizing || action?.position_sizing || null
+    );
+  }
+
+  const maxOpenPositions = Math.max(0, Math.trunc(toNum(
+    simulatedPortfolio.settings.max_open_positions,
+    SETTINGS_DEFAULTS.max_open_positions
+  )));
+  if (sellLegAvailable && !candidateIdentity.conflict && !candidateIdentity.key && Object.keys(simulatedPortfolio.positions).length >= maxOpenPositions) {
+    reasonCodes.push("position_slot_unavailable");
+  }
+
+  const candidateSleeve = action?.sleeve || candidate?.sleeve || "thesis";
+  const thesisCap = toNum(
+    simulatedPortfolio.settings.max_thesis_positions,
+    simulatedPortfolio.settings.max_open_positions
+  );
+  if (sellLegAvailable && !candidateIdentity.conflict && !candidateIdentity.key && candidateSleeve !== "trend_overlay" && countThesisPositions(simulatedPortfolio) >= thesisCap) {
+    reasonCodes.push("thesis_cap_reached");
+  }
+
+  if (sellLegAvailable && price > 0 && allocationUsd < toNum(simulatedPortfolio.settings.min_trade_usd, SETTINGS_DEFAULTS.min_trade_usd)) {
+    reasonCodes.push("below_min_trade_usd");
+  }
+
+  if (sellLegAvailable && price > 0 && allocationUsd > 0) {
+    const rotationRiskDecision = evaluateRiskDecision({
+      mode: "paper",
+      enforcement_mode: "enforced",
+      evaluated_at: evaluationTs,
+      portfolio: simulatedPortfolio,
+      intent: buildBuyRiskIntent(candidate, allocationUsd, "rotation"),
+      analytics: buildPortfolioRiskAnalytics(simulatedPortfolio, evaluationTs),
+      capital_mandate: _cycleActiveCapitalMandate
+    });
+    if (rotationRiskDecision?.decision === "block") {
+      reasonCodes.push("risk_decision_block");
+    }
+  }
+
+  const stableReasonCodes = [...new Set(reasonCodes)];
+  return {
+    feasible: stableReasonCodes.length === 0,
+    reason_codes: stableReasonCodes,
+    allocation_usd: allocationUsd
+  };
+}
+
+function resolveRotationGuardMode(settings) {
+  const rawMode = String(settings?.rotation_friction_guard_mode || "").trim().toLowerCase();
+  return rawMode === "off" || rawMode === "shadow" || rawMode === "enforce"
+    ? rawMode
+    : SETTINGS_DEFAULTS.rotation_friction_guard_mode;
+}
+
+function readNonNegativeRotationGuardSetting(settings, key) {
+  try {
+    const value = Number(settings?.[key]);
+    return Number.isFinite(value) && value >= 0 ? value : SETTINGS_DEFAULTS[key];
+  } catch (_) {
+    return SETTINGS_DEFAULTS[key];
+  }
+}
+
+function safeRotationGuardNumber(value, fallback = 0) {
+  try {
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric : fallback;
+  } catch (_) {
+    return fallback;
+  }
+}
+
+function roundHalfAwayFromZero(value, decimals = 6) {
+  const factor = 10 ** decimals;
+  const scaled = safeRotationGuardNumber(value, 0) * factor;
+  if (!Number.isFinite(scaled) || scaled === 0) return 0;
+  return (scaled > 0 ? Math.floor(scaled + 0.5) : Math.ceil(scaled - 0.5)) / factor;
+}
+
+function parseRotationGuardOpenedAtMs(value) {
+  if (value == null || value === "") return null;
+  try {
+    const parsedMs = Date.parse(value);
+    return Number.isFinite(parsedMs) ? parsedMs : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function evaluateRotationGuard(heldPosition, replacementCandidate, scoreDelta, settings, nowMs, buyFeasibility) {
+  const fallbackMode = SETTINGS_DEFAULTS.rotation_friction_guard_mode;
+  const fallbackRoundTripCostBps = roundHalfAwayFromZero(SETTINGS_DEFAULTS.rotation_round_trip_cost_bps);
+  const fallbackMarginBps = roundHalfAwayFromZero(SETTINGS_DEFAULTS.rotation_margin_bps);
+  const fallbackRequiredEdgeBps = roundHalfAwayFromZero(fallbackRoundTripCostBps + fallbackMarginBps);
+
+  try {
+    const _replacementCandidate = replacementCandidate;
+    void _replacementCandidate;
+
+    const mode = resolveRotationGuardMode(settings);
+    const normalizedScoreDelta = safeRotationGuardNumber(scoreDelta, 0);
+    const normalizedNowMs = safeRotationGuardNumber(nowMs, Date.now());
+    const minHoldHours = readNonNegativeRotationGuardSetting(settings, "rotation_min_hold_hours");
+    const scoreEdgeBpsPerPoint = readNonNegativeRotationGuardSetting(settings, "rotation_score_edge_bps_per_point");
+    const roundTripCostBps = roundHalfAwayFromZero(
+      readNonNegativeRotationGuardSetting(settings, "rotation_round_trip_cost_bps")
+    );
+    const marginBps = roundHalfAwayFromZero(
+      readNonNegativeRotationGuardSetting(settings, "rotation_margin_bps")
+    );
+    const hysteresisBpsPerDay = readNonNegativeRotationGuardSetting(settings, "rotation_hysteresis_bps_per_day");
+    const hysteresisMaxBps = readNonNegativeRotationGuardSetting(settings, "rotation_hysteresis_max_bps");
+
+    const openedAtMs = parseRotationGuardOpenedAtMs(heldPosition?.opened_at);
+    const heldHours = openedAtMs == null ? null : Math.max(0, (normalizedNowMs - openedAtMs) / 3600000);
+    const heldDays = heldHours == null ? null : heldHours / 24;
+    const modeledEdgeBps = roundHalfAwayFromZero(Math.max(0, normalizedScoreDelta) * scoreEdgeBpsPerPoint);
+    const ageHysteresisBps = roundHalfAwayFromZero(
+      heldDays == null ? 0 : Math.min(hysteresisMaxBps, Math.max(0, heldDays) * hysteresisBpsPerDay)
+    );
+    const requiredEdgeBps = roundHalfAwayFromZero(roundTripCostBps + marginBps + ageHysteresisBps);
+    const minimumHoldNotMet = heldHours != null && heldHours < minHoldHours;
+    const frictionHurdleNotCleared = modeledEdgeBps < requiredEdgeBps;
+
+    const buyReasonCodes = Array.isArray(buyFeasibility?.reason_codes)
+      ? [...new Set(buyFeasibility.reason_codes.filter((code) => typeof code === "string" && code))]
+      : [];
+    const buyLegInfeasible = buyFeasibility?.feasible === false;
+    const activeReasonCodes = [];
+    const diagnosticReasonCodes = [];
+
+    if (openedAtMs == null) {
+      diagnosticReasonCodes.push("opened_at_unavailable");
+    }
+
+    if (mode === "enforce") {
+      if (minimumHoldNotMet) activeReasonCodes.push("minimum_hold_not_met");
+      if (frictionHurdleNotCleared) activeReasonCodes.push("friction_hurdle_not_cleared");
+    } else {
+      if (minimumHoldNotMet) diagnosticReasonCodes.push("minimum_hold_not_met");
+      if (frictionHurdleNotCleared) diagnosticReasonCodes.push("friction_hurdle_not_cleared");
+    }
+
+    if (buyLegInfeasible) {
+      activeReasonCodes.push(...(buyReasonCodes.length ? buyReasonCodes : ["buy_leg_infeasible"]));
+    }
+
+    let normalizedBuyFeasibility = {
+      feasible: buyLegInfeasible ? false : true,
+      reason_codes: buyReasonCodes
+    };
+    if (buyFeasibility && typeof buyFeasibility === "object" && !Array.isArray(buyFeasibility)) {
+      try {
+        normalizedBuyFeasibility = {
+          ...deepClone(buyFeasibility),
+          feasible: buyLegInfeasible ? false : buyFeasibility.feasible !== false,
+          reason_codes: buyReasonCodes
+        };
+      } catch (_) {}
+    }
+
+    const reasonCodes = [...new Set(activeReasonCodes)];
+    return {
+      mode,
+      allow: reasonCodes.length === 0,
+      would_block: buyLegInfeasible || minimumHoldNotMet || frictionHurdleNotCleared,
+      reason_codes: reasonCodes,
+      diagnostic_reason_codes: [...new Set(diagnosticReasonCodes)],
+      held_hours: heldHours,
+      score_delta: normalizedScoreDelta,
+      modeled_edge_bps: modeledEdgeBps,
+      round_trip_cost_bps: roundTripCostBps,
+      margin_bps: marginBps,
+      age_hysteresis_bps: ageHysteresisBps,
+      required_edge_bps: requiredEdgeBps,
+      buy_feasibility: normalizedBuyFeasibility
+    };
+  } catch (_) {
+    const buyReasonCodes = Array.isArray(buyFeasibility?.reason_codes)
+      ? [...new Set(buyFeasibility.reason_codes.filter((code) => typeof code === "string" && code))]
+      : [];
+    const buyLegInfeasible = buyFeasibility?.feasible === false;
+    const reasonCodes = buyLegInfeasible
+      ? (buyReasonCodes.length ? buyReasonCodes : ["buy_leg_infeasible"])
+      : [];
+    return {
+      mode: fallbackMode,
+      allow: reasonCodes.length === 0,
+      would_block: buyLegInfeasible,
+      reason_codes: reasonCodes,
+      diagnostic_reason_codes: [],
+      held_hours: null,
+      score_delta: 0,
+      modeled_edge_bps: 0,
+      round_trip_cost_bps: fallbackRoundTripCostBps,
+      margin_bps: fallbackMarginBps,
+      age_hysteresis_bps: 0,
+      required_edge_bps: fallbackRequiredEdgeBps,
+      buy_feasibility: {
+        feasible: buyLegInfeasible ? false : true,
+        reason_codes: buyReasonCodes
+      }
+    };
+  }
+}
+
 async function executeRotation(portfolio, action, review = null) {
   const from = portfolio.positions[action.from_symbol];
   if (!from) return null;
+
+  const buyFeasibility = evaluateRotationBuyFeasibility(
+    portfolio,
+    action,
+    review,
+    action?.position_sizing || null
+  );
+  if (!buyFeasibility.feasible) return null;
 
   const sellTrade = await executeSell(portfolio, {
     type: "sell",
@@ -8871,31 +9302,18 @@ async function executeRotation(portfolio, action, review = null) {
   }
 
   const candidate = action.to_candidate;
-  const equity = equityUsd(portfolio);
-  const approvedPct = toNum(candidate?._risk?.approved_size_pct, 0) / 100;
-  const desiredPct = approvedPct > 0 ? approvedPct : portfolio.settings.risk_per_trade_pct;
-  const executorApprovedPct = toNum(review?.approved_size_pct, 0) / 100;
-  const sizingPct = executorApprovedPct > 0 ? Math.min(desiredPct, executorApprovedPct) : desiredPct;
-  const allocPct = Math.min(sizingPct, portfolio.settings.max_position_pct);
-
-  let allocationUsd = Math.min(
-    portfolio.cash_usd,
-    equity * allocPct,
-    sellTrade.proceeds_usd
-  );
-  if (action.position_sizing?.max_allocation_usd != null) {
-    allocationUsd = Math.min(allocationUsd, toNum(action.position_sizing.max_allocation_usd, allocationUsd));
-  }
-
   const categoryPct = categoryExposurePct(portfolio, candidate.token.category || "unknown");
   const remainingCategoryHeadroom =
     portfolio.settings.category_cap_pct - categoryPct;
 
   if (remainingCategoryHeadroom <= 0) return { sellTrade, buyTrade: null };
 
-  allocationUsd = Math.min(
-    allocationUsd,
-    equity * remainingCategoryHeadroom
+  const allocationUsd = resolveRotationAllocationUsd(
+    portfolio,
+    candidate,
+    sellTrade.proceeds_usd,
+    review,
+    action.position_sizing || null
   );
 
   if (allocationUsd < portfolio.settings.min_trade_usd) {
@@ -10439,9 +10857,32 @@ async function runCycle(runContext = {}) {
     }
 
     // 7. ROTATION ENGINE
+    const rotationEvaluationNowMs = nowMs();
+    const rotationEvaluatedAt = new Date(rotationEvaluationNowMs).toISOString();
     const rotationActions = policy.allow_rotations
-      ? evaluateRotationActions(portfolio, approved).slice(0, policy.max_rotations_per_cycle)
+      ? evaluateRotationActions(portfolio, approved, rotationEvaluationNowMs).slice(0, policy.max_rotations_per_cycle)
       : [];
+    for (const action of rotationActions) {
+      const rotationGuard = action?.rotation_guard;
+      if (rotationGuard?.mode !== "shadow") continue;
+      log("rotation_guard_shadow", {
+        from_symbol: action?.from_symbol || null,
+        to_symbol: action?.to_candidate?.token?.symbol || null,
+        mode: rotationGuard.mode,
+        score_delta: rotationGuard.score_delta,
+        held_hours: rotationGuard.held_hours,
+        modeled_edge_bps: rotationGuard.modeled_edge_bps,
+        required_edge_bps: rotationGuard.required_edge_bps,
+        round_trip_cost_bps: rotationGuard.round_trip_cost_bps,
+        margin_bps: rotationGuard.margin_bps,
+        age_hysteresis_bps: rotationGuard.age_hysteresis_bps,
+        allow: rotationGuard.allow,
+        would_block: rotationGuard.would_block,
+        reason_codes: Array.isArray(rotationGuard.reason_codes) ? rotationGuard.reason_codes : [],
+        diagnostic_reason_codes: Array.isArray(rotationGuard.diagnostic_reason_codes) ? rotationGuard.diagnostic_reason_codes : [],
+        evaluated_at: rotationEvaluatedAt
+      });
+    }
     const sizedRotationActions = rotationActions
       .map((action) => ({ ...action, position_sizing: buildPositionSizingDecision(action, portfolio, "rotation") }));
     const rotationReviews = policy.allow_rotations
@@ -10900,8 +11341,12 @@ export {
   buildPipelineWarningsForCycle,
   evaluateBuyActions,
   evaluateRotationActions,
+  evaluateRotationBuyFeasibility,
+  evaluateRotationGuard,
+  resolveRotationAllocationUsd,
   evaluateSellActions,
   executeSell,
+  executeRotation,
   filterScoutCandidatesForDesk,
   filterScoutCandidatesAgainstPortfolio,
   rankApprovedCandidates,
