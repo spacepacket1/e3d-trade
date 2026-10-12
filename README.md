@@ -258,6 +258,8 @@ Risk runs independently of both the LLM and portfolio state. Its decisions are l
 
 Every approved candidate produces a `paper_trade_ticket` with symbol, size, price, and timestamp. The ticket is logged as a training event. `live_execution_allowed` is always false in paper mode — the flag is checked in code, not just in the prompt.
 
+**Live execution path (`scripts/liveExecutor.js`):** a real on-chain executor exists behind `LIVE_EXECUTION_ENABLED=1` (false by default; without it every live order is rejected as `live_execution_not_enabled`, checked in code). When enabled, it quotes swaps via 0x's allowance-holder API (`scripts/liveQuote.js`) with position/notional caps enforced before submission, guarded by a double-start lock (`LIVE_PIPELINE_LOCK_PATH`) so only one live process can run against a given portfolio file at a time. Fork-tested rather than tested only against mocks.
+
 **Output shape per decision:**
 ```json
 {
@@ -497,13 +499,13 @@ Worst case (15 tool rounds × 6,000 char results ≈ 30K tokens): ~8 + 6 + 4 = ~
 
 The system includes a continuous learning infrastructure designed to internalize trading rules into fine-tuned LoRA adapters, reducing prompt length and improving decision consistency.
 
-### 7.1 Motivation
+### 8.1 Motivation
 
 Scout's system prompt currently runs ~5,000 tokens of rules. Harvest adds ~3,000. These rules are re-read from scratch every cycle. A fine-tuned model that has internalized the rules needs only a short task prompt and live market data — rules become implicit.
 
 Combined savings: ~6,700 tokens/cycle. At 288 cycles/day, this recovers ~80 seconds of cycle time per iteration and significantly reduces inference cost.
 
-### 7.2 Two Adapters
+### 8.2 Two Adapters
 
 | | Scout | Harvest |
 |---|---|---|
@@ -513,7 +515,7 @@ Combined savings: ~6,700 tokens/cycle. At 288 cycles/day, this recovers ~80 seco
 | Sequence length | 2048 | 2048 |
 | Training data | Synthetic rules + pipeline outcomes + risk rejections | Synthetic rules + position trajectory outcomes + pump exhaustion examples |
 
-### 7.3 Training Data Sources
+### 8.3 Training Data Sources
 
 **Source A — Synthetic rule examples:** Hand-crafted examples encoding the decision rules in isolation. ~300–500 examples per agent. Include story_count_1h signals, the story-only universe filter behavior, all pre-pump story type combinations, and FLOW-ONLY threshold logic. Regenerated when rules change.
 
@@ -521,23 +523,23 @@ Combined savings: ~6,700 tokens/cycle. At 288 cycles/day, this recovers ~80 seco
 
 **Source C — High-signal failure examples:** Risk rejections (Scout) and pump exhaustion holds (Harvest) are extracted as additional negative examples. These represent the highest-priority failure modes to avoid.
 
-### 7.4 Training Schedule
+### 8.4 Training Schedule
 
 Weekly retraining, Sunday 3AM. Each run: extract data → validate count → back up current adapter → train → evaluate on held-out test set → deploy if loss improved, restore backup if not.
 
 ---
 
-## 8. Observability
+## 9. Observability
 
-### 8.1 Pipeline Log
+### 9.1 Pipeline Log
 
 Every event is appended to `logs/pipeline.jsonl` as a structured JSON record with timestamp, stage, and data. Key stages: `cycle_start`, `scout`, `harvest`, `risk_approved`, `risk_rejected`, `executor_decision`, `buy_trades`, `sell_trades`, `stats`, `cycle_end`, `manager_report`.
 
-### 8.2 Training Events
+### 9.2 Training Events
 
 High-value decision events are written to a separate `training-events.jsonl` and optionally to ClickHouse for analytics. Schema version is stamped on every record.
 
-### 8.3 Dashboard
+### 9.3 Dashboard
 
 A real-time web dashboard at `http://localhost:3000` provides:
 
@@ -546,7 +548,7 @@ A real-time web dashboard at `http://localhost:3000` provides:
 - **Reports** — Manager Agent cycle grades, flag codes, per-agent scores, portfolio snapshot
 - **Settings** — pipeline control, paper mode toggle, interval configuration
 
-### 8.4 Manager Reports
+### 9.4 Manager Reports
 
 After each cycle, the Manager Agent produces a graded report with:
 
@@ -558,7 +560,22 @@ After each cycle, the Manager Agent produces a graded report with:
 
 ---
 
-## 9. Safety Model
+## 10. External Governance Integration (FutCo Capital Mandates)
+
+e3d-corp's FutCo instance can govern this floor's risk budget externally rather than relying solely on the static hard limits above.
+
+**Intake API** (`server.js`):
+- `GET /api/mandates/capital` — returns the currently active mandate, if any.
+- `POST /api/mandates/capital` — submits a mandate (`max_position_size_pct`, `max_token_exposure_pct`, `max_category_exposure_pct`, `max_strategy_exposure_pct`, `max_open_positions`, `max_daily_turnover_usd`, `max_spread_bps`, `max_slippage_bps`, `max_trade_notional_usd`) via `scripts/capitalMandates.js`'s `submitCapitalMandate()`, validated against the portfolio's current risk policy. Rejections return 400 with `error` + `details`.
+- `POST /api/mandates/capital/{mandateId}/revoke` — revokes a mandate by ID.
+
+**Outcome export** (`scripts/e3dActionOutcomeExport.js`): pushes trade outcomes back to e3d-corp as they occur, `POST {E3D_CORP_BASE_URL}{E3D_CORP_OUTCOME_PATH}` (default path `/webhooks/e3d-trade-outcomes`), authenticated via `E3D_CORP_API_KEY` or `E3D_CORP_SESSION_COOKIE`, with retry up to `E3D_CORP_MAX_ATTEMPTS`. Each outcome record is traced back to its originating mandate via `mandate_id`/`correlation_id` (see `mandateTraceForRecord()`), so a mandate's P&L can be reconstructed on the e3d-corp side.
+
+This is a governance channel, not a trading signal source — a mandate narrows what Risk/Executor are allowed to do; it never proposes trades itself.
+
+---
+
+## 11. Safety Model
 
 | Layer | Mechanism |
 |---|---|
@@ -570,12 +587,21 @@ After each cycle, the Manager Agent produces a graded report with:
 | Pump filter | Hard filter in code: any candidate with 7-day CoinGecko gain > 300% is discarded before Risk sees it. |
 | Manager audit | Post-cycle evaluation catches enforcement failures (e.g. Risk approving a fraud-risk candidate). |
 | Adapter regression check | New LoRA adapters must improve eval loss over the previous adapter before deployment. |
+| Capital mandate | An external mandate (§10) can further narrow position/exposure/turnover limits; it can only tighten the hard limits above, never loosen them. |
 
 ---
 
-## 10. Current Status
+## 12. Current Status
 
 The system is running in paper mode with a portfolio of $100,000 initial capital. All five agents are operational. The hybrid perception architecture (`LLM_TOOL_USE=1`) is active — Scout and Harvest use `buildCognitiveState()` as their primary data layer, with targeted E3D API drill-down available per cycle. The Manager Agent grades each cycle. The training pipeline infrastructure is specified and ready; automated retraining begins once sufficient labeled cycle outcomes accumulate (estimated 4–6 weeks of runtime).
+
+**Recent architectural changes (Sept–Oct 2026):**
+- Built the live execution engine (§4.4): 0x-quoted swaps, position/notional caps, fork-tested, gated by `LIVE_EXECUTION_ENABLED` — still off by default, but no longer purely a future flag
+- Added the external capital-mandate governance channel (§10) so e3d-corp/FutCo can tighten risk limits and receive trade outcomes back
+- Added a Jev shadow-mode pre-screen gate ahead of recurring discover/ideate runs
+- Added deterministic profit-taking (trailing stops, default targets, a manual action queue) and a rotation friction guard to reduce churny rotations
+- Fixed several story-classification and disqualifier bugs (EXCHANGE_FLOW field path, CEX_LISTING/exchange-outflow treated as buy signals, EUR-pegged stablecoin exclusion)
+- Renamed the `.codex-spec-runner` state directory to `.spec2code`, matching the tool's rename elsewhere
 
 **Recent architectural changes (May 2026):**
 - Replaced bulk data pre-fetching with `buildCognitiveState()` — 3 targeted API calls producing a compact ranked candidate list
@@ -584,4 +610,4 @@ The system is running in paper mode with a portfolio of $100,000 initial capital
 - All tool results truncated to 6,000 chars before entering the conversation — keeps KV cache and RAM usage predictable on 25GB hardware
 - Stale Colima disk lock recovery: removed `/Users/mini/.colima/_lima/_disks/colima/in_use_by` symlink after VM crash
 
-**Live trading requires:** adapter training completion, a multi-cycle paper mode validation period showing consistent positive P&L, and an explicit configuration change to enable execution.
+**Live trading requires:** the executor code exists (§4.4) and is gated by `LIVE_EXECUTION_ENABLED`, but it has not been turned on — adapter training completion and a multi-cycle paper mode validation period showing consistent positive P&L are still the bar before that flag gets flipped.
