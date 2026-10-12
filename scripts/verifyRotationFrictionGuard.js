@@ -11,6 +11,15 @@ const trackedWriteMethods = [
   "unlinkSync",
   "truncateSync"
 ];
+// The simulated risk check reads the live training-events log for the
+// day-start equity baseline; hide it so fixtures stay hermetic.
+const originalStatSync = fs.statSync;
+fs.statSync = (target, ...rest) => {
+  if (String(target).endsWith("training-events.jsonl")) {
+    throw Object.assign(new Error("ENOENT (hidden by verifyRotationFrictionGuard)"), { code: "ENOENT" });
+  }
+  return originalStatSync(target, ...rest);
+};
 const originalWriteMethods = new Map();
 const writeCalls = [];
 
@@ -795,11 +804,11 @@ try {
     guardNowMs,
     guardBuyFeasible
   );
-  assert.equal(normalizedMode.mode, "shadow");
-  assert.equal(normalizedMode.allow, true);
+  assert.equal(normalizedMode.mode, "enforce");
+  assert.equal(normalizedMode.allow, false);
   assert.equal(normalizedMode.would_block, true);
-  assert.deepEqual(normalizedMode.reason_codes, []);
-  assert.deepEqual(normalizedMode.diagnostic_reason_codes, ["minimum_hold_not_met"]);
+  assert.deepEqual(normalizedMode.reason_codes, ["minimum_hold_not_met"]);
+  assert.deepEqual(normalizedMode.diagnostic_reason_codes, []);
   assert.equal(normalizedMode.round_trip_cost_bps, 125);
   assert.equal(normalizedMode.margin_bps, 50);
   assert.equal(normalizedMode.modeled_edge_bps, 180);
@@ -994,10 +1003,10 @@ try {
       { feasible: false, reason_codes: Symbol("codes") }
     );
   });
-  assert.equal(pathologicalGuardResult.mode, "shadow");
+  assert.equal(pathologicalGuardResult.mode, "enforce");
   assert.equal(pathologicalGuardResult.allow, false);
   assert.equal(pathologicalGuardResult.would_block, true);
-  assert.deepEqual(pathologicalGuardResult.reason_codes, ["buy_leg_infeasible"]);
+  assert.deepEqual(pathologicalGuardResult.reason_codes, ["friction_hurdle_not_cleared", "buy_leg_infeasible"]);
 
   console.log("verifyRotationFrictionGuard: ok");
 } finally {

@@ -5,6 +5,17 @@ import { SCOUT_FLOW_ONLY_PER_CYCLE_LIMIT } from "./evidencePackets.js";
 const originalAppendFileSync = fs.appendFileSync;
 fs.appendFileSync = () => {};
 
+// Rotation planning now runs a simulated risk check, which reads the live
+// training-events log for the day-start equity baseline. Hide it so the
+// fixtures stay hermetic instead of inheriting today's real equity.
+const originalStatSync = fs.statSync;
+fs.statSync = (target, ...rest) => {
+  if (String(target).endsWith("training-events.jsonl")) {
+    throw Object.assign(new Error("ENOENT (hidden by verifyScoutRelaxation)"), { code: "ENOENT" });
+  }
+  return originalStatSync(target, ...rest);
+};
+
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 const {
