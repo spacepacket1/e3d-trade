@@ -143,7 +143,7 @@ const SETTINGS_DEFAULTS = {
   max_rotations_per_cycle: 5,  // was 0, then 1 (evaluateRotationActions was hardcoded to one pair regardless of this value - extended to evaluate up to this many candidate/weak-position pairs)
   rotation_threshold: 10,
   rotation_sell_fraction: 1.0,
-  rotation_friction_guard_mode: "shadow",
+  rotation_friction_guard_mode: "enforce",
   rotation_min_hold_hours: 48,
   rotation_round_trip_cost_bps: 125,
   rotation_margin_bps: 50,
