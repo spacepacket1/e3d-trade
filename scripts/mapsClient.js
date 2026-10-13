@@ -41,12 +41,23 @@ async function parseJsonResponse(response, endpointName, fallbackValue) {
   }
 }
 
-async function requestMapsArray(pathname, query, endpointName) {
+// The live API wraps every list under a named field rather than returning a
+// bare array - e.g. GET maps/destinations returns {"status":"ok","destinations":[...]}.
+// Each call site below passes that field's name as unwrapKey. Without this,
+// every payload failed the old bare-Array.isArray(payload) check and silently
+// fell back to [] - the "Maps returned non-array payload" warning was firing
+// on every single call, for every endpoint, discarding real signal data
+// (destinations/hazards/congestion/closures feed real precheck and scoring
+// logic in mapsHarvestPrecheck.js/mapsScoutRoute.js, so this wasn't cosmetic).
+async function requestMapsArray(pathname, query, endpointName, unwrapKey) {
   const fallbackValue = [];
   try {
     const response = await e3dRequest(buildMapsUrl(pathname, query));
     const payload = await parseJsonResponse(response, endpointName, fallbackValue);
     if (Array.isArray(payload)) return payload;
+    if (unwrapKey && payload && typeof payload === "object" && Array.isArray(payload[unwrapKey])) {
+      return payload[unwrapKey];
+    }
     mapsWarn(`Maps returned non-array payload for ${endpointName}`);
     return fallbackValue;
   } catch (error) {
@@ -55,7 +66,9 @@ async function requestMapsArray(pathname, query, endpointName) {
   }
 }
 
-async function requestMapsObject(pathname, query, endpointName, { allowNull = false } = {}) {
+// Same wrapping convention for single-object endpoints - e.g. maps/graph
+// returns {"status":"ok","graph":{...}}, not the graph object itself.
+async function requestMapsObject(pathname, query, endpointName, { allowNull = false, unwrapKey } = {}) {
   const fallbackValue = null;
   try {
     const response = await e3dRequest(buildMapsUrl(pathname, query));
@@ -64,6 +77,8 @@ async function requestMapsObject(pathname, query, endpointName, { allowNull = fa
       return null;
     }
     const payload = await parseJsonResponse(response, endpointName, fallbackValue);
+    const unwrapped = unwrapKey ? payload?.[unwrapKey] : undefined;
+    if (unwrapped && typeof unwrapped === "object" && !Array.isArray(unwrapped)) return unwrapped;
     if (payload && typeof payload === "object" && !Array.isArray(payload)) return payload;
     if (payload == null && allowNull) return null;
     mapsWarn(`Maps returned non-object payload for ${endpointName}`);
@@ -85,27 +100,27 @@ async function fetchMapsSignals(options = {}) {
   if (options.minConfidence != null) query.min_confidence = options.minConfidence;
   if (options.limit != null) query.limit = options.limit;
   if (options.offset != null) query.offset = options.offset;
-  return requestMapsArray("maps/signals", query, "fetchMapsSignals");
+  return requestMapsArray("maps/signals", query, "fetchMapsSignals", "signals");
 }
 
 async function fetchMapsDestinations({ limit = 10 } = {}) {
-  return requestMapsArray("maps/destinations", { limit: normalizeLimit(limit) }, "fetchMapsDestinations");
+  return requestMapsArray("maps/destinations", { limit: normalizeLimit(limit) }, "fetchMapsDestinations", "destinations");
 }
 
 async function fetchMapsCongestion({ limit = 10 } = {}) {
-  return requestMapsArray("maps/congestion", { limit: normalizeLimit(limit) }, "fetchMapsCongestion");
+  return requestMapsArray("maps/congestion", { limit: normalizeLimit(limit) }, "fetchMapsCongestion", "congestion");
 }
 
 async function fetchMapsHazards({ limit = 10 } = {}) {
-  return requestMapsArray("maps/hazards", { limit: normalizeLimit(limit) }, "fetchMapsHazards");
+  return requestMapsArray("maps/hazards", { limit: normalizeLimit(limit) }, "fetchMapsHazards", "hazards");
 }
 
 async function fetchMapsClosures({ limit = 10 } = {}) {
-  return requestMapsArray("maps/signals", { signal_type: "route_closure", limit: normalizeLimit(limit) }, "fetchMapsClosures");
+  return requestMapsArray("maps/signals", { signal_type: "route_closure", limit: normalizeLimit(limit) }, "fetchMapsClosures", "signals");
 }
 
 async function fetchMapsFlowGraph() {
-  return requestMapsObject("maps/graph", {}, "fetchMapsFlowGraph", { allowNull: true });
+  return requestMapsObject("maps/graph", {}, "fetchMapsFlowGraph", { allowNull: true, unwrapKey: "graph" });
 }
 
 async function fetchMapsFlowGraphNode(node) {
@@ -113,11 +128,11 @@ async function fetchMapsFlowGraphNode(node) {
     mapsWarn("Maps flow graph node fetch skipped: node is required");
     return null;
   }
-  return requestMapsObject(`maps/graph/${encodeURIComponent(String(node).trim())}`, {}, "fetchMapsFlowGraphNode", { allowNull: true });
+  return requestMapsObject(`maps/graph/${encodeURIComponent(String(node).trim())}`, {}, "fetchMapsFlowGraphNode", { allowNull: true, unwrapKey: "node" });
 }
 
 async function fetchMapsCalibration() {
-  return requestMapsObject("maps/calibration", {}, "fetchMapsCalibration");
+  return requestMapsObject("maps/calibration", {}, "fetchMapsCalibration", { unwrapKey: "calibration" });
 }
 
 async function fetchMapsContext({ signalLimit = 5 } = {}) {
