@@ -32,7 +32,7 @@ const SAFE_OFFLINE = [
   "verifyOperationsMonitor.js", "verifyPaperExecutionRealism.js", "verifyPartialSellFloor.js",
   "verifyPortfolioSnapshotWriter.js", "verifyProfitTakeCalibration.js", "verifyPromotionGates.js",
   "verifyRegimeSentinelThrottle.js", "verifyRiskEngine.js", "verifyRotationFrictionGuard.js",
-  "verifyScoutMapsRoute.js", "verifyScoutRelaxation.js", "verifyTokenRiskScanner.js",
+  "verifyScoutBatchPlanning.js", "verifyScoutMapsRoute.js", "verifyScoutRelaxation.js", "verifyTokenRiskScanner.js",
   "verifyTradeEvidence.js", "verifyTrendSleevePersistence.js",
   // Evaluation foundation (synthetic fixtures only; no logs, no network).
   "verifyCandidateSnapshots.js", "verifySettingsHash.js", "verifyBaselineCompare.js", "verifyBackfillSnapshots.js"
