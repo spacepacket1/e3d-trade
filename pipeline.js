@@ -6578,24 +6578,20 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
   const beforeStr = partsBefore.join("\n");
   const afterStr = partsAfter.join("\n");
   const fixedChars = systemPrompt.length + beforeStr.length + afterStr.length;
-  const availableForCandidates = Math.max(SAFE_PROMPT_CHARS - fixedChars, 3000);
 
   const sortedCandidates = [...data.e3dCandidates]
     .sort((a, b) => (b.convergence_score ?? 0) - (a.convergence_score ?? 0));
   const formattedCandidates = sortedCandidates.length ? sortedCandidates.map(formatCandidate) : ["none currently"];
 
-  const batches = [];
-  let batch = [], batchChars = 0;
-  for (const fc of formattedCandidates) {
-    if (batchChars + fc.length + 1 > availableForCandidates && batch.length > 0) {
-      batches.push(batch);
-      batch = [];
-      batchChars = 0;
-    }
-    batch.push(fc);
-    batchChars += fc.length + 1;
+  const { batches, availableForCandidates, totalBatches, droppedCandidates } = planScoutBatches(formattedCandidates, {
+    safePromptChars: SAFE_PROMPT_CHARS,
+    fixedChars,
+    minBudgetChars: toNum(process.env.SCOUT_MIN_CANDIDATE_BUDGET_CHARS, 20000),
+    maxBatches: toNum(process.env.SCOUT_MAX_BATCHES, 8)
+  });
+  if (droppedCandidates > 0) {
+    log("scout_batches_capped", { planned_batches: totalBatches, kept_batches: batches.length, dropped_candidates: droppedCandidates });
   }
-  if (batch.length > 0) batches.push(batch);
 
   log("scout_batches", { total_candidates: data.e3dCandidates.length, batches: batches.length, fixed_chars: fixedChars, available_for_candidates: availableForCandidates });
 
@@ -9661,6 +9657,36 @@ function evaluateBuyActions(portfolio, approved) {
   return actions;
 }
 
+// Splits formatted scout candidates into LLM batches. The legacy scout prompt carries ~47-72k chars of
+// fixed context (theses, CoinGecko, signals, token universe) and is re-sent with every batch. Once that
+// fixed part exceeded the 50k "safe" budget the old code fell to a 3,000-char floor: ~1 candidate per
+// batch, 50-86 sequential ~90s LLM calls per cycle (1.5-2h of the shared GPU, starving the maps and story
+// windows). minBudget keeps batches meaningfully sized; maxBatches bounds the cycle, and since candidates
+// arrive best-first the dropped tail is the weakest.
+function planScoutBatches(formattedCandidates, { safePromptChars, fixedChars, minBudgetChars, maxBatches }) {
+  const availableForCandidates = Math.max(safePromptChars - fixedChars, minBudgetChars);
+  const batches = [];
+  let batch = [];
+  let batchChars = 0;
+  for (const fc of formattedCandidates) {
+    if (batchChars + fc.length + 1 > availableForCandidates && batch.length > 0) {
+      batches.push(batch);
+      batch = [];
+      batchChars = 0;
+    }
+    batch.push(fc);
+    batchChars += fc.length + 1;
+  }
+  if (batch.length > 0) batches.push(batch);
+
+  const totalBatches = batches.length;
+  let droppedCandidates = 0;
+  if (Number.isFinite(maxBatches) && maxBatches > 0 && batches.length > maxBatches) {
+    for (const dropped of batches.splice(maxBatches)) droppedCandidates += dropped.length;
+  }
+  return { batches, availableForCandidates, totalBatches, droppedCandidates };
+}
+
 function buildTrendSleeveCandidate(vehicle, priceUsd) {
   const price = toNum(priceUsd, 0);
   const candidate = {
@@ -11383,6 +11409,7 @@ export {
   evaluateRotationBuyFeasibility,
   evaluateRotationGuard,
   advanceTrendSleevePersistence,
+  planScoutBatches,
   resolveRotationAllocationUsd,
   evaluateSellActions,
   executeSell,
