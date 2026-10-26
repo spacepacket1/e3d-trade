@@ -8902,6 +8902,12 @@ function resolveRotationAllocationUsd(postSellPortfolio, candidate, expectedNetP
     allocationUsd = Math.min(allocationUsd, Math.max(0, maxAllocationUsd));
   }
 
+  // Rotation-ins open a new position, so they get the same flow-only ceiling as evaluateBuyActions.
+  if (equity > 0 && hasCanonicalFlowOnlyWarning(candidate)) {
+    const flowOnlyMaxPct = toNum(settings.flow_only_max_position_pct, SETTINGS_DEFAULTS.flow_only_max_position_pct);
+    allocationUsd = Math.min(allocationUsd, equity * Math.max(0, flowOnlyMaxPct));
+  }
+
   const category = candidate?.token?.category || "unknown";
   const remainingCategoryHeadroom =
     toNum(settings.category_cap_pct, SETTINGS_DEFAULTS.category_cap_pct) - categoryExposurePct(postSellPortfolio, category);
