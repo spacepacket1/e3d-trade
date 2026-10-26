@@ -277,6 +277,19 @@ try {
   approxEqual(sizingCapAllocation, 750);
   assertNoAdditionalWrites();
 
+  const flowOnlyPortfolio = buildPortfolio({
+    cash_usd: 10000,
+    stats: { equity_usd: 10000 },
+    settings: { max_position_pct: 0.5, risk_per_trade_pct: 0.5, flow_only_max_position_pct: 0.015 }
+  });
+  const flowOnlyCandidate = buildCandidate({ approved_size_pct: 50 });
+  flowOnlyCandidate.evidence_warnings = ["flow_only_candidate"];
+  approxEqual(resolveRotationAllocationUsd(flowOnlyPortfolio, flowOnlyCandidate, 8000), 150);
+  const flowOnlySummaryCandidate = buildCandidate({ approved_size_pct: 50 });
+  flowOnlySummaryCandidate.evidence_summary = { warnings: ["flow_only_candidate"] };
+  approxEqual(resolveRotationAllocationUsd(flowOnlyPortfolio, flowOnlySummaryCandidate, 8000), 150);
+  // Control: a candidate without the warning keeps its full approved size.
+  approxEqual(resolveRotationAllocationUsd(flowOnlyPortfolio, buildCandidate({ approved_size_pct: 50 }), 8000), 5000);
   const liquidityCapPortfolio = buildPortfolio({
     cash_usd: 10000,
     stats: { equity_usd: 10000 },

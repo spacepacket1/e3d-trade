@@ -30,13 +30,14 @@ const portfolio = {
 setCooldown(portfolio, "ASTEROID", "target_hit");
 assert.deepEqual(Object.keys(portfolio.cooldowns), ["ASTEROID"]);
 assert.equal(portfolio.cooldowns.ASTEROID.reason, "target_hit");
-assert(approxHoursUntil(portfolio.cooldowns.ASTEROID.until) > 2.9);
-assert(approxHoursUntil(portfolio.cooldowns.ASTEROID.until) < 3.1);
+const targetHitHours = defaultHours / 4;
+assert(approxHoursUntil(portfolio.cooldowns.ASTEROID.until) > targetHitHours - 0.1);
+assert(approxHoursUntil(portfolio.cooldowns.ASTEROID.until) < targetHitHours + 0.1);
 
 setCooldown(portfolio, "LDO", "fraud_risk_breach");
 assert.equal(portfolio.cooldowns.LDO.reason, "fraud_risk_breach");
-assert(approxHoursUntil(portfolio.cooldowns.LDO.until) > 11.9);
-assert(approxHoursUntil(portfolio.cooldowns.LDO.until) < 12.1);
+assert(approxHoursUntil(portfolio.cooldowns.LDO.until) > defaultHours - 0.1);
+assert(approxHoursUntil(portfolio.cooldowns.LDO.until) < defaultHours + 0.1);
 
 const upgraded = normalizePortfolioCooldowns({
   LEGACY: "2026-05-01T12:00:00.000Z",

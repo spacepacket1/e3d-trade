@@ -42,15 +42,28 @@ try {
   assert.equal(entryExecution.fee_bps, 12.5);
   assert.equal(Number(entryExecution.fee_usd.toFixed(3)), 0.125);
 
-  const exitExecution = buildPaperFillExecution({
+  // Default sell slippage scales with liquidity (commit 5d95cc1): 75 bps for
+  // deep (>= $1M), up to 400 bps for very_thin or unknown liquidity.
+  const deepExitExecution = buildPaperFillExecution({
+    side: "sell",
+    price: 1,
+    quantity: 100,
+    liquidity_usd: 5000000,
+    settings: SETTINGS_DEFAULTS
+  });
+
+  assert.equal(deepExitExecution.fill_price, 0.9925);
+  assert.equal(deepExitExecution.slippage_bps, 75);
+
+  const unknownLiquidityExit = buildPaperFillExecution({
     side: "sell",
     price: 1,
     quantity: 100,
     settings: SETTINGS_DEFAULTS
   });
 
-  assert.equal(exitExecution.fill_price, 0.9925);
-  assert.equal(exitExecution.slippage_bps, 75);
+  assert.equal(unknownLiquidityExit.fill_price, 0.96);
+  assert.equal(unknownLiquidityExit.slippage_bps, 400);
 
   const portfolio = buildPortfolio();
   const candidate = {

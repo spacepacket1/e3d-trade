@@ -13,3 +13,4 @@ reports/
 .e3d-pilot/
 operator-actions/*
 !operator-actions/.gitkeep
+node_modules/

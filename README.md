@@ -2,6 +2,8 @@
 
 **April 2026**
 
+> Five LLM agents propose trades on E3D.ai on-chain signals; deterministic code enforces every risk limit. **Paper mode by default.** To install and run it, see [INSTALL.md](INSTALL.md). Nothing here is investment advice.
+
 ---
 
 ## Abstract
@@ -608,6 +610,10 @@ The system is running in paper mode with a portfolio of $100,000 initial capital
 - Implemented OpenAI-compatible tool calling for both Scout and Harvest agents
 - Hybrid mode: Node.js handles perception bandwidth, Qwen handles strategy; agents can drill down on specific candidates with up to 3 targeted API calls per cycle
 - All tool results truncated to 6,000 chars before entering the conversation — keeps KV cache and RAM usage predictable on 25GB hardware
-- Stale Colima disk lock recovery: removed `/Users/mini/.colima/_lima/_disks/colima/in_use_by` symlink after VM crash
+- Stale Colima disk lock recovery: removed `~/.colima/_lima/_disks/colima/in_use_by` symlink after VM crash
 
 **Live trading requires:** the executor code exists (§4.4) and is gated by `LIVE_EXECUTION_ENABLED`, but it has not been turned on — adapter training completion and a multi-cycle paper mode validation period showing consistent positive P&L are still the bar before that flag gets flipped.
+
+## License
+
+[MIT](LICENSE) © 2026 FutCo LLC. Part of the [FutCo](https://futco.ai/projects) open-source ecosystem.

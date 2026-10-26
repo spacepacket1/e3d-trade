@@ -4,6 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "verify:all": "node scripts/run-verify.js",
     "start": "node pipeline.js",
     "loop": "node pipeline.js --loop",
     "dashboard": "node server.js",
@@ -11,6 +12,10 @@
     "backtest:replay": "node scripts/backtestReplay.js",
     "promotion:gates": "node scripts/promotionGates.js",
     "signal:attribution": "node scripts/signalAttribution.js",
+    "eval:baselines": "node scripts/baselineCompare.js",
+    "eval:snapshots": "node scripts/snapshotCompleteness.js",
+    "eval:settings": "node scripts/settingsLedger.js",
+    "eval:backfill": "node scripts/backfillSnapshots.js",
     "jev:gate": "node scripts/jevRecurringGate.js",
     "jev:verify": "node scripts/verifyJevRecurringGate.js",
     "jev:cadence": "node scripts/jevCycleCadenceGate.js",

@@ -36,6 +36,12 @@ import {
   buildMandateTrace,
   getActiveCapitalMandate
 } from "./scripts/capitalMandates.js";
+import {
+  captureCandidateList,
+  captureScoutUniverse,
+  recordCycleCandidateSnapshots
+} from "./scripts/candidateSnapshots.js";
+import { computeSettingsHashSafe } from "./scripts/settingsHash.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -2943,6 +2949,9 @@ let _cycleActiveCapitalMandateTrace = null;
 // Story types actually returned by the E3D API this cycle — used to make coverage scoring fair.
 // Coverage only grades against types that were present in the data, not the full expected list.
 let _cycleAvailableStoryTypes = null;
+// Evaluation-only: summary of the scout evidence shortlist + token universe prices for
+// logs/candidate-snapshots.jsonl. Never read by any trading decision.
+let _cycleSnapshotUniverse = null;
 
 function getOrFetchCycleMarketContext() {
   if (_cycleMarketContext) return _cycleMarketContext;
@@ -5933,6 +5942,8 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
     for (const blocked of shortlistBuild.blocked) {
       log("scout_shortlist_blocked", blocked);
     }
+    // Evaluation-only read of the shortlist build; captureScoutUniverse never throws.
+    _cycleSnapshotUniverse = captureScoutUniverse(shortlistBuild, data?.tokenUniverse);
     for (const packetError of shortlistBuild.packet_errors) {
       log("scout_evidence_packet_error", packetError);
     }
@@ -6587,24 +6598,20 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
   const beforeStr = partsBefore.join("\n");
   const afterStr = partsAfter.join("\n");
   const fixedChars = systemPrompt.length + beforeStr.length + afterStr.length;
-  const availableForCandidates = Math.max(SAFE_PROMPT_CHARS - fixedChars, 3000);
 
   const sortedCandidates = [...data.e3dCandidates]
     .sort((a, b) => (b.convergence_score ?? 0) - (a.convergence_score ?? 0));
   const formattedCandidates = sortedCandidates.length ? sortedCandidates.map(formatCandidate) : ["none currently"];
 
-  const batches = [];
-  let batch = [], batchChars = 0;
-  for (const fc of formattedCandidates) {
-    if (batchChars + fc.length + 1 > availableForCandidates && batch.length > 0) {
-      batches.push(batch);
-      batch = [];
-      batchChars = 0;
-    }
-    batch.push(fc);
-    batchChars += fc.length + 1;
+  const { batches, availableForCandidates, totalBatches, droppedCandidates } = planScoutBatches(formattedCandidates, {
+    safePromptChars: SAFE_PROMPT_CHARS,
+    fixedChars,
+    minBudgetChars: toNum(process.env.SCOUT_MIN_CANDIDATE_BUDGET_CHARS, 20000),
+    maxBatches: toNum(process.env.SCOUT_MAX_BATCHES, 8)
+  });
+  if (droppedCandidates > 0) {
+    log("scout_batches_capped", { planned_batches: totalBatches, kept_batches: batches.length, dropped_candidates: droppedCandidates });
   }
-  if (batch.length > 0) batches.push(batch);
 
   log("scout_batches", { total_candidates: data.e3dCandidates.length, batches: batches.length, fixed_chars: fixedChars, available_for_candidates: availableForCandidates });
 
@@ -8678,6 +8685,9 @@ async function executeSell(portfolio, action) {
   };
 
   trade.trade_id = buildTradeId(trade, getTrainingContext());
+  // Additive field for per-settings-version evaluation (scripts/settingsLedger.js).
+  const sellSettingsHash = computeSettingsHashSafe(portfolio?.settings);
+  if (sellSettingsHash) trade.settings_hash = sellSettingsHash;
   applyEvidenceMetadata(trade, action);
   const sellTokenRiskScan = buildPositionTokenRiskScan(pos, portfolio, {
     evaluated_at: trade.ts,
@@ -8911,6 +8921,11 @@ function resolveRotationAllocationUsd(postSellPortfolio, candidate, expectedNetP
     allocationUsd = Math.min(allocationUsd, Math.max(0, maxAllocationUsd));
   }
 
+  // Rotation-ins open a new position, so they get the same flow-only ceiling as evaluateBuyActions.
+  if (equity > 0 && hasCanonicalFlowOnlyWarning(candidate)) {
+    const flowOnlyMaxPct = toNum(settings.flow_only_max_position_pct, SETTINGS_DEFAULTS.flow_only_max_position_pct);
+    allocationUsd = Math.min(allocationUsd, equity * Math.max(0, flowOnlyMaxPct));
+  }
   allocationUsd = Math.min(allocationUsd, liquidityShareCapUsd(candidate, settings));
 
   const category = candidate?.token?.category || "unknown";
@@ -9570,6 +9585,9 @@ async function openPosition(portfolio, candidate, allocationUsd, reason = "buy",
   };
 
   trade.trade_id = buildTradeId(trade, context);
+  // Additive field for per-settings-version evaluation (scripts/settingsLedger.js).
+  const buySettingsHash = computeSettingsHashSafe(portfolio?.settings);
+  if (buySettingsHash) trade.settings_hash = buySettingsHash;
   if (options.paperTradeTicket) {
     trade.paper_trade_ticket = deepClone(options.paperTradeTicket);
   }
@@ -9672,6 +9690,36 @@ function evaluateBuyActions(portfolio, approved) {
   }
 
   return actions;
+}
+
+// Splits formatted scout candidates into LLM batches. The legacy scout prompt carries ~47-72k chars of
+// fixed context (theses, CoinGecko, signals, token universe) and is re-sent with every batch. Once that
+// fixed part exceeded the 50k "safe" budget the old code fell to a 3,000-char floor: ~1 candidate per
+// batch, 50-86 sequential ~90s LLM calls per cycle (1.5-2h of the shared GPU, starving the maps and story
+// windows). minBudget keeps batches meaningfully sized; maxBatches bounds the cycle, and since candidates
+// arrive best-first the dropped tail is the weakest.
+function planScoutBatches(formattedCandidates, { safePromptChars, fixedChars, minBudgetChars, maxBatches }) {
+  const availableForCandidates = Math.max(safePromptChars - fixedChars, minBudgetChars);
+  const batches = [];
+  let batch = [];
+  let batchChars = 0;
+  for (const fc of formattedCandidates) {
+    if (batchChars + fc.length + 1 > availableForCandidates && batch.length > 0) {
+      batches.push(batch);
+      batch = [];
+      batchChars = 0;
+    }
+    batch.push(fc);
+    batchChars += fc.length + 1;
+  }
+  if (batch.length > 0) batches.push(batch);
+
+  const totalBatches = batches.length;
+  let droppedCandidates = 0;
+  if (Number.isFinite(maxBatches) && maxBatches > 0 && batches.length > maxBatches) {
+    for (const dropped of batches.splice(maxBatches)) droppedCandidates += dropped.length;
+  }
+  return { batches, availableForCandidates, totalBatches, droppedCandidates };
 }
 
 function buildTrendSleeveCandidate(vehicle, priceUsd) {
@@ -10628,6 +10676,7 @@ async function runCycle(runContext = {}) {
   _cycleAvailableStoryTypes = null;
   _lastCognitiveState = null;
   _cycleScoutToolCalls = [];
+  _cycleSnapshotUniverse = null;
 
   const portfolio = loadPortfolio();
   const activeMandate = getActiveCapitalMandate();
@@ -10761,6 +10810,8 @@ async function runCycle(runContext = {}) {
     // 1. SCOUT — pre-fetch E3D data, then call LLM directly (no tool loop needed)
     const scoutPayload = runScoutDirect(portfolio, portfolioIntelligence);
     validateScoutPayload(scoutPayload);
+    // Evaluation-only shallow copies of the candidate lists (array copy, no object mutation).
+    const snapshotProposedCandidates = captureCandidateList(scoutPayload.candidates);
     scoutPayload.candidates = applyMandateScoutBias(filterScoutCandidatesForDesk(
       filterScoutCandidatesAgainstPortfolio(scoutPayload.candidates || [], portfolio),
       portfolio
@@ -10882,6 +10933,7 @@ async function runCycle(runContext = {}) {
     // 5. RISK ON CANDIDATES
     // Cross-source price validation first: reject any candidate whose e3d price can't be corroborated
     // by an independent feed (guards against the e3d mispricing that caused the SATA incident).
+    const snapshotDeskKeptCandidates = captureCandidateList(scoutPayload.candidates);
     scoutPayload.candidates = validateCandidatePricesAgainstSources(scoutPayload.candidates || [], portfolio);
     const scoutHash = sha256(scoutPayload);
     const { approved, rejected } = runRiskForCandidates(scoutPayload.candidates || [], portfolio);
@@ -11099,6 +11151,31 @@ async function runCycle(runContext = {}) {
       rejected_count: rejected.length,
       portfolio_intelligence: portfolioIntelligence.prompt_snapshot
     });
+
+    // Evaluation-only point-in-time candidate snapshot (logs/candidate-snapshots.jsonl).
+    // Reads cycle state after all decisions are final; recordCycleCandidateSnapshots
+    // never throws, and the extra try/catch keeps any surprise away from the cycle.
+    try {
+      const snapshotStatus = recordCycleCandidateSnapshots({
+        ts: nowIso(),
+        cycleId: trainingContext.cycle_id,
+        pipelineRunId: trainingContext.pipeline_run_id,
+        cycleIndex: trainingContext.cycle_index,
+        regime: trainingContext.market_regime,
+        settings: portfolio.settings,
+        ethPriceUsd: _cycleQuantContext?.macro?.eth?.price ?? _cycleQuantContext?.macro?.eth_trend?.price ?? null,
+        universe: _cycleSnapshotUniverse,
+        proposed: snapshotProposedCandidates,
+        deskKept: snapshotDeskKeptCandidates,
+        rejected,
+        approved,
+        buyTrades,
+        rotationResults
+      });
+      if (!snapshotStatus.ok) log("candidate_snapshot_error", { message: snapshotStatus.error });
+    } catch (snapshotErr) {
+      try { log("candidate_snapshot_error", { message: String(snapshotErr?.message || snapshotErr).slice(0, 200) }); } catch { /* never affect the cycle */ }
+    }
 
     const cycleEndTs = nowIso();
     try {
@@ -11396,6 +11473,7 @@ export {
   evaluateRotationBuyFeasibility,
   evaluateRotationGuard,
   advanceTrendSleevePersistence,
+  planScoutBatches,
   resolveRotationAllocationUsd,
   evaluateSellActions,
   executeSell,
