@@ -35,7 +35,7 @@ const SAFE_OFFLINE = [
   "verifyScoutMapsRoute.js", "verifyScoutRelaxation.js", "verifyTokenRiskScanner.js",
   "verifyTradeEvidence.js", "verifyTrendSleevePersistence.js",
   // Evaluation foundation (synthetic fixtures only; no logs, no network).
-  "verifyCandidateSnapshots.js", "verifySettingsHash.js", "verifyBaselineCompare.js"
+  "verifyCandidateSnapshots.js", "verifySettingsHash.js", "verifyBaselineCompare.js", "verifyBackfillSnapshots.js"
 ];
 
 const SKIPPED = {

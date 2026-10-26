@@ -24,13 +24,18 @@
 // Usage:
 //   node scripts/baselineCompare.js [--from=ISO] [--to=ISO] [--seed=42] [--draws=1000]
 //        [--universe=gate|all] [--include-trend-sleeve] [--json]
+//        [--include-backfilled] [--backfilled-snapshots=PATH] [--backfilled-ledger=PATH]
+//        [--drop-price-spikes[=10]]
+//   --include-backfilled also reads the snapshots rebuilt from history by
+//   scripts/backfillSnapshots.js (provenance "backfilled"); the report labels how much
+//   of each baseline came from backfilled cycles. Run with and without it to compare.
 //   node scripts/baselineCompare.js --fixture=null|edge [--seed=..]   (synthetic data, no logs read)
 import path from "path";
 import { fileURLToPath } from "url";
 import { ETH_SLEEVE_EXECUTION, netRoundTripReturn, resolveExitRules } from "./evalCostModel.js";
 import {
-  DEFAULT_FILES, WETH_ADDRESS, buildClosedPositions, loadSettingsLedger, loadSnapshots,
-  loadTrainingEvents, parseArgs, toMs, utcDay
+  DEFAULT_FILES, WETH_ADDRESS, backfillOptionsFromArgs, buildClosedPositions, isBackfilled,
+  loadSettingsLedgerWithBackfill, loadSnapshotsWithBackfill, loadTrainingEvents, parseArgs, toMs, utcDay
 } from "./evalData.js";
 import { bootstrapDiffCi, bootstrapMeanCi, createRng, mean, median, percentileCi, randInt } from "./evalStats.js";
 
@@ -46,43 +51,82 @@ function round(value, digits = 6) {
   return Math.round(value * f) / f;
 }
 
-function insertPoint(series, address, ms, price, liquidity) {
+function insertPoint(series, address, ms, price, liquidity, backfilled = false) {
   if (!address || ms == null || !(price > 0)) return;
   if (!series.has(address)) series.set(address, []);
-  series.get(address).push({ ms, price, liquidity: Number.isFinite(liquidity) ? liquidity : null });
+  series.get(address).push({ ms, price, liquidity: Number.isFinite(liquidity) ? liquidity : null, backfilled });
 }
 
-export function buildMarketIndex(snapshotRecords = []) {
+// Bad-tick filter (opt-in, --drop-price-spikes[=RATIO], default ratio 10): a point whose
+// price is more than RATIO times above (or below) BOTH neighbours in its token's series
+// is dropped as a unit/feed error, and a candidate priced at a dropped point is not used
+// as an entry. Off by default; history mixes price feeds with occasional unit glitches.
+// The first and last points are judged against their two nearest points, which must
+// agree with each other within RATIO.
+export function dropPriceSpikes(points, ratio) {
+  if (!(ratio > 1) || points.length < 3) return { kept: points, dropped: [] };
+  const off = (p, q) => p / q > ratio || q / p > ratio;
+  const spikeVs = (p, a, b) => (p / a > ratio && p / b > ratio) || (a / p > ratio && b / p > ratio);
+  const dropped = [];
+  const kept = [];
+  const n = points.length;
+  if (!off(points[1].price, points[2].price) && spikeVs(points[0].price, points[1].price, points[2].price)) dropped.push(points[0]);
+  else kept.push(points[0]);
+  for (let i = 1; i < n - 1; i += 1) {
+    const prev = kept.length ? kept[kept.length - 1].price : points[i - 1].price;
+    if (spikeVs(points[i].price, prev, points[i + 1].price)) dropped.push(points[i]); else kept.push(points[i]);
+  }
+  const last = points[n - 1];
+  const k = kept.length;
+  if (k >= 2 && !off(kept[k - 1].price, kept[k - 2].price) && spikeVs(last.price, kept[k - 1].price, kept[k - 2].price)) dropped.push(last);
+  else kept.push(last);
+  return { kept, dropped };
+}
+
+export function buildMarketIndex(snapshotRecords = [], options = {}) {
   const cycles = new Map();
   const series = new Map();
   for (const r of snapshotRecords) {
     const ms = toMs(r?.ts);
     if (ms == null || !r?.cycle_id) continue;
-    if (!cycles.has(r.cycle_id)) cycles.set(r.cycle_id, { cycle_id: r.cycle_id, ms, candidates: [], settings_hash: r.settings_hash || null });
+    if (!cycles.has(r.cycle_id)) cycles.set(r.cycle_id, { cycle_id: r.cycle_id, ms, candidates: [], settings_hash: r.settings_hash || null, backfilled: isBackfilled(r) });
     const cycle = cycles.get(r.cycle_id);
+    if (!isBackfilled(r)) cycle.backfilled = false;
     cycle.ms = Math.min(cycle.ms, ms);
     if (r.record_type === "cycle") {
-      insertPoint(series, WETH_ADDRESS, ms, Number(r.eth_price_usd), null);
+      insertPoint(series, WETH_ADDRESS, ms, Number(r.eth_price_usd), null, isBackfilled(r));
     } else if (r.record_type === "candidate") {
       const address = String(r.token_address || "").toLowerCase();
       const price = Number(r.price_usd);
       if (address && price > 0) {
-        cycle.candidates.push({ address, symbol: r.symbol, stage: r.stage, price, liquidity: Number(r.liquidity_usd), slippage: r.slippage_bps });
-        insertPoint(series, address, ms, price, Number(r.liquidity_usd));
+        cycle.candidates.push({ address, symbol: r.symbol, stage: r.stage, price, liquidity: Number(r.liquidity_usd), slippage: r.slippage_bps, ms });
+        insertPoint(series, address, ms, price, Number(r.liquidity_usd), isBackfilled(r));
       }
     } else if (r.record_type === "price_marks" && Array.isArray(r.marks)) {
       for (const mark of r.marks) {
-        if (Array.isArray(mark)) insertPoint(series, String(mark[0] || "").toLowerCase(), ms, Number(mark[1]), Number(mark[2]));
+        if (Array.isArray(mark)) insertPoint(series, String(mark[0] || "").toLowerCase(), ms, Number(mark[1]), Number(mark[2]), isBackfilled(r));
       }
     }
   }
+  const spikes = { ratio: options.spikeRatio > 1 ? options.spikeRatio : null, points_dropped: 0, candidates_dropped: 0 };
+  const spikeKeys = new Set();
   for (const [address, points] of series) {
     points.sort((a, b) => a.ms - b.ms);
     const deduped = points.filter((p, i) => i === 0 || p.ms !== points[i - 1].ms);
-    series.set(address, deduped);
+    const { kept, dropped } = dropPriceSpikes(deduped, spikes.ratio);
+    for (const p of dropped) spikeKeys.add(`${address}|${p.ms}|${p.price}`);
+    spikes.points_dropped += dropped.length;
+    series.set(address, kept);
+  }
+  if (spikeKeys.size) {
+    for (const cycle of cycles.values()) {
+      const before = cycle.candidates.length;
+      cycle.candidates = cycle.candidates.filter((c) => !spikeKeys.has(`${c.address}|${c.ms}|${c.price}`));
+      spikes.candidates_dropped += before - cycle.candidates.length;
+    }
   }
   const cycleList = [...cycles.values()].sort((a, b) => a.ms - b.ms);
-  return { cycles, cycleList, series };
+  return { cycles, cycleList, series, spikes };
 }
 
 function firstIndexAfter(points, ms) {
@@ -187,7 +231,7 @@ export function compareBaselines({ snapshotRecords = [], closedPositions = [], s
 
   const settingsByHash = new Map();
   for (const r of settingsLedgerRecords) if (r?.settings_hash && r.settings) settingsByHash.set(r.settings_hash, r.settings);
-  const market = buildMarketIndex(snapshotRecords);
+  const market = buildMarketIndex(snapshotRecords, { spikeRatio: options.dropPriceSpikes });
   const ethPoints = market.series.get(WETH_ADDRESS) || [];
 
   const systemTrades = closedPositions
@@ -195,9 +239,15 @@ export function compareBaselines({ snapshotRecords = [], closedPositions = [], s
     .filter((t) => options.includeTrendSleeve || String(t.contract_address || "").toLowerCase() !== WETH_ADDRESS);
 
   const report = {
-    generated_with: { seed: String(seed), draws, universe: universeMode, price_tolerance_hours: toleranceMs / HOUR_MS, min_entries: minEntries, min_distinct_days: minDays },
+    generated_with: { seed: String(seed), draws, universe: universeMode, drop_price_spikes: market.spikes.ratio, price_tolerance_hours: toleranceMs / HOUR_MS, min_entries: minEntries, min_distinct_days: minDays },
     window: { from: Number.isFinite(fromMs) ? new Date(fromMs).toISOString() : null, to: Number.isFinite(toMsValue) ? new Date(toMsValue).toISOString() : null },
-    inputs: { snapshot_cycles: market.cycleList.length, priced_tokens: market.series.size, eth_price_points: ethPoints.length, closed_positions_in_window: systemTrades.length, settings_versions_known: settingsByHash.size },
+    inputs: {
+      snapshot_cycles: market.cycleList.length,
+      backfilled_snapshot_cycles: market.cycleList.filter((c) => c.backfilled).length,
+      priced_tokens: market.series.size, eth_price_points: ethPoints.length,
+      price_spike_filter: market.spikes, closed_positions_in_window: systemTrades.length, settings_versions_known: settingsByHash.size
+    },
+    data_provenance: market.cycleList.some((c) => c.backfilled) ? (market.cycleList.some((c) => !c.backfilled) ? "live+backfilled" : "backfilled") : "live",
     exit_rule_note: "Baselines use a simplified exit rule (fixed stop, first-target partial, time exit). The system's own trades use their real exits.",
     system: null,
     baselines: {}
@@ -225,7 +275,7 @@ export function compareBaselines({ snapshotRecords = [], closedPositions = [], s
         legs: [{ fraction: 1, price: b.price, liquidityUsd: ETH_SLEEVE_EXECUTION.liquidity_usd }],
         feeBps: rulesForHash(t.entry_settings_hash, settingsByHash).fee_bps_per_side
       });
-      if (eth != null) paired.push({ trade: t, sys: t.net_return, base: eth });
+      if (eth != null) paired.push({ trade: t, sys: t.net_return, base: eth, backfilled: Boolean(a.backfilled || b.backfilled) });
     }
     const diffs = paired.map((p) => p.sys - p.base);
     const stats = {
@@ -245,6 +295,7 @@ export function compareBaselines({ snapshotRecords = [], closedPositions = [], s
       ...stats,
       window_buy_and_hold_net_return: round(windowHold),
       unpaired_trades: systemTrades.length - paired.length,
+      backfilled_pairs: paired.filter((p) => p.backfilled).length,
       ...verdictFor(stats, minEntries, minDays)
     };
   }
@@ -286,7 +337,7 @@ export function compareBaselines({ snapshotRecords = [], closedPositions = [], s
           const r = simulateCandidate(cycle, cand, holdMs);
           if (r == null) continue;
           ewReturns.push(r);
-          ewEntries.push({ entry_ms: cycle.ms, contract_address: cand.address });
+          ewEntries.push({ entry_ms: cycle.ms, contract_address: cand.address, backfilled: cycle.backfilled });
         }
       }
     }
@@ -298,6 +349,7 @@ export function compareBaselines({ snapshotRecords = [], closedPositions = [], s
       baseline_entries: ewStats.n,
       baseline_distinct_days: ewStats.distinct_days,
       baseline_distinct_tokens: ewStats.distinct_tokens,
+      baseline_backfilled_entries: ewEntries.filter((e) => e.backfilled).length,
       hold_hours: round((holdMs ?? NaN) / HOUR_MS, 2),
       system_mean_net_return: round(mean(sysReturns)),
       baseline_mean_net_return: round(mean(ewReturns)),
@@ -332,7 +384,7 @@ export function compareBaselines({ snapshotRecords = [], closedPositions = [], s
         if (r != null) values.push(r);
       }
       if (!values.length) { noPriceable += 1; continue; }
-      comparable.push({ trade: t, sys: t.net_return, values, expected: mean(values) });
+      comparable.push({ trade: t, sys: t.net_return, values, expected: mean(values), backfilled: cycle.backfilled });
     }
     const rng = createRng(`${seed}:random`);
     const n = comparable.length;
@@ -361,6 +413,7 @@ export function compareBaselines({ snapshotRecords = [], closedPositions = [], s
       excess_ci95: diffSamples.length ? percentileCi(diffSamples).map((v) => round(v)) : [null, null],
       p_value_one_sided: drawMeans.length ? round(drawMeans.filter((m) => m >= sysMean).length / drawMeans.length, 4) : null,
       unpaired_trades: unpairedCycle,
+      backfilled_cycle_pairs: comparable.filter((c) => c.backfilled).length,
       trades_without_priceable_universe: noPriceable
     };
     report.baselines.random_entry = {
@@ -385,8 +438,14 @@ export function formatReport(report) {
   const lines = [];
   lines.push("BASELINE COMPARISON (net of paper cost model; returns are per entry, equal notional)");
   lines.push(`window: ${report.window.from || "start"} -> ${report.window.to || "end"}   seed=${report.generated_with.seed} draws=${report.generated_with.draws} universe=${report.generated_with.universe}`);
+  if (report.data_provenance !== "live") {
+    lines.push(`DATA: ${report.data_provenance} (${report.inputs.backfilled_snapshot_cycles} of ${report.inputs.snapshot_cycles} snapshot cycles rebuilt from history by backfillSnapshots.js; point-in-time fields only, scout universe not captured)`);
+  }
   lines.push(`inputs: ${report.inputs.snapshot_cycles} snapshot cycles, ${report.inputs.priced_tokens} priced tokens, ${report.inputs.eth_price_points} ETH points, ${report.inputs.closed_positions_in_window} closed positions, ${report.inputs.settings_versions_known} settings versions`);
   const s = report.system;
+  if (report.inputs.price_spike_filter?.ratio) {
+    lines.push(`price spike filter: ratio ${report.inputs.price_spike_filter.ratio}x, ${report.inputs.price_spike_filter.points_dropped} price points and ${report.inputs.price_spike_filter.candidates_dropped} candidate entries dropped`);
+  }
   lines.push(`(d) system: n=${s.n} days=${s.distinct_days} tokens=${s.distinct_tokens} mean=${fmtPct(s.mean_net_return)} CI95=${fmtCi(s.mean_net_return_ci95)} median hold=${s.median_holding_hours == null ? "n/a" : `${s.median_holding_hours}h`}`);
   const labels = { buy_and_hold_eth: "(a) buy-and-hold ETH", equal_weight_approved: "(b) equal-weight approved", random_entry: "(c) random entry" };
   for (const [key, label] of Object.entries(labels)) {
@@ -396,6 +455,10 @@ export function formatReport(report) {
     lines.push(`${label}: n=${b.n} days=${b.distinct_days} tokens=${b.distinct_tokens} baseline mean=${fmtPct(base)} excess=${fmtPct(b.excess_mean)} CI95=${fmtCi(b.excess_ci95)}${b.p_value_one_sided != null ? ` p=${b.p_value_one_sided}` : ""}`);
     if (b.window_buy_and_hold_net_return !== undefined) lines.push(`    window buy-and-hold ETH (net): ${fmtPct(b.window_buy_and_hold_net_return)}`);
     if (b.baseline_entries !== undefined) lines.push(`    baseline entries=${b.baseline_entries} days=${b.baseline_distinct_days} tokens=${b.baseline_distinct_tokens} hold=${b.hold_hours == null ? "n/a" : `${b.hold_hours}h`}`);
+    if (report.data_provenance !== "live") {
+      const bf = b.backfilled_pairs ?? b.baseline_backfilled_entries ?? b.backfilled_cycle_pairs;
+      if (bf !== undefined) lines.push(`    from backfilled cycles: ${bf}${b.unpaired_trades !== undefined ? `; unpaired trades: ${b.unpaired_trades}` : ""}${b.trades_without_priceable_universe !== undefined ? `; trades without a priceable universe: ${b.trades_without_priceable_universe}` : ""}`);
+    }
     if (b.verdict === "INSUFFICIENT DATA" && b.shortfall) {
       const sf = b.shortfall;
       lines.push(`    verdict: INSUFFICIENT DATA${sf.reason ? ` (${sf.reason})` : ` (entries ${sf.entries_have}/${sf.entries_needed}, short ${sf.entries_short}; distinct days ${sf.days_have}/${sf.days_needed}, short ${sf.days_short})`}`);
@@ -407,11 +470,12 @@ export function formatReport(report) {
   return lines.join("\n");
 }
 
-export async function loadRealInputs(files = DEFAULT_FILES) {
+export async function loadRealInputs(files = DEFAULT_FILES, backfill = { include: false }) {
   const [snap, ledger, events] = await Promise.all([
-    loadSnapshots(files.snapshots), loadSettingsLedger(files.settingsLedger), loadTrainingEvents(files.trainingEvents)
+    loadSnapshotsWithBackfill(backfill, files.snapshots), loadSettingsLedgerWithBackfill(backfill, files.settingsLedger), loadTrainingEvents(files.trainingEvents)
   ]);
   return {
+    snapshotProvenance: snap.provenance,
     snapshotRecords: snap.records,
     settingsLedgerRecords: ledger.records,
     closedPositions: buildClosedPositions(events.tradeEvents),
@@ -429,12 +493,15 @@ async function main() {
     inputs = { snapshotRecords: fixture.snapshotRecords, settingsLedgerRecords: fixture.settingsLedgerRecords, closedPositions: buildClosedPositions(fixture.tradeEvents) };
     console.log(`(synthetic fixture: ${args.fixture === "edge" ? "planted edge" : "edge-free"}; no logs read)`);
   } else {
-    inputs = await loadRealInputs();
-    if (!inputs.fileStats.snapshots.exists) console.log("note: logs/candidate-snapshots.jsonl not found; (b) and (c) need snapshot data. Try --fixture=null or --fixture=edge for a demo.");
+    const backfill = backfillOptionsFromArgs(args);
+    inputs = await loadRealInputs(DEFAULT_FILES, backfill);
+    if (!inputs.fileStats.snapshots.exists) console.log("note: logs/candidate-snapshots.jsonl not found; (b) and (c) need snapshot data. Try --fixture=null or --fixture=edge for a demo, or backfill history (scripts/backfillSnapshots.js) and pass --include-backfilled.");
+    if (backfill.include && !inputs.snapshotProvenance.backfilled_file_found) console.log(`note: --include-backfilled but ${backfill.snapshots} not found; run scripts/backfillSnapshots.js first.`);
   }
   const report = compareBaselines(inputs, {
     seed: args.seed ?? 42, draws: args.draws ? Number(args.draws) : 1000, from: args.from, to: args.to,
-    universe: args.universe, includeTrendSleeve: Boolean(args["include-trend-sleeve"])
+    universe: args.universe, includeTrendSleeve: Boolean(args["include-trend-sleeve"]),
+    dropPriceSpikes: args["drop-price-spikes"] === true ? 10 : (args["drop-price-spikes"] ? Number(args["drop-price-spikes"]) : null)
   });
   console.log(args.json ? JSON.stringify(report, null, 2) : formatReport(report));
 }
