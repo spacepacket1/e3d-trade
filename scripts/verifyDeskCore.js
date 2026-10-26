@@ -11,7 +11,7 @@ import {
 import { buildBookRegimeFromTrends } from "../marketData.js";
 import { SCOUT_FLOW_ONLY_PER_CYCLE_LIMIT } from "./evidencePackets.js";
 
-assert.equal(SCOUT_FLOW_ONLY_PER_CYCLE_LIMIT, 0);
+assert.equal(SCOUT_FLOW_ONLY_PER_CYCLE_LIMIT, 1);
 assert.equal(SETTINGS_DEFAULTS.risk_r_pct, 0.02);
 assert.equal(SETTINGS_DEFAULTS.trend_sleeve_enabled, true);
 assert.equal(SETTINGS_DEFAULTS.max_thesis_positions, 6);
