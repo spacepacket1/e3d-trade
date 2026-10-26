@@ -15,5 +15,4 @@ Not run by the runner: `verifyLiveExecutorFork.js` and `verifyLivePipelineFork.j
 
 ## Known issues (owner to decide, not changed here)
 - Tracked `.claude/settings.json` sets `permissions.defaultMode` to `bypassPermissions`, so agent sessions in this repo skip permission prompts.
-- `node_modules/` is committed to git.
 - Some verify scripts fail on main today (see PR for the list).
