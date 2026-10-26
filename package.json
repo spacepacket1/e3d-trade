@@ -4,6 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "verify:all": "node scripts/run-verify.js",
     "start": "node pipeline.js",
     "loop": "node pipeline.js --loop",
     "dashboard": "node server.js",
