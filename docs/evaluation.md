@@ -82,3 +82,60 @@ A tuning change (a PR that changes a setting, gate threshold or exit rule) must:
 3. **Clear the data bar**: at least 100 entries over at least 30 distinct days under the
    new hash, with a 95% interval that excludes 0. Until then the change is
    unvalidated, however good one incident looks.
+
+## Running on history (backfill)
+
+The snapshot hook only records cycles from the day it was deployed. To evaluate the
+months before that, rebuild snapshots from `logs/training-events.jsonl`:
+
+```
+npm run eval:backfill            # writes logs/candidate-snapshots.backfilled.jsonl
+                                 # and logs/settings-ledger.backfilled.jsonl
+npm run eval:baselines -- --include-backfilled --drop-price-spikes
+npm run eval:settings  -- --include-backfilled
+npm run eval:snapshots -- --include-backfilled
+```
+
+`scripts/backfillSnapshots.js` streams the training events (read-only) and writes new
+files; it refuses to overwrite an existing output without `--force` and refuses to
+write over its input or the live snapshot files. Use `--input=`, `--out=` and
+`--ledger-out=` to work on a copy elsewhere, and `--backfilled-snapshots=PATH` /
+`--backfilled-ledger=PATH` to point the tools at it. Every record it writes has
+`provenance: "backfilled"`; the tools only read these files when asked, label the
+output (`DATA: backfilled` / `live+backfilled`, `[backfilled]` versions, a separate
+`BACKFILLED` completeness section) and prefer live records for any cycle that has both.
+Run each tool with and without the flag to see what the backfill adds.
+
+What the backfill can and cannot rebuild:
+
+| Snapshot content | Source in history | Backfilled? |
+| --- | --- | --- |
+| cycle time, regime | `cycle_start` | yes |
+| settings hash | `cycle_start.payload.settings` | partly: `bf1:` hash of the logged portfolio overrides, not the effective defaults merge |
+| ETH price | WETH price mark in the same cycle | only in cycles that held WETH; otherwise null |
+| gate_rejected / risk_vetoed / approved | `risk_decision` (buy proposals) | yes, with the proposal's confidence, evidence count, fragility |
+| bought | `trade` buy legs | yes |
+| price, liquidity, mcap, volume, slippage, fraud | `candidate` and `risk_decision` | yes where logged, null otherwise |
+| desk-kept but no risk decision | `candidate` only | stage `price_rejected`, reason `backfill_no_risk_decision` |
+| universe_blocked / ranked_out / shortlisted / desk_filtered | not in training events | no |
+| price marks | held positions and market-trend lists in `cycle_start` / `cycle_end` | yes (trade fill prices are not used) |
+
+Caveats when reading results on backfilled history:
+
+- **Random entry has little power**: the backfilled gated universe is only the
+  candidates that reached the risk reviewer (often one or two per cycle, frequently the
+  one that was bought), so (c) mostly compares the system's real exits with the
+  simplified exit rule on the same tokens.
+- **Survivorship**: candidates are priced later only when the token shows up again
+  (held, re-proposed or in a trend list). Tokens that vanished are unpriceable and drop
+  out of (b) and (c), which flatters the baselines.
+- **Price glitches**: history mixes price feeds and has occasional unit errors (orders
+  of magnitude). `--drop-price-spikes[=10]` drops isolated points more than 10x away
+  from both neighbours; check results with and without it.
+- **ETH** is only priced while the desk held WETH, so (a) is usually short of data.
+- **Settings churn**: `bf1:` versions only see the logged overrides; code-default
+  changes in `pipeline.js` (see `git log -L '/const SETTINGS_DEFAULTS = {/,/^};/:pipeline.js'`)
+  are invisible to them. Split by date with `--from` / `--to` around known changes.
+- **Paper-fill model**: historical trades carry the PnL of the fill model active at
+  the time (the liquidity-scaled sell slippage with a 400 bps unknown-liquidity default
+  arrived on 2026-09-29), while baselines use the current model.

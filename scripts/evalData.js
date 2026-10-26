@@ -11,7 +11,10 @@ export const ROOT = path.resolve(__dirname, "..");
 export const DEFAULT_FILES = {
   snapshots: path.join(ROOT, "logs", "candidate-snapshots.jsonl"),
   settingsLedger: path.join(ROOT, "logs", "settings-ledger.jsonl"),
-  trainingEvents: path.join(ROOT, "logs", "training-events.jsonl")
+  trainingEvents: path.join(ROOT, "logs", "training-events.jsonl"),
+  // Written by scripts/backfillSnapshots.js; only read with --include-backfilled.
+  backfilledSnapshots: path.join(ROOT, "logs", "candidate-snapshots.backfilled.jsonl"),
+  backfilledSettingsLedger: path.join(ROOT, "logs", "settings-ledger.backfilled.jsonl")
 };
 export const WETH_ADDRESS = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2";
 
@@ -58,6 +61,64 @@ export async function loadSnapshots(filePath = DEFAULT_FILES.snapshots) {
   const records = [];
   const stats = await streamJsonl(filePath, (r) => { if (r && r.record_type) records.push(r); });
   return { records, stats };
+}
+
+export function isBackfilled(record) {
+  return record?.provenance === "backfilled";
+}
+
+// Live snapshots plus (optionally) backfilled ones. A backfilled cycle whose cycle_id
+// also has live records is dropped, so live data always wins. Every backfilled record
+// keeps provenance: "backfilled"; live records are returned unchanged.
+export function mergeSnapshotSources(liveRecords = [], backfilledRecords = []) {
+  const liveCycles = new Set(liveRecords.map((r) => r?.cycle_id).filter(Boolean));
+  const kept = [];
+  let droppedOverlap = 0;
+  for (const r of backfilledRecords) {
+    if (!isBackfilled(r)) continue;
+    if (r.cycle_id && liveCycles.has(r.cycle_id)) { droppedOverlap += 1; continue; }
+    kept.push(r);
+  }
+  return {
+    records: [...liveRecords, ...kept],
+    provenance: {
+      live_records: liveRecords.length,
+      backfilled_records: kept.length,
+      backfilled_dropped_overlapping_live: droppedOverlap,
+      live_cycles: liveCycles.size,
+      backfilled_cycles: new Set(kept.map((r) => r.cycle_id).filter(Boolean)).size
+    }
+  };
+}
+
+// Options from the CLI: --include-backfilled uses the default backfilled files;
+// --backfilled-snapshots=PATH / --backfilled-ledger=PATH override them (and imply it).
+export function backfillOptionsFromArgs(args = {}) {
+  const include = Boolean(args["include-backfilled"] || args["backfilled-snapshots"] || args["backfilled-ledger"]);
+  return {
+    include,
+    snapshots: typeof args["backfilled-snapshots"] === "string" ? args["backfilled-snapshots"] : DEFAULT_FILES.backfilledSnapshots,
+    settingsLedger: typeof args["backfilled-ledger"] === "string" ? args["backfilled-ledger"] : DEFAULT_FILES.backfilledSettingsLedger
+  };
+}
+
+// Load live snapshots and, when backfill.include, the backfilled ones (merged).
+export async function loadSnapshotsWithBackfill(backfill = { include: false }, livePath = DEFAULT_FILES.snapshots) {
+  const live = await loadSnapshots(livePath);
+  if (!backfill?.include) {
+    return { records: live.records, stats: live.stats, backfilledStats: null, provenance: { live_records: live.records.length, backfilled_records: 0, backfilled_included: false } };
+  }
+  const bf = await loadSnapshots(backfill.snapshots);
+  const merged = mergeSnapshotSources(live.records, bf.records);
+  return { records: merged.records, stats: live.stats, backfilledStats: bf.stats, provenance: { ...merged.provenance, backfilled_included: true, backfilled_file_found: bf.stats.exists } };
+}
+
+export async function loadSettingsLedgerWithBackfill(backfill = { include: false }, livePath = DEFAULT_FILES.settingsLedger) {
+  const live = await loadSettingsLedger(livePath);
+  if (!backfill?.include) return live;
+  const bf = await loadSettingsLedger(backfill.settingsLedger);
+  const known = new Set(live.records.map((r) => r.settings_hash));
+  return { records: [...live.records, ...bf.records.filter((r) => isBackfilled(r) && !known.has(r.settings_hash))], stats: live.stats, backfilledStats: bf.stats };
 }
 
 export async function loadSettingsLedger(filePath = DEFAULT_FILES.settingsLedger) {

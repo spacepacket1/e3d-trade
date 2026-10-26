@@ -15,6 +15,7 @@
     "eval:baselines": "node scripts/baselineCompare.js",
     "eval:snapshots": "node scripts/snapshotCompleteness.js",
     "eval:settings": "node scripts/settingsLedger.js",
+    "eval:backfill": "node scripts/backfillSnapshots.js",
     "jev:gate": "node scripts/jevRecurringGate.js",
     "jev:verify": "node scripts/verifyJevRecurringGate.js",
     "jev:cadence": "node scripts/jevCycleCadenceGate.js",
