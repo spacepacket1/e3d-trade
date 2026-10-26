@@ -36,6 +36,12 @@ import {
   buildMandateTrace,
   getActiveCapitalMandate
 } from "./scripts/capitalMandates.js";
+import {
+  captureCandidateList,
+  captureScoutUniverse,
+  recordCycleCandidateSnapshots
+} from "./scripts/candidateSnapshots.js";
+import { computeSettingsHashSafe } from "./scripts/settingsHash.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -2942,6 +2948,9 @@ let _cycleActiveCapitalMandateTrace = null;
 // Story types actually returned by the E3D API this cycle — used to make coverage scoring fair.
 // Coverage only grades against types that were present in the data, not the full expected list.
 let _cycleAvailableStoryTypes = null;
+// Evaluation-only: summary of the scout evidence shortlist + token universe prices for
+// logs/candidate-snapshots.jsonl. Never read by any trading decision.
+let _cycleSnapshotUniverse = null;
 
 function getOrFetchCycleMarketContext() {
   if (_cycleMarketContext) return _cycleMarketContext;
@@ -5924,6 +5933,8 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
     for (const blocked of shortlistBuild.blocked) {
       log("scout_shortlist_blocked", blocked);
     }
+    // Evaluation-only read of the shortlist build; captureScoutUniverse never throws.
+    _cycleSnapshotUniverse = captureScoutUniverse(shortlistBuild, data?.tokenUniverse);
     for (const packetError of shortlistBuild.packet_errors) {
       log("scout_evidence_packet_error", packetError);
     }
@@ -8669,6 +8680,9 @@ async function executeSell(portfolio, action) {
   };
 
   trade.trade_id = buildTradeId(trade, getTrainingContext());
+  // Additive field for per-settings-version evaluation (scripts/settingsLedger.js).
+  const sellSettingsHash = computeSettingsHashSafe(portfolio?.settings);
+  if (sellSettingsHash) trade.settings_hash = sellSettingsHash;
   applyEvidenceMetadata(trade, action);
   const sellTokenRiskScan = buildPositionTokenRiskScan(pos, portfolio, {
     evaluated_at: trade.ts,
@@ -9559,6 +9573,9 @@ async function openPosition(portfolio, candidate, allocationUsd, reason = "buy",
   };
 
   trade.trade_id = buildTradeId(trade, context);
+  // Additive field for per-settings-version evaluation (scripts/settingsLedger.js).
+  const buySettingsHash = computeSettingsHashSafe(portfolio?.settings);
+  if (buySettingsHash) trade.settings_hash = buySettingsHash;
   if (options.paperTradeTicket) {
     trade.paper_trade_ticket = deepClone(options.paperTradeTicket);
   }
@@ -10615,6 +10632,7 @@ async function runCycle(runContext = {}) {
   _cycleAvailableStoryTypes = null;
   _lastCognitiveState = null;
   _cycleScoutToolCalls = [];
+  _cycleSnapshotUniverse = null;
 
   const portfolio = loadPortfolio();
   const activeMandate = getActiveCapitalMandate();
@@ -10748,6 +10766,8 @@ async function runCycle(runContext = {}) {
     // 1. SCOUT — pre-fetch E3D data, then call LLM directly (no tool loop needed)
     const scoutPayload = runScoutDirect(portfolio, portfolioIntelligence);
     validateScoutPayload(scoutPayload);
+    // Evaluation-only shallow copies of the candidate lists (array copy, no object mutation).
+    const snapshotProposedCandidates = captureCandidateList(scoutPayload.candidates);
     scoutPayload.candidates = applyMandateScoutBias(filterScoutCandidatesForDesk(
       filterScoutCandidatesAgainstPortfolio(scoutPayload.candidates || [], portfolio),
       portfolio
@@ -10869,6 +10889,7 @@ async function runCycle(runContext = {}) {
     // 5. RISK ON CANDIDATES
     // Cross-source price validation first: reject any candidate whose e3d price can't be corroborated
     // by an independent feed (guards against the e3d mispricing that caused the SATA incident).
+    const snapshotDeskKeptCandidates = captureCandidateList(scoutPayload.candidates);
     scoutPayload.candidates = validateCandidatePricesAgainstSources(scoutPayload.candidates || [], portfolio);
     const scoutHash = sha256(scoutPayload);
     const { approved, rejected } = runRiskForCandidates(scoutPayload.candidates || [], portfolio);
@@ -11086,6 +11107,31 @@ async function runCycle(runContext = {}) {
       rejected_count: rejected.length,
       portfolio_intelligence: portfolioIntelligence.prompt_snapshot
     });
+
+    // Evaluation-only point-in-time candidate snapshot (logs/candidate-snapshots.jsonl).
+    // Reads cycle state after all decisions are final; recordCycleCandidateSnapshots
+    // never throws, and the extra try/catch keeps any surprise away from the cycle.
+    try {
+      const snapshotStatus = recordCycleCandidateSnapshots({
+        ts: nowIso(),
+        cycleId: trainingContext.cycle_id,
+        pipelineRunId: trainingContext.pipeline_run_id,
+        cycleIndex: trainingContext.cycle_index,
+        regime: trainingContext.market_regime,
+        settings: portfolio.settings,
+        ethPriceUsd: _cycleQuantContext?.macro?.eth?.price ?? _cycleQuantContext?.macro?.eth_trend?.price ?? null,
+        universe: _cycleSnapshotUniverse,
+        proposed: snapshotProposedCandidates,
+        deskKept: snapshotDeskKeptCandidates,
+        rejected,
+        approved,
+        buyTrades,
+        rotationResults
+      });
+      if (!snapshotStatus.ok) log("candidate_snapshot_error", { message: snapshotStatus.error });
+    } catch (snapshotErr) {
+      try { log("candidate_snapshot_error", { message: String(snapshotErr?.message || snapshotErr).slice(0, 200) }); } catch { /* never affect the cycle */ }
+    }
 
     const cycleEndTs = nowIso();
     try {
