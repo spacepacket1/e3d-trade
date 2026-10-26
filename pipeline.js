@@ -135,6 +135,7 @@ const SETTINGS_DEFAULTS = {
   max_thesis_positions: 6,
   max_position_pct: 0.12,              // 12% of equity max per position
   flow_only_max_position_pct: 0.015,   // ceiling for a newly opened flow-only position
+  max_position_liquidity_share: 0.01,  // max position notional as a share of pool liquidity (0 disables)
   risk_per_trade_pct: 0.08,            // fallback notional if ATR/R is unavailable
   risk_r_pct: 0.02,                    // 2% of equity at risk per thesis trade (1R)
   atr_stop_multiple: 2.5,
@@ -4602,6 +4603,14 @@ function cleanEvidenceList(values = []) {
     .filter(Boolean))];
 }
 
+function liquidityShareCapUsd(candidate, settings = SETTINGS_DEFAULTS) {
+  const share = toNum(settings?.max_position_liquidity_share, SETTINGS_DEFAULTS.max_position_liquidity_share);
+  const liquidityUsd = toNum(candidate?.liquidity_data?.liquidity_usd, toNum(candidate?.liquidity_usd, 0));
+  // Missing liquidity is handled by the sizing multiplier and risk checks, not by this cap.
+  if (!(share > 0) || !(liquidityUsd > 0)) return Infinity;
+  return liquidityUsd * share;
+}
+
 function hasCanonicalFlowOnlyWarning(source = {}) {
   const warnings = cleanEvidenceList([
     ...(Array.isArray(source?.evidence_warnings) ? source.evidence_warnings : []),
@@ -8917,6 +8926,7 @@ function resolveRotationAllocationUsd(postSellPortfolio, candidate, expectedNetP
     const flowOnlyMaxPct = toNum(settings.flow_only_max_position_pct, SETTINGS_DEFAULTS.flow_only_max_position_pct);
     allocationUsd = Math.min(allocationUsd, equity * Math.max(0, flowOnlyMaxPct));
   }
+  allocationUsd = Math.min(allocationUsd, liquidityShareCapUsd(candidate, settings));
 
   const category = candidate?.token?.category || "unknown";
   const remainingCategoryHeadroom =
@@ -9652,6 +9662,8 @@ function evaluateBuyActions(portfolio, approved) {
       const remainingPositionHeadroom = Math.max(0, settings.max_position_pct - existingWeightPct);
       allocationUsd = Math.min(allocationUsd, eq * remainingPositionHeadroom);
     }
+    const existingValueUsd = isAdd ? toNum(portfolio.positions[existingPositionKey]?.market_value_usd, 0) : 0;
+    allocationUsd = Math.min(allocationUsd, Math.max(0, liquidityShareCapUsd(c, settings) - existingValueUsd));
     if (allocationUsd < settings.min_trade_usd) continue;
 
     const category = c.token.category || "unknown";
