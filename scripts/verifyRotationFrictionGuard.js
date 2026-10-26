@@ -35,6 +35,7 @@ const {
   SETTINGS_DEFAULTS,
   buildPaperFillExecution,
   executeRotation,
+  evaluateBuyActions,
   evaluateRotationActions,
   evaluateRotationBuyFeasibility,
   evaluateRotationGuard,
@@ -274,6 +275,48 @@ try {
     { max_allocation_usd: 750 }
   );
   approxEqual(sizingCapAllocation, 750);
+  assertNoAdditionalWrites();
+
+  const liquidityCapPortfolio = buildPortfolio({
+    cash_usd: 10000,
+    stats: { equity_usd: 10000 },
+    settings: { max_position_pct: 0.5, risk_per_trade_pct: 0.5, max_position_liquidity_share: 0.01 }
+  });
+  // 1% of $200k liquidity = $2,000, below the 50% approved size ($5,000).
+  approxEqual(
+    resolveRotationAllocationUsd(liquidityCapPortfolio, buildCandidate({ approved_size_pct: 50, liquidity_usd: 200000 }), 8000),
+    2000
+  );
+  // Deep pool: the cap is not binding.
+  approxEqual(
+    resolveRotationAllocationUsd(liquidityCapPortfolio, buildCandidate({ approved_size_pct: 50, liquidity_usd: 5_000_000 }), 8000),
+    5000
+  );
+  // Missing liquidity is left to the sizing multiplier and risk checks.
+  const noLiquidityCandidate = buildCandidate({ approved_size_pct: 50 });
+  noLiquidityCandidate.liquidity_data.liquidity_usd = 0;
+  approxEqual(resolveRotationAllocationUsd(liquidityCapPortfolio, noLiquidityCandidate, 8000), 5000);
+  // Setting 0 disables the cap.
+  const liquidityCapOffPortfolio = buildPortfolio({
+    cash_usd: 10000,
+    stats: { equity_usd: 10000 },
+    settings: { max_position_pct: 0.5, risk_per_trade_pct: 0.5, max_position_liquidity_share: 0 }
+  });
+  approxEqual(
+    resolveRotationAllocationUsd(liquidityCapOffPortfolio, buildCandidate({ approved_size_pct: 50, liquidity_usd: 200000 }), 8000),
+    5000
+  );
+  // New-position buy path applies the same cap.
+  const buyActions = evaluateBuyActions(
+    buildPortfolio({
+      cash_usd: 10000,
+      stats: { equity_usd: 10000 },
+      settings: { max_position_pct: 0.5, max_buys_per_cycle: 1, max_new_positions_per_day: 5, max_position_liquidity_share: 0.01 }
+    }),
+    [buildCandidate({ approved_size_pct: 50, liquidity_usd: 200000 })]
+  );
+  assert.equal(buyActions.length, 1);
+  approxEqual(buyActions[0].allocation_usd, 2000);
   assertNoAdditionalWrites();
 
   const categoryBlockedPortfolio = buildPortfolio({
